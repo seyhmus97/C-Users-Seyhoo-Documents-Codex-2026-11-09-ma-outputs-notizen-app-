@@ -1,0 +1,56 @@
+name: Publish Notizraum on GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: pnpm aktivieren
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Node.js einrichten
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Abhängigkeiten installieren
+        run: pnpm install --frozen-lockfile
+      - name: GitHub-Pages-Pfad bestimmen
+        shell: bash
+        run: |
+          repo="${GITHUB_REPOSITORY#*/}"
+          if [[ "$repo" == *.github.io ]]; then
+            echo "VITE_BASE_PATH=/" >> "$GITHUB_ENV"
+          else
+            echo "VITE_BASE_PATH=/$repo/" >> "$GITHUB_ENV"
+          fi
+      - name: Website und App bauen
+        run: pnpm run build
+      - name: GitHub Pages vorbereiten
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - name: Build veröffentlichen
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: ./dist
+      - name: GitHub Pages deployen
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
