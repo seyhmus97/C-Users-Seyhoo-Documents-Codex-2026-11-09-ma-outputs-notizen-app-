@@ -87,6 +87,8 @@ jobs:
           java-version: 21
       - name: Android SDK einrichten
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Android SDK-Komponenten installieren
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
       - name: Abhängigkeiten installieren
@@ -127,3 +129,4 @@ jobs:
           files: release-assets/*
           generate_release_notes: true
           make_latest: true
+
