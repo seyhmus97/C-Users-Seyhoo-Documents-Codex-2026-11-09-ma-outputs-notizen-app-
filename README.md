@@ -34,15 +34,25 @@ Lade danach den Ordner `dist` auf Netlify (Drag & Drop unter app.netlify.com/dro
 
 Wichtig: Die App funktioniert (Service Worker, Installation, Offline) nur über HTTPS. Alle genannten Anbieter liefern HTTPS automatisch.
 
-## App installieren und speichern
+## Installierbare Apps bauen
 
-Öffne die veröffentlichte Seite online, starte die App einmal und installiere sie über das Browsermenü. Android: **App installieren**. iPad: in Safari **Teilen → Zum Home-Bildschirm**. Nach dem ersten Laden kann die App-Oberfläche offline starten.
+Die Website dient zum Herunterladen. Die Windows- und Android-Builds starten als eigene installierte App-Fenster ohne Browserleiste; die Notizoberfläche läuft in der eingebetteten WebView des Betriebssystems. Das ist keine native Neuentwicklung der Zeichenoberfläche, sondern eine Desktop- und Mobile-App-Hülle um die bestehende React-App.
 
-Notizen und importierte PDFs liegen im IndexedDB-Speicher des jeweiligen Browsers. Backups lassen sich in der App manuell exportieren und wieder importieren. Automatisches Cloud-Backup ist nicht eingerichtet.
+```powershell
+pnpm install
+pnpm run desktop:build                 # Windows x64 auf einem Windows-Buildrechner
+pnpm run native:sync:android           # Android-Projekt synchronisieren
+cd android
+.\gradlew.bat assembleDebug
+```
 
-PDF-Seiten bleiben im Dokumentfluss. Zwischen ihnen kannst du Blanko-, Linien-, Karoraster- oder Punktrasterflächen einsetzen. Stiftprofile unterstützen Füller, Kugelschreiber, Bleistift und Textmarker. Linien können durchgezogen, gestrichelt oder gepunktet sein und Pfeile tragen. Haltegesten glätten Linien und geometrische Grundformen. „Schaltbild glätten“ richtet ausgewählte Formen und Verbindungen aus, erkennt aber keine elektrischen Bauteile oder Beschriftungen semantisch.
+GitHub Actions baut Windows x64, Windows ARM64 und eine Android-APK. Die iOS-/iPadOS-Projektdateien sind vorbereitet; ein auf iPad installierbarer Build benötigt Xcode auf macOS und Apples Signierung. Für App-Store-Verteilung werden außerdem ein Apple-Developer-Konto und eine App-Store-Veröffentlichung benötigt.
 
-Ein globaler Dunkelmodus für die gesamte App-Oberfläche ist in dieser Version noch nicht enthalten. Importierte PDF-Seiten werden beim Anzeigen nicht invertiert.
+Notizen und importierte PDFs werden lokal im jeweiligen App-Speicher abgelegt. Die zentrale Einstellungsleiste steuert Design, Papier, Werkzeuge und Stiftdruck. Backups enthalten Notizen, PDFs und App-Einstellungen; automatisches Cloud-Backup ist nicht eingerichtet.
+
+PDF-Seiten bleiben im Dokumentfluss und werden im Dunkelmodus nicht invertiert. Zwischen ihnen kannst du Blanko-, Linien-, Karoraster- oder Punktrasterflächen einsetzen. Stiftprofile unterstützen Füller, Kugelschreiber, Bleistift und Textmarker. Die Schnellleiste bietet durchgezogene, gestrichelte, gepunktete Linien und Pfeile. Haltegesten glätten Linien und geometrische Grundformen. „Schaltbild glätten“ richtet ausgewählte Leitungen und Grundformen aus, erkennt aber keine elektrischen Bauteile oder Beschriftungen semantisch.
+
+Im Dunkelmodus bleibt die Tinte über PDF-Seiten und dunkle Notizflächen lesbar; die App passt nur die handgezeichnete Tinte an den jeweiligen Papierhintergrund an. PDF- und Bildinhalte werden nicht gefiltert oder invertiert.
 
 ## Build und PWA-Icons
 

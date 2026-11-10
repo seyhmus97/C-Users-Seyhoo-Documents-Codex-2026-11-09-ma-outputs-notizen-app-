@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import type { RasterIn, RasterOut } from "./pdfRaster.worker";
+import { saveFile } from "./saveFile";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 let pdfjsPromise: Promise<PdfJsModule> | undefined;
@@ -22,6 +23,7 @@ type Shape = "rect" | "ellipse" | "triangle" | "line" | "arrow";
 type Tpl = "blank" | "lined" | "grid" | "dots";
 type PenKind = "ballpoint" | "fountain" | "pencil" | "marker";
 type LineStyle = "solid" | "dashed" | "dotted" | "arrow" | "dashedArrow" | "dottedArrow";
+type ThemePreference = "system" | "light" | "dark";
 type Pt = { x: number; y: number; p: number };
 // y ist RELATIV zum Block → Notizen wandern mit, wenn davor Platz eingefügt wird
 type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color: string; size: number; pts: Pt[]; raw?: boolean; penKind?: PenKind; lineStyle?: LineStyle }; // raw: Formen (Ecken) nicht glätten
@@ -180,6 +182,27 @@ const perfectStroke = (s: Stroke): Stroke | null => {
   if (kind === "ellipse") { const d = Math.max(x1 - x0, y1 - y0), cx = (x0 + x1) / 2, cy = (y0 + y1) / 2; x0 = cx - d / 2; x1 = cx + d / 2; y0 = cy - d / 2; y1 = cy + d / 2; }
   const geometry = kind === "line" && hasArrow(s.lineStyle) ? "arrow" : kind;
   return { ...s, pts: shapePts(geometry, { x: x0, y: y0 }, { x: x1, y: y1 }), raw: true };
+};
+const straightenCircuitWire = (s: Stroke): Stroke | null => {
+  if (s.pts.length < 3) return null;
+  const first = s.pts[0], last = s.pts[s.pts.length - 1];
+  const dx = last.x - first.x, dy = last.y - first.y, direct = Math.hypot(dx, dy);
+  if (direct < 24) return null;
+  let length = 0;
+  for (let i = 1; i < s.pts.length; i++) length += Math.hypot(s.pts[i].x - s.pts[i - 1].x, s.pts[i].y - s.pts[i - 1].y);
+  if (!length || direct / length < 0.68) return null;
+  let a = { x: first.x, y: first.y }, b = { x: last.x, y: last.y };
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  const tolerance = Math.max(14, direct * 0.42);
+  if (horizontal && Math.abs(dy) <= tolerance) {
+    const y = s.pts.reduce((sum, p) => sum + p.y, 0) / s.pts.length;
+    a = { x: first.x, y }; b = { x: last.x, y };
+  } else if (!horizontal && Math.abs(dx) <= tolerance) {
+    const x = s.pts.reduce((sum, p) => sum + p.x, 0) / s.pts.length;
+    a = { x, y: first.y }; b = { x, y: last.y };
+  } else if (direct / length < 0.86) return null;
+  const geometry = hasArrow(s.lineStyle) ? "arrow" : "line";
+  return { ...s, pts: shapePts(geometry, a, b), raw: true };
 };
 const IDENT: XF = { px: 0, py: 0, s: 1, rot: 0 };
 const PRESSURE_LERP = 0.2; // Tiefpass: Anteil des neuen Druckwerts pro Punkt
@@ -420,7 +443,7 @@ function PdfPage({ doc, docId, pageNum, height, zoom, getRoot }: { doc: PDFDocum
 }
 
 /* ───────── Hauptkomponente ───────── */
-export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: string; title?: string; onLibrary?: () => void }) {
+export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, onThemeChange, onBackup, onRestore }: { noteId: string; title?: string; onLibrary?: () => void; darkMode: boolean; theme: ThemePreference; onThemeChange: (theme: ThemePreference) => void; onBackup: () => void; onRestore: () => void }) {
   const [blocks, setBlocks] = useState<Block[]>([{ id: uid(), kind: "blank", height: 1600, gap: 0 }]);
   const [tool, setTool] = useState<Tool>("pen");
   const [eraseMode, setEraseMode] = useState<"pixel" | "stroke">("pixel");
@@ -431,6 +454,20 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
   const [size, setSize] = useState(2.5);
   const [penProfiles, setPenProfiles] = useState<PenProfile[]>(readPenProfiles);
   const [activePenId, setActivePenId] = useState("ballpoint");
+  const [customColors, setCustomColors] = useState<string[]>(() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem("notizraum-custom-colors") ?? "[]");
+      return Array.isArray(saved) ? [...new Set(saved.filter((c): c is string => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c)))].slice(0, 12) : [];
+    } catch { return []; }
+  });
+  const [pressureSensitivity, setPressureSensitivity] = useState(() => {
+    try { const saved = Number(localStorage.getItem("notizraum-pressure-sensitivity")); return Number.isFinite(saved) && saved >= 0.25 && saved <= 2 ? saved : 1; }
+    catch { return 1; }
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [smartShapesEnabled, setSmartShapesEnabled] = useState(() => { try { return localStorage.getItem("notizraum-smart-shapes") !== "false"; } catch { return true; } });
+  const [circuitAssistEnabled, setCircuitAssistEnabled] = useState(() => { try { return localStorage.getItem("notizraum-circuit-assist") !== "false"; } catch { return true; } });
+  const [toolbarCollapsed, setToolbarCollapsed] = useState(() => { try { return localStorage.getItem("notizraum-toolbar-collapsed") === "true"; } catch { return false; } });
   const [sidebar, setSidebar] = useState(true);
   const [zoom, setZoomState] = useState(1);
   const [saved, setSaved] = useState("");
@@ -475,6 +512,11 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
   const updatePenProfiles = (next: PenProfile[]) => { setPenProfiles(next); try { localStorage.setItem("notizraum-pen-profiles", JSON.stringify(next)); } catch { /* profiles still work for this session */ } };
   const choosePen = (p: PenProfile) => { setActivePenId(p.id); setColor(p.color); setSize(p.size); setTool(p.kind === "marker" ? "highlighter" : "pen"); };
   const changePen = (patch: Partial<PenProfile>) => updatePenProfiles(penProfiles.map((p) => p.id === activePen.id ? { ...p, ...patch } : p));
+  useEffect(() => { try { localStorage.setItem("notizraum-smart-shapes", String(smartShapesEnabled)); } catch { /* preference still works for this session */ } }, [smartShapesEnabled]);
+  useEffect(() => { try { localStorage.setItem("notizraum-circuit-assist", String(circuitAssistEnabled)); } catch { /* preference still works for this session */ } }, [circuitAssistEnabled]);
+  useEffect(() => { try { localStorage.setItem("notizraum-toolbar-collapsed", String(toolbarCollapsed)); } catch { /* preference still works for this session */ } }, [toolbarCollapsed]);
+  useEffect(() => { try { localStorage.setItem("notizraum-custom-colors", JSON.stringify(customColors)); } catch { /* palette still works for this session */ } }, [customColors]);
+  useEffect(() => { try { localStorage.setItem("notizraum-pressure-sensitivity", String(pressureSensitivity)); } catch { /* sensitivity still works for this session */ } }, [pressureSensitivity]);
   useEffect(() => {
     if (!penProfiles.some((p) => p.id === activePenId)) setActivePenId(penProfiles[0]?.id ?? "ballpoint");
   }, [penProfiles, activePenId]);
@@ -485,19 +527,25 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
     const p: PenProfile = { id: uid(), name, kind: activePen.kind === "marker" ? "ballpoint" : activePen.kind, color: nextColor, size };
     updatePenProfiles([...penProfiles, p]); setActivePenId(p.id); setColor(p.color); setTool("pen");
   };
+  const addCustomColor = (value: string) => {
+    const normalized = value.toLowerCase();
+    setColor(normalized); changePen({ color: normalized });
+    setCustomColors((old) => old.includes(normalized) ? old : [...old, normalized].slice(-12));
+  };
   const perfectSelected = () => {
     const beforeSelection = snap(); let changed = false;
     strokes.current = strokes.current.map((s) => {
       if (!sel.current.has(s.id)) return s;
-      const clean = perfectStroke(s);
+      const clean = perfectStroke(s) ?? (circuitAssistEnabled ? straightenCircuitWire(s) : null);
       if (clean) { changed = true; return clean; }
       return s;
     });
-    if (changed) { pushHist(beforeSelection); setSaved("Schaltbildformen geglättet"); schedule(); }
+    if (changed) { pushHist(beforeSelection); setSaved("Schaltbild und Grundformen geglättet"); schedule(); }
     else setSaved("Keine passende Form erkannt");
   };
   const cancelSmartHold = () => { if (smartHoldTimer.current) clearTimeout(smartHoldTimer.current); smartHoldTimer.current = undefined; };
   const armSmartHold = () => {
+    if (!smartShapesEnabled) return;
     cancelSmartHold();
     smartHoldTimer.current = setTimeout(() => {
       const current = cur.current;
@@ -515,6 +563,33 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
   }, [blocks]);
   const topsRef = useRef(tops); topsRef.current = tops;
   const blocksRef = useRef(blocks); blocksRef.current = blocks;
+
+  const paperAtY = (y: number): "pdf" | "blank" | "gap" => {
+    for (const b of blocksRef.current) {
+      const top = topsRef.current[b.id] ?? 0;
+      if (y >= top && y < top + b.height) return b.kind;
+      if (b.kind === "pdf" && y >= top + b.height && y < top + b.height + b.gap) return "gap";
+    }
+    return blocksRef.current.at(-1)?.kind ?? "blank";
+  };
+  const displayInk = (ink: string, paperKind: "pdf" | "blank" | "gap") => {
+    const rgb = /^#[0-9a-f]{6}$/i.test(ink) ? [1, 3, 5].map((i) => parseInt(ink.slice(i, i + 2), 16) / 255) : null;
+    const luma = rgb ? 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2] : 0.5;
+    // PDF-Seiten bleiben im Original. Nur die gezeichnete Tinte wird angepasst,
+    // wenn sie sonst auf der weißen PDF-Fläche unsichtbar wäre.
+    if (paperKind === "pdf") return luma > 0.94 ? "#111827" : ink;
+    if (paperKind === "blank" && !darkMode) return luma > 0.94 ? "#1f2937" : ink;
+    if (paperKind === "gap" && !darkMode) return luma > 0.94 ? "#1f2937" : ink;
+    const contrast: Record<string, string> = {
+      "#1f2937": "#f8fafc", "#1e3a8a": "#93c5fd", "#475569": "#cbd5e1", "#2563eb": "#93c5fd",
+      "#dc2626": "#fca5a5", "#16a34a": "#86efac", "#f59e0b": "#fcd34d", "#9333ea": "#d8b4fe",
+      "#0891b2": "#67e8f9", "#facc15": "#fef08a",
+    };
+    const mapped = contrast[ink.toLowerCase()];
+    if (mapped) return mapped;
+    if (rgb && luma < 0.24) return "#f8fafc";
+    return ink;
+  };
 
   const getScroller = useCallback(() => scRef.current, []);
   const offX = () => Math.max(0, ((scRef.current?.clientWidth ?? 0) - PAGE_W * zoomRef.current) / 2);
@@ -590,13 +665,16 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
 
   /* ───── Zeichenebene (nur sichtbarer Ausschnitt) ───── */
   // Zero-Allocation: nur Zahlen und Indexschleifen, keine Arrays, Objekte oder Closures pro Aufruf
-  const paint = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0) => {
+  const paint = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0, ink = s.color) => {
     const top = (topsRef.current[s.blockId] ?? 0) + oy, hl = s.tool === "highlighter", P = s.pts, n = P.length;
     const dash = dashFor(s.lineStyle);
-    const pressureWidth = (p: number) => s.size * (s.penKind === "fountain" ? 0.12 + p * 1.75 : s.penKind === "pencil" ? 0.35 + p * 0.8 : 0.4 + p * 1.2);
+    const pressureWidth = (p: number) => {
+      const pressure = clamp(0.5 + (p - 0.5) * pressureSensitivity, 0.05, 1);
+      return s.size * (s.penKind === "fountain" ? 0.12 + pressure * 1.75 : s.penKind === "pencil" ? 0.35 + pressure * 0.8 : 0.4 + pressure * 1.2);
+    };
     ctx.save();
     ctx.lineCap = ctx.lineJoin = "round";
-    ctx.strokeStyle = ctx.fillStyle = s.color;
+    ctx.strokeStyle = ctx.fillStyle = ink;
     if (s.penKind === "pencil" && !hl) ctx.globalAlpha = 0.62;
     if (dash.length) ctx.setLineDash(dash);
     if (hl) { ctx.globalAlpha = 0.35; ctx.lineWidth = s.size * 5; ctx.lineCap = "butt"; }
@@ -635,6 +713,32 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
     }
     ctx.restore();
   };
+  const paintAdaptive = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0) => {
+    if (s.pts.length < 2) {
+      const top = topsRef.current[s.blockId] ?? 0;
+      paint(ctx, s, ox, oy, displayInk(s.color, paperAtY(top + oy + (s.pts[0]?.y ?? 0))));
+      return;
+    }
+    const top = topsRef.current[s.blockId] ?? 0;
+    let run: Pt[] = [], region: "pdf" | "blank" | "gap" | null = null;
+    const flush = () => {
+      if (!run.length || !region) return;
+      paint(ctx, { ...s, pts: run }, ox, oy, displayInk(s.color, region));
+    };
+    for (let i = 0; i < s.pts.length; i++) {
+      const p = s.pts[i], nextRegion = paperAtY(top + oy + p.y);
+      if (region !== nextRegion) {
+        if (run.length) {
+          const last = run[run.length - 1];
+          flush();
+          run = [{ ...last }]; // keep joins clean where a stroke crosses a paper boundary
+        }
+        region = nextRegion;
+      }
+      run.push(p);
+    }
+    flush();
+  };
   const eraseR = () => 6 + size * 3;
   const draw = useCallback(() => {
     const cv = cvRef.current, sc = scRef.current;
@@ -653,11 +757,11 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
     for (const s of strokes.current) {
       const top = topsRef.current[s.blockId] ?? 0, bb = bbox(s), isSel = sel.current.has(s.id);
       const oy = isSel ? dragOff.current.y : 0;
-      if (isSel && xf.current) { paint(ctx, xformStroke(s, xf.current)); continue; }
+      if (isSel && xf.current) { paintAdaptive(ctx, xformStroke(s, xf.current)); continue; }
       if (top + bb.y1 + oy < v0 || top + bb.y0 + oy > v1) continue;
-      paint(ctx, s, isSel ? dragOff.current.x : 0, oy);
+      paintAdaptive(ctx, s, isSel ? dragOff.current.x : 0, oy);
     }
-    if (cur.current) paint(ctx, cur.current);
+    if (cur.current) paintAdaptive(ctx, cur.current);
     for (const t of textFields.current) if (sel.current.has(t.id)) {
       const r = textRect(liveText(t));
       ctx.save(); ctx.setLineDash([]); ctx.fillStyle = "rgba(37,99,235,.10)"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.2 / z;
@@ -683,9 +787,9 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
     if (tool === "eraser" && hover.current) { ctx.setLineDash([]); ctx.strokeStyle = "#64748b"; ctx.beginPath(); ctx.arc(hover.current.x, hover.current.y, eraseR(), 0, 7); ctx.stroke(); }
     ctx.restore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool, size]);
+  }, [tool, size, darkMode, pressureSensitivity]);
   const schedule = useCallback(() => { cancelAnimationFrame(raf.current); raf.current = requestAnimationFrame(draw); }, [draw]);
-  useEffect(schedule, [blocks, tool, size, schedule]);
+  useEffect(schedule, [blocks, tool, size, darkMode, schedule]);
   useEffect(() => {
     const sc = scRef.current!, ro = new ResizeObserver(schedule);
     ro.observe(sc); sc.addEventListener("scroll", schedule, { passive: true });
@@ -1046,6 +1150,11 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
   const exportPdf = async () => {
     setSaved("Exportiere …");
     const { jsPDF } = await import("jspdf");
+    const printableInk = (ink: string) => {
+      if (!/^#[0-9a-f]{6}$/i.test(ink)) return ink;
+      const [r, g, b] = [1, 3, 5].map((i) => parseInt(ink.slice(i, i + 2), 16) / 255);
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.94 ? "#111827" : ink;
+    };
     const S = 2, TH = 1123, bs = blocksRef.current, bmp = new Map<string, HTMLCanvasElement>();
     for (const b of bs) {
       const doc = b.kind === "pdf" ? docs.current.get(b.docId!) : undefined;
@@ -1091,11 +1200,11 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
           if (b.gap > 0) drawTpl(ctx, t + b.height, b.gap);
         } else drawTpl(ctx, t, b.height);
       }
-      strokes.current.forEach((s) => paint(ctx, s));
+      strokes.current.forEach((s) => paint(ctx, s, 0, 0, printableInk(s.color)));
       textFields.current.forEach((t) => {
         const lh = t.fontSize * 1.375;
         let y = (topsRef.current[t.blockId] ?? 0) + t.y + 2;
-        ctx.fillStyle = t.color; ctx.font = `${t.fontSize}px sans-serif`; ctx.textBaseline = "top";
+        ctx.fillStyle = printableInk(t.color); ctx.font = `${t.fontSize}px sans-serif`; ctx.textBaseline = "top";
         for (const para of t.text.split("\n")) {
           let line = "";
           for (const w of para.split(" ")) {
@@ -1108,7 +1217,7 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
       pdf.addImage(cv.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, PAGE_W, TH);
       if (i < pages - 1) pdf.addPage([PAGE_W, TH]);
     }
-    pdf.save((title?.split(" › ").pop() || "Notiz") + ".pdf");
+    await saveFile(pdf.output("blob"), (title?.split(" › ").pop() || "Notiz") + ".pdf");
     setSaved("Exportiert");
   };
 
@@ -1191,36 +1300,50 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
 
   /* ───── UI ───── */
   const tplStyle: React.CSSProperties =
-    tpl === "lined" ? { backgroundImage: "linear-gradient(#cbd5e1 1px, transparent 1px)", backgroundSize: "100% 24px", backgroundPosition: "0 23px" }
-    : tpl === "grid" ? { backgroundImage: "linear-gradient(#e2e8f0 1px, transparent 1px), linear-gradient(90deg, #e2e8f0 1px, transparent 1px)", backgroundSize: "24px 24px" }
-    : tpl === "dots" ? { backgroundImage: "radial-gradient(circle, #cbd5e1 1px, transparent 1.2px)", backgroundSize: "24px 24px", backgroundPosition: "12px 12px" }
+    tpl === "lined" ? { backgroundImage: `linear-gradient(${darkMode ? "#334155" : "#cbd5e1"} 1px, transparent 1px)`, backgroundSize: "100% 24px", backgroundPosition: "0 23px" }
+    : tpl === "grid" ? { backgroundImage: `linear-gradient(${darkMode ? "#334155" : "#e2e8f0"} 1px, transparent 1px), linear-gradient(90deg, ${darkMode ? "#334155" : "#e2e8f0"} 1px, transparent 1px)`, backgroundSize: "24px 24px" }
+    : tpl === "dots" ? { backgroundImage: `radial-gradient(circle, ${darkMode ? "#475569" : "#cbd5e1"} 1px, transparent 1.2px)`, backgroundSize: "24px 24px", backgroundPosition: "12px 12px" }
     : {};
   const btn = (on: boolean) => `px-3 py-2 rounded-lg text-sm transition select-none ${on ? "bg-slate-900 text-white" : "hover:bg-slate-200 text-slate-700"}`;
+  const palette = [...COLORS, ...customColors.filter((c) => !COLORS.includes(c))];
   const tools: [Tool, string][] = [["pen", "✒ Stift"], ["highlighter", "▰ Marker"], ["eraser", "Radierer"], ["lasso", "Lasso"], ["shape", "Form"], ["text", "Text"]];
+  const toolIcon = (kind: Tool) => {
+    const paths: Record<Tool, React.ReactNode> = {
+      pen: <><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/><path d="m14.5 7.5 3 3"/></>,
+      highlighter: <><path d="m4 16 9-9 5 5-9 9H4z"/><path d="m12 8 4 4M4 21h16"/></>,
+      eraser: <><path d="m7 21-4-4a2 2 0 0 1 0-3l9-9a2 2 0 0 1 3 0l6 6a2 2 0 0 1 0 3l-7 7z"/><path d="m7 21 7-7"/></>,
+      lasso: <><path d="M9 17c-4 0-6-2-6-5 0-4 4-7 9-7s9 2 9 6-4 7-9 7"/><path d="M9 17c0 2-1 4-3 4-1 0-2-1-2-2s1-2 2-2h3Z"/></>,
+      shape: <><rect x="4" y="4" width="8" height="8" rx="1"/><circle cx="17" cy="17" r="4"/><path d="m15 5 5 5"/></>,
+      text: <><path d="M4 6V4h16v2M12 4v16M8 20h8"/></>,
+    };
+    return <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[kind]}</svg>;
+  };
   const Sep = () => <span className="w-px h-6 bg-slate-200" />;
 
   return (
-    <div className="relative h-full flex-1 min-w-0 flex flex-col bg-slate-100 text-slate-800 select-none overscroll-none">
+    <div className="notiz-workspace relative h-full flex-1 min-w-0 flex flex-col bg-slate-100 text-slate-800 select-none overscroll-none" data-theme={darkMode ? "dark" : "light"}>
       <header className="flex items-center gap-1.5 px-3 py-2 bg-white border-b border-slate-200 flex-wrap">
         {onLibrary && <button className={btn(false)} onClick={onLibrary}>Bibliothek</button>}
         <button className={btn(sidebar)} onClick={() => setSidebar(!sidebar)}>Seiten</button>
+        <button className={btn(toolbarCollapsed)} onClick={() => setToolbarCollapsed(!toolbarCollapsed)} aria-pressed={toolbarCollapsed} title={toolbarCollapsed ? "Werkzeugleiste ausklappen" : "Werkzeugleiste einklappen"}>
+          {toolbarCollapsed ? "Leiste ausklappen" : "Leiste einklappen"}
+        </button>
         <Sep />
-        {tools.map(([t, l]) => <button key={t} className={btn(tool === t)} onClick={() => {
+        {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " inline-flex items-center gap-1.5"} onClick={() => {
           if (t === "pen") { const p = activePen.kind === "marker" ? penProfiles.find((x) => x.kind !== "marker") : activePen; if (p) choosePen(p); else setTool(t); }
           else if (t === "highlighter") { const p = penProfiles.find((x) => x.kind === "marker"); if (p) choosePen(p); else setTool(t); }
           else setTool(t);
-        }}>{l}</button>)}
+        }}>{toolIcon(t)}{!toolbarCollapsed && <span>{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
         {(tool === "pen" || tool === "highlighter") && (
           <>
-            <select aria-label="Stiftprofil" title="Gespeichertes Stiftprofil" className="px-2 py-2 rounded-lg bg-slate-100 text-sm max-w-40" value={activePen.id}
-              onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
-              {penProfiles.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
             <select aria-label="Stifttyp" title="Strichverhalten" className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
               onChange={(e) => { const kind = e.target.value as PenKind; changePen({ kind }); setTool(kind === "marker" ? "highlighter" : "pen"); }}>
               <option value="ballpoint">Kugelschreiber</option><option value="fountain">Füller</option><option value="pencil">Bleistift</option><option value="marker">Textmarker</option>
             </select>
-            <button className={btn(false)} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>
+            {toolbarCollapsed && <select aria-label="Gespeichertes Stiftprofil" title="Meine Stifte" className="max-w-36 px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.id} onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
+              {penProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.color}</option>)}
+            </select>}
+            {toolbarCollapsed && <button className={btn(false)} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>}
           </>
         )}
         {tool === "eraser" && (
@@ -1238,9 +1361,12 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
           {LINE_STYLES.map((s) => <button key={s.id} title={s.title} aria-label={s.title} onClick={() => setLineStyle(s.id)} className={`rounded px-1.5 py-1 text-xs font-mono ${lineStyle === s.id ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}>{s.label}</button>)}
         </div>}
         <Sep />
-        {COLORS.map((c) => (
+        {palette.map((c) => (
           <button key={c} aria-label={`Farbe ${c}`} onClick={() => { setColor(c); changePen({ color: c }); }} style={{ background: c }} className={`w-7 h-7 rounded-full border border-slate-300 ${color === c ? "ring-2 ring-offset-2 ring-slate-900" : ""}`} />
         ))}
+        <label className="relative inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border border-dashed border-slate-400 text-slate-500" title="Eigene Stiftfarbe hinzufügen" aria-label="Eigene Stiftfarbe hinzufügen">
+          <span aria-hidden="true">＋</span><input type="color" className="absolute inset-0 h-full w-full cursor-pointer opacity-0" onChange={(e) => addCustomColor(e.target.value)} aria-label="Eigene Stiftfarbe" />
+        </label>
         <input type="range" min={1} max={10} step={0.5} value={size} onChange={(e) => { const v = +e.target.value; setSize(v); changePen({ size: v }); }} className="w-24" aria-label="Strichstärke / Radiergröße" />
         {(tool === "pen" || tool === "shape") && <span className="text-[10px] text-slate-500">Am Ende 0,65 s halten = glätten</span>}
         {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Markierte Linien und Grundformen eines Schaltbilds begradigen">Schaltbild glätten</button>}
@@ -1260,11 +1386,23 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
           <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
         </select>
         <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
+        <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
         <label className={btn(false) + " cursor-pointer ml-auto"}>
           PDF importieren
           <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
         </label>
       </header>
+
+      {(tool === "pen" || tool === "highlighter") && !toolbarCollapsed && <div className="notiz-pen-strip flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white px-3 py-2" role="group" aria-label="Meine Stiftprofile">
+        <span className="shrink-0 text-xs font-semibold text-slate-500">Meine Stifte</span>
+        {penProfiles.map((p) => <button key={p.id} type="button" aria-pressed={activePen.id === p.id} onClick={() => choosePen(p)}
+          className={`notiz-pen-preset inline-flex shrink-0 items-center gap-2 rounded-xl border px-3 py-1.5 text-left ${activePen.id === p.id ? "border-blue-400 bg-blue-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}>
+          <span className="h-3 w-3 rounded-full border border-slate-300" style={{ backgroundColor: p.color }} />
+          <span className="text-xs font-medium text-slate-700">{p.name}</span>
+          <span className="text-[10px] text-slate-500">{p.kind === "marker" ? "Marker" : p.kind === "fountain" ? "Füller" : p.kind === "pencil" ? "Bleistift" : "Kugel"} · {p.size.toFixed(1)}</span>
+        </button>)}
+        <button className={btn(false) + " shrink-0"} onClick={addPenProfile}>＋ Stift hinzufügen</button>
+      </div>}
 
       <div className="flex flex-1 min-h-0">
         {sidebar && (
@@ -1293,20 +1431,31 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
         )}
         <div ref={scRef} className="flex-1 overflow-auto relative" style={{ touchAction: "none", cursor: tool === "lasso" ? "crosshair" : tool === "eraser" ? "none" : tool === "text" ? "text" : "default" }}
           onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
-          onDoubleClick={() => { if (tool === "lasso" && sel.current.size > 0) perfectSelected(); }}>
+          onDoubleClick={(e) => {
+            if (tool !== "lasso") return;
+            if (sel.current.size === 0) {
+              const p = toDoc(e.clientX, e.clientY), rx = PAGE_W * 0.45, ry = PAGE_W * 0.3;
+              sel.current = new Set(strokes.current.filter((s) => {
+                const bb = bbox(s), top = topsRef.current[s.blockId] ?? 0;
+                return bb.x1 >= p.x - rx && bb.x0 <= p.x + rx && top + bb.y1 >= p.y - ry && top + bb.y0 <= p.y + ry;
+              }).map((s) => s.id));
+              bump();
+            }
+            if (sel.current.size > 0) perfectSelected(); else setSaved("Kein handgezeichnetes Schaltbild in der Nähe erkannt");
+          }}>
           <canvas ref={cvRef} className="sticky top-0 left-0 z-10 pointer-events-none block" />
           <div className="relative mx-auto" style={{ width: PAGE_W * zoom, height: (total + 400) * zoom }}>
             <div className="absolute top-0 left-0" style={{ width: PAGE_W, transform: `scale(${zoom})`, transformOrigin: "0 0" }}>
               {blocks.map((b) => (
                 <div key={b.id}>
-                  <div className="absolute left-0 bg-white shadow-md" style={{ top: tops[b.id], width: PAGE_W, height: b.height, ...(b.kind === "blank" ? tplStyle : {}) }}>
+                  <div className="absolute left-0 bg-white shadow-md" data-note-paper={b.kind} style={{ top: tops[b.id], width: PAGE_W, height: b.height, backgroundColor: b.kind === "blank" && darkMode ? "#111827" : "#fff", ...(b.kind === "blank" ? tplStyle : {}) }}>
                     {b.kind === "pdf" && docs.current.get(b.docId!) && <PdfPage doc={docs.current.get(b.docId!)!} docId={b.docId!} pageNum={b.pageNum!} height={b.height} zoom={zoom} getRoot={getScroller} />}
                   </div>
                   {b.kind === "pdf" && (
                     <div onPointerDown={(e) => startGapDrag(e, b)} onDoubleClick={() => setGap(b.id, MIN_GAP)}
                       title="Ziehen = Platz einfügen · Doppelklick = zurücksetzen"
                       className="absolute left-0 group cursor-row-resize" style={{ top: tops[b.id] + b.height, width: PAGE_W, height: Math.max(b.gap, 20) }}>
-                      <div className={`w-full border-y border-dashed flex items-center justify-center ${b.gap > MIN_GAP ? "border-blue-300" : "border-transparent group-hover:border-blue-300"}`} style={{ height: b.gap, backgroundColor: "#fff", ...tplStyle }}>
+                      <div className={`w-full border-y border-dashed flex items-center justify-center ${b.gap > MIN_GAP ? "border-blue-300" : "border-transparent group-hover:border-blue-300"}`} style={{ height: b.gap, backgroundColor: darkMode ? "#111827" : "#fff", ...tplStyle }}>
                         <span className="text-xs text-blue-600 opacity-0 group-hover:opacity-100">↕ {Math.round(b.gap)} px Platz</span>
                       </div>
                     </div>
@@ -1322,12 +1471,56 @@ export default function NoteCanvas({ noteId, title, onLibrary }: { noteId: strin
                   onChange={(e) => { const el = e.target; el.style.height = "auto"; editText(tf.id, { text: el.value, height: el.scrollHeight / zoom }); }}
                   onBlur={finishText}
                   className="w-full bg-transparent outline-none resize-none overflow-hidden border border-dashed border-blue-300/70 rounded-sm leading-snug block"
-                  style={{ color: tf.color, fontSize: tf.fontSize * zoom, height: textH(tf) * zoom }} />
+                  style={{ color: displayInk(tf.color, paperAtY((topsRef.current[tf.blockId] ?? 0) + tf.y)), fontSize: tf.fontSize * zoom, height: textH(tf) * zoom }} />
               </div>
             ); })}
           </div>
         </div>
       </div>
+      {settingsOpen && <div className="notiz-settings-backdrop absolute inset-0 z-40 flex justify-end" onPointerDown={(e) => { if (e.target === e.currentTarget) setSettingsOpen(false); }}>
+        <aside id="notizraum-settings" role="dialog" aria-modal="true" aria-labelledby="notizraum-settings-title" className="notiz-settings-panel h-full w-[min(380px,92vw)] overflow-y-auto border-l border-slate-200 bg-white p-5 shadow-2xl">
+          <div className="flex items-center justify-between gap-3 border-b border-slate-200 pb-4">
+            <div><span className="text-[10px] font-semibold uppercase tracking-[.14em] text-blue-600">Kontrollzentrum</span><h2 id="notizraum-settings-title" className="mt-1 text-xl font-semibold">Einstellungen</h2></div>
+            <button className={btn(false)} aria-label="Einstellungen schließen" onClick={() => setSettingsOpen(false)}>✕</button>
+          </div>
+          <div className="space-y-5 py-4">
+            <section className="notiz-settings-section">
+              <h3>App-Design</h3><label htmlFor="app-theme">Erscheinungsbild</label>
+              <select id="app-theme" value={theme} onChange={(e) => onThemeChange(e.target.value as ThemePreference)} className="notiz-settings-select">
+                <option value="system">Wie auf diesem Gerät</option><option value="light">Hell</option><option value="dark">Dunkel</option>
+              </select>
+              <p>PDFs und Bilder behalten ihre Originalfarben. Striche passen ihren Kontrast beim Übergang zwischen PDF, Raster-Zwischenraum und dunkler Schreibfläche an.</p>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Zwischenraum</h3><label htmlFor="settings-template">Papierlayout</label>
+              <select id="settings-template" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} className="notiz-settings-select">
+                <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
+              </select><p>Gilt für eingefügte Schreibflächen zwischen PDF-Seiten. Das Raster bleibt an der Seite verankert.</p>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Linien &amp; Formen</h3><label htmlFor="settings-line-style">Linienstil</label>
+              <select id="settings-line-style" value={lineStyle} onChange={(e) => setLineStyle(e.target.value as LineStyle)} className="notiz-settings-select">
+                {LINE_STYLES.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
+              </select>
+              <label className="notiz-check-row"><input type="checkbox" checked={smartShapesEnabled} onChange={(e) => setSmartShapesEnabled(e.target.checked)} /><span><strong>Smart Shapes</strong><small>Linie, Rechteck, Dreieck und Kreis beim Halten glätten.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={circuitAssistEnabled} onChange={(e) => setCircuitAssistEnabled(e.target.checked)} /><span><strong>Schaltbild-Hilfe</strong><small>Ausgewählte Leitungen und Grundformen beim Glätten ausrichten.</small></span></label>
+              <p>Wähle Linien mit dem Lasso. „Schaltbild glätten“ oder Doppelklicken richtet erkannte Leitungen und Grundformen aus. Bauteilnamen werden dabei nicht automatisch gelesen.</p>
+              <label htmlFor="pressure-sensitivity">Stiftdruckempfindlichkeit · {pressureSensitivity.toFixed(2).replace(".", ",")}</label>
+              <input id="pressure-sensitivity" type="range" min="0.25" max="2" step="0.05" value={pressureSensitivity} onChange={(e) => setPressureSensitivity(Number(e.target.value))} aria-label="Stiftdruckempfindlichkeit" />
+              <p>Wirkt auf unterstützte druckempfindliche Stifte. Maus und Finger verwenden eine gleichmäßige Stärke.</p>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Werkzeugleiste</h3>
+              <label className="notiz-check-row"><input type="checkbox" checked={toolbarCollapsed} onChange={(e) => setToolbarCollapsed(e.target.checked)} /><span><strong>Werkzeugleiste minimieren</strong><small>Die Schnellleiste mit Linienarten, Farben und Stiftstärke bleibt sichtbar.</small></span></label>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Speicherung &amp; Export</h3><p>Notizen und PDFs werden lokal auf diesem Gerät gespeichert.</p>
+              <div className="flex flex-wrap gap-2"><button className={btn(false)} onClick={onBackup}>Backup speichern</button><button className={btn(false)} onClick={onRestore}>Backup laden</button><button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button></div>
+              <p>Notizen, PDFs und Einstellungen bleiben lokal. Cloud-Backup ist nicht eingerichtet. Für ein anderes Gerät kannst du ein vollständiges Backup exportieren und dort wieder laden.</p>
+            </section>
+          </div>
+        </aside>
+      </div>}
       {showBar && (
         <div className="absolute left-1/2 -translate-x-1/2 bottom-6 z-30 flex gap-2 p-2 rounded-2xl bg-white/95 border border-slate-200 shadow-xl select-none"
           style={{ marginBottom: "env(safe-area-inset-bottom, 0px)", touchAction: "manipulation" }}>

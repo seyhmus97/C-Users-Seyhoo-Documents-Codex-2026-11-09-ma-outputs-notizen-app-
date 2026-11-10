@@ -2,11 +2,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useRegisterSW } from "virtual:pwa-register/react";
 import NoteCanvas, { kvAll, kvDel, kvGet, kvReplaceAll, kvSet, rasterKey } from "./NoteCanvas";
+import { saveFile } from "./saveFile";
 
 const toB64 = (b: ArrayBuffer) => { let s = ""; const u = new Uint8Array(b); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
 const fromB64 = (t: string) => Uint8Array.from(atob(t), (c) => c.charCodeAt(0)).buffer;
 
 type N = { id: string; parentId: string | null; type: "folder" | "note"; name: string; open?: boolean; color?: string; icon?: string };
+type Theme = "system" | "light" | "dark";
 type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: "accepted" | "dismissed" }> };
 const uid = () => Math.random().toString(36).slice(2, 10);
 const FOLDER_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#db2777", "#475569"];
@@ -26,7 +28,29 @@ export default function App() {
   const [menu, setMenu] = useState<string | null>(null);
   const [moving, setMoving] = useState<string | null>(null);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const restoreInput = useRef<HTMLInputElement>(null);
+  const [theme, setTheme] = useState<Theme>(() => {
+    try {
+      const saved = localStorage.getItem("notizraum-theme");
+      return saved === "light" || saved === "dark" ? saved : "system";
+    } catch { return "system"; }
+  });
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
+  const darkMode = theme === "dark" || (theme === "system" && systemDark);
   const ready = useRef(false);
+
+  useEffect(() => {
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!media) return;
+    const update = () => setSystemDark(media.matches);
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, []);
+  useEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+    try { localStorage.setItem("notizraum-theme", theme); } catch { /* app theme still works for this session */ }
+  }, [theme, darkMode]);
 
   useEffect(() => {
     const onInstall = (event: Event) => { event.preventDefault(); setInstallPrompt(event as InstallPromptEvent); };
@@ -104,13 +128,12 @@ export default function App() {
 
   const backup = async () => {
     // Rasterbilder (pgimg:) sind abgeleitet und werden nicht gesichert; PDF-Originale können Blob oder ArrayBuffer sein
-    const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:")).map(async ([k, v]) => [
+    const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:") && k !== "app:preferences").map(async ([k, v]) => [
       k, v instanceof Blob ? { __ab: toB64(await v.arrayBuffer()), type: v.type } : v instanceof ArrayBuffer ? { __ab: toB64(v) } : v,
     ]));
-    const url = URL.createObjectURL(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }));
-    const a = document.createElement("a");
-    a.href = url; a.download = `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click();
-    URL.revokeObjectURL(url);
+    const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed"];
+    entries.push(["app:preferences", Object.fromEntries(preferenceKeys.map((k) => [k, localStorage.getItem(k)]))]);
+    await saveFile(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }), `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`);
   };
   const restore = async (f: File) => {
     try {
@@ -118,9 +141,16 @@ export default function App() {
       if (d?.app !== "notizen" || !Array.isArray(d.entries) || !d.entries.every((e: unknown) => Array.isArray(e) && typeof e[0] === "string")) throw new Error();
       if (!d.entries.some((e: [string]) => e[0] === "tree")) throw new Error();
       if (!confirm("Alle Notizen auf diesem Gerät werden durch das Backup ersetzt. Fortfahren?")) return;
-      const entries = d.entries.map(([k, v]: [string, unknown]) => [k, v && typeof v === "object" && "__ab" in v ? (() => { const o = v as { __ab: string; type?: string }, ab = fromB64(o.__ab); return o.type ? new Blob([ab], { type: o.type }) : ab; })() : v]);
+      const entries: [string, unknown][] = d.entries.map(([k, v]: [string, unknown]): [string, unknown] => [k, v && typeof v === "object" && "__ab" in v ? (() => { const o = v as { __ab: string; type?: string }, ab = fromB64(o.__ab); return o.type ? new Blob([ab], { type: o.type }) : ab; })() : v]);
+      const preferences = entries.find(([k]) => k === "app:preferences")?.[1];
+      if (preferences && typeof preferences === "object") {
+        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed"]);
+        for (const [key, value] of Object.entries(preferences)) if (allowed.has(key)) {
+          if (typeof value === "string") localStorage.setItem(key, value); else localStorage.removeItem(key);
+        }
+      }
       (window as unknown as { restoring: boolean }).restoring = true; ready.current = false;
-      await kvReplaceAll(entries);
+      await kvReplaceAll(entries.filter(([k]) => k !== "app:preferences"));
       location.reload();
     } catch { alert("Diese Datei ist kein gültiges Notizen-Backup."); }
   };
@@ -175,7 +205,7 @@ export default function App() {
   const hits = q.trim() ? nodes.filter((n) => n.name.toLowerCase().includes(q.trim().toLowerCase())) : null;
 
   return (
-    <div className="h-screen flex bg-slate-100">
+    <div className="notiz-app h-screen flex bg-slate-100 text-slate-800" data-theme={darkMode ? "dark" : "light"}>
       {lib && (
         <aside className="w-72 shrink-0 flex flex-col bg-white border-r border-slate-200">
           <div className="px-3 pt-3 pb-1">
@@ -189,10 +219,7 @@ export default function App() {
             </div>
             <div className="flex gap-1">
               <Btn on={backup}>Backup speichern</Btn>
-              <label className="px-2.5 py-1.5 rounded-md bg-white border border-slate-200 text-xs hover:bg-slate-100 cursor-pointer">
-                Backup laden
-                <input type="file" accept="application/json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) restore(f); e.target.value = ""; }} />
-              </label>
+              <Btn on={() => restoreInput.current?.click()}>Backup laden</Btn>
             </div>
             {installPrompt && <button onClick={installApp} className="w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white">Notizraum installieren</button>}
             {moving && (
@@ -211,7 +238,7 @@ export default function App() {
       )}
       <main className="flex-1 min-w-0 flex h-screen">
         {active && byId(active) ? (
-          <NoteCanvas key={active} noteId={active} title={pathOf(active)} onLibrary={() => setLib(!lib)} />
+          <NoteCanvas key={active} noteId={active} title={pathOf(active)} onLibrary={() => setLib(!lib)} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
         ) : (
           <div className="m-auto text-center text-slate-500 space-y-3">
             <p>Wähle ein Thema oder lege eine Notiz an.</p>
@@ -219,6 +246,7 @@ export default function App() {
           </div>
         )}
       </main>
+      <input ref={restoreInput} type="file" accept="application/json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) restore(f); e.target.value = ""; }} />
       {(offlineReady || needRefresh) && (
         <div role="status" className="fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border border-slate-200 bg-white p-4 shadow-xl">
           <p className="text-sm text-slate-800">

@@ -1,0 +1,129 @@
+name: Build installable Notizraum apps
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.label }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            label: x64
+          - target: aarch64-pc-windows-msvc
+            label: ARM64
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+      - name: pnpm aktivieren
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Rust und Windows-Ziele einrichten
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Abhängigkeiten installieren
+        run: pnpm install --frozen-lockfile
+      - name: App-Symbole erzeugen
+        run: pnpm run icons:generate
+      - name: Native Windows-App bauen
+        run: pnpm tauri build --target ${{ matrix.target }}
+      - name: Windows-Installer sammeln
+        shell: pwsh
+        run: |
+          $bundle = "src-tauri/target/${{ matrix.target }}/release/bundle"
+          $out = "release-assets"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $msi = Get-ChildItem -Path "$bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $exe = Get-ChildItem -Path "$bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) { Copy-Item $msi.FullName "$out/Notizraum-Windows-${{ matrix.label }}.msi" }
+          if ($exe) { Copy-Item $exe.FullName "$out/Notizraum-Windows-${{ matrix.label }}-Setup.exe" }
+          if (-not $msi -and -not $exe) { throw "Kein Windows-Installer für ${{ matrix.label }} erzeugt." }
+      - name: Installer als CI-Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Notizraum-Windows-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  android:
+    name: Android-APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+      - name: pnpm aktivieren
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Java einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Android SDK einrichten
+        uses: android-actions/setup-android@v3
+      - name: Android SDK-Komponenten installieren
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+      - name: Abhängigkeiten installieren
+        run: pnpm install --frozen-lockfile
+      - name: Android-Projekt synchronisieren
+        run: pnpm run native:sync:android
+      - name: Installierbare Android-APK bauen
+        working-directory: android
+        run: ./gradlew assembleDebug
+      - name: APK als CI-Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Notizraum-Android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  release:
+    name: GitHub-Release mit Installern
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Alle Build-Artefakte herunterladen
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: APK eindeutig benennen
+        run: mv release-assets/app-debug.apk release-assets/Notizraum-Android.apk
+      - name: Release veröffentlichen
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          name: Notizraum ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          files: release-assets/*
+          generate_release_notes: true
+          make_latest: true

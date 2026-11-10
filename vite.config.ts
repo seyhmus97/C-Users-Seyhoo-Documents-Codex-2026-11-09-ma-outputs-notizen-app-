@@ -5,22 +5,20 @@ import { VitePWA } from "vite-plugin-pwa";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "VITE_");
-  const base = env.VITE_BASE_PATH || "/";
+  const nativeShell = env.VITE_NATIVE_SHELL === "1";
+  const base = nativeShell ? "./" : env.VITE_BASE_PATH || "/";
+  const input: Record<string, string> = nativeShell ? { index: "app.html" } : { landing: "index.html", app: "app.html" };
 
   return {
     base,
     build: {
-      rolldownOptions: {
-        input: {
-          landing: "index.html",
-          app: "app.html",
-        },
-      },
+      rolldownOptions: { input },
     },
     plugins: [
       react(),
       tailwindcss(),
       VitePWA({
+        disable: nativeShell,
         registerType: "prompt",
         includeAssets: [
           "favicon.ico", "icon.svg", "notizraum-logo.svg", "apple-touch-icon-180x180.png",

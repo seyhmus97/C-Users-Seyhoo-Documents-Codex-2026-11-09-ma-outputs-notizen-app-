@@ -2,3 +2,17 @@ node_modules/
 dist/
 .pnpm-store/
 *.tsbuildinfo
+/src-tauri/target/
+/android/.gradle/
+/android/local.properties
+/android/**/build/
+/android/.idea/
+/ios/Pods/
+/ios/App/Pods/
+/src-tauri/icons/
+/android/app/src/main/res/mipmap-*/ic_launcher*.png
+/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher*.xml
+/android/app/src/main/res/drawable/ic_launcher_background.xml
+/android/app/src/main/res/drawable-v24/ic_launcher_foreground.xml
+/android/app/src/main/res/values/ic_launcher_background.xml
+/ios/App/App/Assets.xcassets/AppIcon.appiconset/
