@@ -467,9 +467,17 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [smartShapesEnabled, setSmartShapesEnabled] = useState(() => { try { return localStorage.getItem("notizraum-smart-shapes") !== "false"; } catch { return true; } });
   const [circuitAssistEnabled, setCircuitAssistEnabled] = useState(() => { try { return localStorage.getItem("notizraum-circuit-assist") !== "false"; } catch { return true; } });
-  const [toolbarCollapsed, setToolbarCollapsed] = useState(() => { try { return localStorage.getItem("notizraum-toolbar-collapsed") === "true"; } catch { return false; } });
-  const [sidebar, setSidebar] = useState(true);
-  const [zoom, setZoomState] = useState(1);
+  const [toolbarCollapsed, setToolbarCollapsed] = useState(() => {
+    try {
+      const saved = localStorage.getItem("notizraum-toolbar-collapsed");
+      return saved === null ? window.matchMedia("(max-width: 1279px)").matches : saved === "true";
+    } catch { return window.matchMedia("(max-width: 1279px)").matches; }
+  });
+  const [sidebar, setSidebar] = useState(() => window.matchMedia("(min-width: 1280px)").matches);
+  const [zoom, setZoomState] = useState(() => {
+    const desktopSidebars = window.matchMedia("(min-width: 1280px)").matches ? 480 : 0;
+    return Math.max(MIN_Z, Math.min(1, (window.innerWidth - desktopSidebars - 16) / PAGE_W));
+  });
   const [saved, setSaved] = useState("");
   const [, setReady] = useState(0);
 
@@ -501,7 +509,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const future = useRef<Snap[]>([]);
   const touches = useRef(new Map<number, { x: number; y: number }>());
   const pinch = useRef<{ d0: number; z0: number } | null>(null);
-  const zoomRef = useRef(1);
+  const zoomRef = useRef(zoom);
   const anchor = useRef<{ dx: number; dy: number; cx: number; cy: number } | null>(null);
   const loaded = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -1322,75 +1330,81 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   return (
     <div className="notiz-workspace relative h-full flex-1 min-w-0 flex flex-col bg-slate-100 text-slate-800 select-none overscroll-none" data-theme={darkMode ? "dark" : "light"}>
-      <header className="flex items-center gap-1.5 px-3 py-2 bg-white border-b border-slate-200 flex-wrap">
-        {onLibrary && <button className={btn(false)} onClick={onLibrary}>Bibliothek</button>}
-        <button className={btn(sidebar)} onClick={() => setSidebar(!sidebar)}>Seiten</button>
-        <button className={btn(toolbarCollapsed)} onClick={() => setToolbarCollapsed(!toolbarCollapsed)} aria-pressed={toolbarCollapsed} title={toolbarCollapsed ? "Werkzeugleiste ausklappen" : "Werkzeugleiste einklappen"}>
-          {toolbarCollapsed ? "Leiste ausklappen" : "Leiste einklappen"}
-        </button>
-        <Sep />
-        {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " inline-flex items-center gap-1.5"} onClick={() => {
-          if (t === "pen") { const p = activePen.kind === "marker" ? penProfiles.find((x) => x.kind !== "marker") : activePen; if (p) choosePen(p); else setTool(t); }
-          else if (t === "highlighter") { const p = penProfiles.find((x) => x.kind === "marker"); if (p) choosePen(p); else setTool(t); }
-          else setTool(t);
-        }}>{toolIcon(t)}{!toolbarCollapsed && <span>{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
-        {(tool === "pen" || tool === "highlighter") && (
-          <>
-            <select aria-label="Stifttyp" title="Strichverhalten" className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
-              onChange={(e) => { const kind = e.target.value as PenKind; changePen({ kind }); setTool(kind === "marker" ? "highlighter" : "pen"); }}>
-              <option value="ballpoint">Kugelschreiber</option><option value="fountain">Füller</option><option value="pencil">Bleistift</option><option value="marker">Textmarker</option>
+      <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-2 bg-white border-b border-slate-200 flex-wrap">
+        <div className="notiz-toolbar__row notiz-toolbar__primary">
+          {onLibrary && <button className={btn(false)} onClick={onLibrary} aria-label="Bibliothek öffnen">Bibliothek</button>}
+          <button className={btn(sidebar)} onClick={() => setSidebar(!sidebar)} aria-pressed={sidebar}>Seiten</button>
+          <button className={btn(toolbarCollapsed) + " notiz-toolbar__collapse"} onClick={() => setToolbarCollapsed(!toolbarCollapsed)} aria-pressed={toolbarCollapsed} title={toolbarCollapsed ? "Werkzeugleiste ausklappen" : "Werkzeugleiste einklappen"}>
+            {toolbarCollapsed ? "Leiste +" : "Leiste −"}
+          </button>
+          <Sep />
+          {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => {
+            if (t === "pen") { const p = activePen.kind === "marker" ? penProfiles.find((x) => x.kind !== "marker") : activePen; if (p) choosePen(p); else setTool(t); }
+            else if (t === "highlighter") { const p = penProfiles.find((x) => x.kind === "marker"); if (p) choosePen(p); else setTool(t); }
+            else setTool(t);
+          }}>{toolIcon(t)}{!toolbarCollapsed && <span className="notiz-toolbar__tool-label">{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
+          {(tool === "pen" || tool === "highlighter") && (
+            <>
+              <select aria-label="Stifttyp" title="Strichverhalten" className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
+                onChange={(e) => { const kind = e.target.value as PenKind; changePen({ kind }); setTool(kind === "marker" ? "highlighter" : "pen"); }}>
+                <option value="ballpoint">Kugelschreiber</option><option value="fountain">Füller</option><option value="pencil">Bleistift</option><option value="marker">Textmarker</option>
+              </select>
+              {toolbarCollapsed && <select aria-label="Gespeichertes Stiftprofil" title="Meine Stifte" className="max-w-36 px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.id} onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
+                {penProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.color}</option>)}
+              </select>}
+              {toolbarCollapsed && <button className={btn(false)} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>}
+            </>
+          )}
+          {tool === "eraser" && (
+            <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={eraseMode} onChange={(e) => setEraseMode(e.target.value as "pixel" | "stroke")}>
+              <option value="pixel">Nur berührter Teil</option>
+              <option value="stroke">Ganzer Strich</option>
             </select>
-            {toolbarCollapsed && <select aria-label="Gespeichertes Stiftprofil" title="Meine Stifte" className="max-w-36 px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.id} onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
-              {penProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.color}</option>)}
-            </select>}
-            {toolbarCollapsed && <button className={btn(false)} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>}
-          </>
-        )}
-        {tool === "eraser" && (
-          <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={eraseMode} onChange={(e) => setEraseMode(e.target.value as "pixel" | "stroke")}>
-            <option value="pixel">Nur berührter Teil</option>
-            <option value="stroke">Ganzer Strich</option>
+          )}
+          {tool === "shape" && (
+            <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
+              <option value="rect">Rechteck</option><option value="triangle">Dreieck</option><option value="ellipse">Kreis</option><option value="line">Gerade Linie</option><option value="arrow">Pfeil</option>
+            </select>
+          )}
+        </div>
+        <div className="notiz-toolbar__row notiz-toolbar__ink">
+          {(tool === "pen" || tool === "shape") && <div className="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5" aria-label="Linienstil">
+            {LINE_STYLES.map((s) => <button key={s.id} title={s.title} aria-label={s.title} onClick={() => setLineStyle(s.id)} className={`rounded px-1.5 py-1 text-xs font-mono ${lineStyle === s.id ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}>{s.label}</button>)}
+          </div>}
+          <Sep />
+          {palette.map((c) => (
+            <button key={c} aria-label={`Farbe ${c}`} onClick={() => { setColor(c); changePen({ color: c }); }} style={{ background: c }} className={`notiz-toolbar__swatch w-7 h-7 rounded-full border border-slate-300 ${color === c ? "ring-2 ring-offset-2 ring-slate-900" : ""}`} />
+          ))}
+          <label className="notiz-toolbar__color-add relative inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border border-dashed border-slate-400 text-slate-500" title="Eigene Stiftfarbe hinzufügen" aria-label="Eigene Stiftfarbe hinzufügen">
+            <span aria-hidden="true">＋</span><input type="color" className="absolute inset-0 h-full w-full cursor-pointer opacity-0" onChange={(e) => addCustomColor(e.target.value)} aria-label="Eigene Stiftfarbe" />
+          </label>
+          <input type="range" min={1} max={10} step={0.5} value={size} onChange={(e) => { const v = +e.target.value; setSize(v); changePen({ size: v }); }} className="w-24" aria-label="Strichstärke / Radiergröße" />
+          {(tool === "pen" || tool === "shape") && <span className="notiz-toolbar__hold-hint text-[10px] text-slate-500">Am Ende 0,65 s halten = glätten</span>}
+          {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Markierte Linien und Grundformen eines Schaltbilds begradigen">Schaltbild glätten</button>}
+        </div>
+        <div className="notiz-toolbar__row notiz-toolbar__document">
+          <Sep />
+          <button className={btn(false)} onClick={undo} title="Strg+Z">Rückgängig</button>
+          <button className={btn(false)} onClick={redo} title="Strg+Y">Wiederholen</button>
+          <Sep />
+          <button className={btn(false)} onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
+          <button className={btn(false)} onClick={() => setZoom(1)} title="Strg+0">{Math.round(zoom * 100)} %</button>
+          <button className={btn(false)} onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
+          <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
+          <Sep />
+          <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>
+          {title && <span className="notiz-toolbar__title text-sm font-medium truncate max-w-[18rem] ml-2">{title}</span>}
+          <span className="notiz-toolbar__saved text-xs text-slate-500 ml-2">{saved}</span>
+          <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
+            <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
           </select>
-        )}
-        {tool === "shape" && (
-          <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
-            <option value="rect">Rechteck</option><option value="triangle">Dreieck</option><option value="ellipse">Kreis</option><option value="line">Gerade Linie</option><option value="arrow">Pfeil</option>
-          </select>
-        )}
-        {(tool === "pen" || tool === "shape") && <div className="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5" aria-label="Linienstil">
-          {LINE_STYLES.map((s) => <button key={s.id} title={s.title} aria-label={s.title} onClick={() => setLineStyle(s.id)} className={`rounded px-1.5 py-1 text-xs font-mono ${lineStyle === s.id ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}>{s.label}</button>)}
-        </div>}
-        <Sep />
-        {palette.map((c) => (
-          <button key={c} aria-label={`Farbe ${c}`} onClick={() => { setColor(c); changePen({ color: c }); }} style={{ background: c }} className={`w-7 h-7 rounded-full border border-slate-300 ${color === c ? "ring-2 ring-offset-2 ring-slate-900" : ""}`} />
-        ))}
-        <label className="relative inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border border-dashed border-slate-400 text-slate-500" title="Eigene Stiftfarbe hinzufügen" aria-label="Eigene Stiftfarbe hinzufügen">
-          <span aria-hidden="true">＋</span><input type="color" className="absolute inset-0 h-full w-full cursor-pointer opacity-0" onChange={(e) => addCustomColor(e.target.value)} aria-label="Eigene Stiftfarbe" />
-        </label>
-        <input type="range" min={1} max={10} step={0.5} value={size} onChange={(e) => { const v = +e.target.value; setSize(v); changePen({ size: v }); }} className="w-24" aria-label="Strichstärke / Radiergröße" />
-        {(tool === "pen" || tool === "shape") && <span className="text-[10px] text-slate-500">Am Ende 0,65 s halten = glätten</span>}
-        {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Markierte Linien und Grundformen eines Schaltbilds begradigen">Schaltbild glätten</button>}
-        <Sep />
-        <button className={btn(false)} onClick={undo} title="Strg+Z">Rückgängig</button>
-        <button className={btn(false)} onClick={redo} title="Strg+Y">Wiederholen</button>
-        <Sep />
-        <button className={btn(false)} onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
-        <button className={btn(false)} onClick={() => setZoom(1)} title="Strg+0">{Math.round(zoom * 100)} %</button>
-        <button className={btn(false)} onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
-        <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
-        <Sep />
-        <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>
-        {title && <span className="text-sm font-medium truncate max-w-[18rem] ml-2">{title}</span>}
-        <span className="text-xs text-slate-500 ml-2">{saved}</span>
-        <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
-          <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
-        </select>
-        <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
-        <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
-        <label className={btn(false) + " cursor-pointer ml-auto"}>
-          PDF importieren
-          <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
-        </label>
+          <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
+          <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
+          <label className={btn(false) + " cursor-pointer ml-auto"}>
+            PDF importieren
+            <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
+          </label>
+        </div>
       </header>
 
       {(tool === "pen" || tool === "highlighter") && !toolbarCollapsed && <div className="notiz-pen-strip flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white px-3 py-2" role="group" aria-label="Meine Stiftprofile">
@@ -1406,7 +1420,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
       <div className="flex flex-1 min-h-0">
         {sidebar && (
-          <aside className="w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2 space-y-1">
+          <aside className="notiz-page-sidebar w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2 space-y-1">
             {blocks.map((b, i) => (
               <div key={b.id}>
                 <button onClick={() => insertEmptyPageAt(i)} title="Leere Seite hier einfügen" aria-label={"Leere Seite vor Seite " + (i + 1) + " einfügen"}

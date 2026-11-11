@@ -197,3 +197,190 @@ select {
 .notiz-workspace canvas {
   filter: none !important;
 }
+
+.notiz-library-backdrop {
+  display: none;
+}
+
+.notiz-library-close {
+  display: none;
+}
+
+.notiz-toolbar__row {
+  display: contents;
+}
+
+@media (max-width: 1279px) {
+  .notiz-library-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    width: 100%;
+    border: 0;
+    background: rgb(15 23 42 / 42%);
+  }
+
+  .notiz-library {
+    position: fixed !important;
+    z-index: 50;
+    inset: 0 auto 0 0;
+    width: min(88vw, 360px) !important;
+    max-width: 360px;
+    height: 100vh;
+    height: 100dvh;
+    padding-bottom: env(safe-area-inset-bottom);
+    box-shadow: 14px 0 38px rgb(15 23 42 / 22%);
+  }
+
+  .notiz-library-close {
+    display: grid;
+    width: 38px;
+    height: 38px;
+    flex: 0 0 auto;
+    place-items: center;
+    border-radius: 10px;
+    background: #f1f5f9;
+    color: #334155;
+  }
+}
+
+@media (max-width: 1279px) {
+  .notiz-app {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .notiz-app > main {
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    flex: 1 1 auto;
+  }
+
+  .notiz-workspace {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .notiz-toolbar {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 0;
+    max-width: 100%;
+    padding: 3px 6px 0;
+    overflow: hidden;
+  }
+
+  .notiz-toolbar__row {
+    display: flex;
+    flex: 0 0 42px;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-bottom: 1px solid #e2e8f0;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    touch-action: pan-x;
+  }
+
+  .notiz-toolbar__row > * {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .notiz-toolbar__row > button,
+  .notiz-toolbar__row > label,
+  .notiz-toolbar__row > select {
+    min-height: 36px;
+  }
+
+  .notiz-toolbar__primary .notiz-toolbar__tool {
+    min-width: 42px;
+    justify-content: center;
+    padding: 8px;
+  }
+
+  .notiz-toolbar__ink [aria-label="Linienstil"] > button {
+    min-width: 30px;
+    min-height: 32px;
+    padding: 4px;
+  }
+
+  .notiz-toolbar__hold-hint {
+    max-width: 112px;
+    white-space: normal !important;
+    line-height: 1.2;
+  }
+
+  .notiz-pen-strip {
+    flex: 0 0 42px;
+    min-height: 42px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+
+  .notiz-page-sidebar {
+    width: clamp(128px, 24vw, 180px) !important;
+  }
+}
+
+@media (max-width: 540px) {
+  .notiz-toolbar {
+    padding-right: 4px;
+    padding-left: 4px;
+  }
+
+  .notiz-toolbar__row {
+    flex-basis: 40px;
+    gap: 3px;
+  }
+
+  .notiz-toolbar__tool-label,
+  .notiz-toolbar__hold-hint,
+  .notiz-toolbar__saved {
+    display: none;
+  }
+
+  .notiz-toolbar__collapse {
+    max-width: 76px;
+    padding-right: 7px;
+    padding-left: 7px;
+    font-size: 11px;
+  }
+
+  .notiz-toolbar__primary select {
+    max-width: 148px;
+    font-size: 12px;
+  }
+
+  .notiz-toolbar__document .notiz-toolbar__title {
+    max-width: 140px;
+    font-size: 12px;
+  }
+
+  .notiz-toolbar__swatch {
+    width: 26px;
+    height: 26px;
+  }
+
+  .notiz-toolbar__ink input[type="range"] {
+    width: 76px;
+  }
+
+  .notiz-page-sidebar {
+    width: min(42vw, 160px) !important;
+    padding: 5px;
+  }
+}

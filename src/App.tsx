@@ -22,7 +22,7 @@ export default function App() {
   } = useRegisterSW({ immediate: true });
   const [nodes, setNodes] = useState<N[]>([]);
   const [active, setActive] = useState<string | null>(null);
-  const [lib, setLib] = useState(true);
+  const [lib, setLib] = useState(() => window.matchMedia("(min-width: 1280px)").matches);
   const [q, setQ] = useState("");
   const [edit, setEdit] = useState<string | null>(null);
   const [menu, setMenu] = useState<string | null>(null);
@@ -124,7 +124,13 @@ export default function App() {
     setMoving(null);
   };
   const commit = (id: string, v: string) => { if (v.trim()) patch(id, { name: v.trim() }); setEdit(null); };
-  const open = (n: N) => { if (n.type === "folder") patch(n.id, { open: !n.open }); else setActive(n.id); };
+  const open = (n: N) => {
+    if (n.type === "folder") patch(n.id, { open: !n.open });
+    else {
+      setActive(n.id);
+      if (window.matchMedia("(max-width: 1279px)").matches) setLib(false);
+    }
+  };
 
   const backup = async () => {
     // Rasterbilder (pgimg:) sind abgeleitet und werden nicht gesichert; PDF-Originale können Blob oder ArrayBuffer sein
@@ -206,10 +212,12 @@ export default function App() {
 
   return (
     <div className="notiz-app h-screen flex bg-slate-100 text-slate-800" data-theme={darkMode ? "dark" : "light"}>
+      {lib && <button className="notiz-library-backdrop" aria-label="Bibliothek schließen" onClick={() => setLib(false)} />}
       {lib && (
-        <aside className="w-72 shrink-0 flex flex-col bg-white border-r border-slate-200">
-          <div className="px-3 pt-3 pb-1">
+        <aside className="notiz-library w-72 shrink-0 flex flex-col bg-white border-r border-slate-200">
+          <div className="notiz-library-brand flex items-center justify-between px-3 pt-3 pb-1">
             <img src={import.meta.env.BASE_URL + "notizraum-logo.svg"} alt="Notizraum" className="h-9 w-auto" />
+            <button className="notiz-library-close" onClick={() => setLib(false)} aria-label="Bibliothek schließen">✕</button>
           </div>
           <div className="p-2 space-y-2 border-b border-slate-200">
             <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Suchen (Semester, Fach, Thema)…" className="w-full px-3 py-2 rounded-lg bg-slate-100 text-sm outline-none focus:ring-2 focus:ring-blue-400" />
