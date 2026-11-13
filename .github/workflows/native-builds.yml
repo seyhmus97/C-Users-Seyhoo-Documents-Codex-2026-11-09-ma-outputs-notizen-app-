@@ -17,6 +17,8 @@ jobs:
   windows:
     name: Windows ${{ matrix.label }}
     runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: D:\t
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +52,7 @@ jobs:
       - name: Windows-Installer sammeln
         shell: pwsh
         run: |
-          $bundle = "src-tauri/target/${{ matrix.target }}/release/bundle"
+          $bundle = "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/bundle"
           $out = "release-assets"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $msi = Get-ChildItem -Path "$bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
