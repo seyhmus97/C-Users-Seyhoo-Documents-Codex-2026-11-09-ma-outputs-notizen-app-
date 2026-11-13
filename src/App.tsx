@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRegisterSW } from "virtual:pwa-register/react";
 import NoteCanvas, { kvAll, kvDel, kvGet, kvReplaceAll, kvSet, rasterKey } from "./NoteCanvas";
 import { saveFile } from "./saveFile";
+import StudySpace from "./StudySpace";
 
 const toB64 = (b: ArrayBuffer) => { let s = ""; const u = new Uint8Array(b); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
 const fromB64 = (t: string) => Uint8Array.from(atob(t), (c) => c.charCodeAt(0)).buffer;
@@ -22,6 +23,7 @@ export default function App() {
   } = useRegisterSW({ immediate: true });
   const [nodes, setNodes] = useState<N[]>([]);
   const [active, setActive] = useState<string | null>(null);
+  const [studySpace, setStudySpace] = useState(false);
   const [lib, setLib] = useState(() => window.matchMedia("(min-width: 1280px)").matches);
   const [q, setQ] = useState("");
   const [edit, setEdit] = useState<string | null>(null);
@@ -229,6 +231,7 @@ export default function App() {
               <Btn on={backup}>Backup speichern</Btn>
               <Btn on={() => restoreInput.current?.click()}>Backup laden</Btn>
             </div>
+            <button onClick={() => setStudySpace(true)} className="w-full rounded-lg bg-indigo-600 px-3 py-2 text-left text-sm font-semibold text-white hover:bg-indigo-700">👥 Lerngruppen · MVP</button>
             {installPrompt && <button onClick={installApp} className="w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white">Notizraum installieren</button>}
             {moving && (
               <div className="p-2 rounded-lg bg-blue-50 text-xs text-blue-900 space-y-1.5">
@@ -245,7 +248,9 @@ export default function App() {
         </aside>
       )}
       <main className="flex-1 min-w-0 flex h-screen">
-        {active && byId(active) ? (
+        {studySpace ? (
+          <StudySpace onBack={() => setStudySpace(false)} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
+        ) : active && byId(active) ? (
           <NoteCanvas key={active} noteId={active} title={pathOf(active)} onLibrary={() => setLib(!lib)} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
         ) : (
           <div className="m-auto text-center text-slate-500 space-y-3">
