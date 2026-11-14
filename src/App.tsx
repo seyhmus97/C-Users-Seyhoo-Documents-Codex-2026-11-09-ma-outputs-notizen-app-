@@ -4,6 +4,8 @@ import { useRegisterSW } from "virtual:pwa-register/react";
 import NoteCanvas, { kvAll, kvDel, kvGet, kvReplaceAll, kvSet, rasterKey } from "./NoteCanvas";
 import { saveFile } from "./saveFile";
 import StudySpace from "./StudySpace";
+import Tutorial, { openTutorial } from "./Tutorial";
+import { GROUPS_ENABLED } from "./features";
 
 const toB64 = (b: ArrayBuffer) => { let s = ""; const u = new Uint8Array(b); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
 const fromB64 = (t: string) => Uint8Array.from(atob(t), (c) => c.charCodeAt(0)).buffer;
@@ -14,6 +16,9 @@ type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Pro
 const uid = () => Math.random().toString(36).slice(2, 10);
 const FOLDER_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#db2777", "#475569"];
 const FOLDER_ICONS = ["📁", "📚", "🎓", "⚡", "📐", "🧪", "💻", "🔬", "🧠", "🗂️"];
+// Bibliotheksbreite (Desktop): per Griff am rechten Rand frei verschiebbar, wird lokal gemerkt
+const LIB_MIN = 200, LIB_MAX = 560, LIB_DEFAULT = 288, LIB_CLOSE = 150;
+const readLibWidth = () => { try { const v = Number(localStorage.getItem("xnts-library-width")); return Number.isFinite(v) && v >= LIB_MIN && v <= LIB_MAX ? v : LIB_DEFAULT; } catch { return LIB_DEFAULT; } };
 
 export default function App() {
   const {
@@ -25,7 +30,35 @@ export default function App() {
   const [active, setActive] = useState<string | null>(null);
   const [studySpace, setStudySpace] = useState(false);
   const [lib, setLib] = useState(() => window.matchMedia("(min-width: 1280px)").matches);
+  const [libWidth, setLibWidth] = useState(readLibWidth);
+  const [libDragging, setLibDragging] = useState(false);
+  // Fokusmodus der Notiz: Bibliothek mit ausblenden und beim Beenden wieder so herstellen, wie sie war
+  const libBeforeFocus = useRef<boolean | null>(null);
+  const libRef = useRef(lib); libRef.current = lib;
+  const onNoteFocus = useRef((on: boolean) => {
+    if (on) { if (libBeforeFocus.current === null) libBeforeFocus.current = libRef.current; setLib(false); }
+    else if (libBeforeFocus.current !== null) { setLib(libBeforeFocus.current); libBeforeFocus.current = null; }
+  }).current;
+  useEffect(() => { try { localStorage.setItem("xnts-library-width", String(Math.round(libWidth))); } catch { /* gilt dann nur für diese Sitzung */ } }, [libWidth]);
+  /** Griff zwischen Bibliothek und Notiz: ziehen = Breite ändern, ganz nach links = Bibliothek einklappen, Doppelklick = Standardbreite */
+  const startLibResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault(); e.stopPropagation();
+    const el = e.currentTarget, x0 = e.clientX, w0 = libWidth;
+    try { el.setPointerCapture(e.pointerId); } catch { /* Fenster-Listener reichen auch ohne Capture */ }
+    setLibDragging(true);
+    let latest = w0;
+    const move = (ev: PointerEvent) => { if (ev.pointerId !== e.pointerId) return; latest = w0 + ev.clientX - x0; setLibWidth(Math.min(LIB_MAX, Math.max(LIB_MIN, latest))); };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
+      setLibDragging(false);
+      if (latest < LIB_CLOSE) { setLibWidth(w0 < LIB_MIN + 20 ? LIB_DEFAULT : w0); setLib(false); } // weit nach links gezogen → einklappen (Breite bleibt gemerkt)
+    };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
+  };
   const [q, setQ] = useState("");
+  const [libraryMenu, setLibraryMenu] = useState(false);
   const [edit, setEdit] = useState<string | null>(null);
   const [menu, setMenu] = useState<string | null>(null);
   const [moving, setMoving] = useState<string | null>(null);
@@ -139,7 +172,7 @@ export default function App() {
     const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:") && k !== "app:preferences").map(async ([k, v]) => [
       k, v instanceof Blob ? { __ab: toB64(await v.arrayBuffer()), type: v.type } : v instanceof ArrayBuffer ? { __ab: toB64(v) } : v,
     ]));
-    const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed"];
+    const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
     entries.push(["app:preferences", Object.fromEntries(preferenceKeys.map((k) => [k, localStorage.getItem(k)]))]);
     await saveFile(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }), `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`);
   };
@@ -152,7 +185,7 @@ export default function App() {
       const entries: [string, unknown][] = d.entries.map(([k, v]: [string, unknown]): [string, unknown] => [k, v && typeof v === "object" && "__ab" in v ? (() => { const o = v as { __ab: string; type?: string }, ab = fromB64(o.__ab); return o.type ? new Blob([ab], { type: o.type }) : ab; })() : v]);
       const preferences = entries.find(([k]) => k === "app:preferences")?.[1];
       if (preferences && typeof preferences === "object") {
-        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed"]);
+        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"]);
         for (const [key, value] of Object.entries(preferences)) if (allowed.has(key)) {
           if (typeof value === "string") localStorage.setItem(key, value); else localStorage.removeItem(key);
         }
@@ -184,7 +217,7 @@ export default function App() {
               {flat && <div className="text-xs opacity-60 truncate pl-4">{pathOf(n.id)}</div>}
             </button>
           )}
-          {canDrop && <Btn on={() => moveTo(n.id)}>Hierher</Btn>}
+          {canDrop && <button className="notiz-library-drop" onClick={() => moveTo(n.id)}>In Ordner</button>}
           {edit !== n.id && !moving && <button aria-label="Aktionen" className="px-2 py-1 rounded opacity-70 hover:opacity-100" onClick={() => setMenu(menu === n.id ? null : n.id)}>⋯</button>}
         </div>
         {menu === n.id && (
@@ -210,48 +243,67 @@ export default function App() {
     );
   };
 
+  // Im Lernraum gehört die Breite der Gruppennotiz: die persönliche Bibliothek bleibt dort ausgeblendet
+  const showLib = lib && !(GROUPS_ENABLED && studySpace);
   const hits = q.trim() ? nodes.filter((n) => n.name.toLowerCase().includes(q.trim().toLowerCase())) : null;
 
   return (
     <div className="notiz-app h-screen flex bg-slate-100 text-slate-800" data-theme={darkMode ? "dark" : "light"}>
-      {lib && <button className="notiz-library-backdrop" aria-label="Bibliothek schließen" onClick={() => setLib(false)} />}
-      {lib && (
-        <aside className="notiz-library w-72 shrink-0 flex flex-col bg-white border-r border-slate-200">
+      {showLib && <button className="notiz-library-backdrop" aria-label="Bibliothek schließen" onClick={() => setLib(false)} />}
+      {showLib && (
+        <aside className={`notiz-library shrink-0 flex flex-col bg-white border-r border-slate-200${libDragging ? " is-resizing" : ""}`} style={{ width: libWidth }}>
+          <div className="notiz-library-resizer" role="separator" aria-orientation="vertical" aria-label="Bibliotheksbreite ändern" aria-valuemin={LIB_MIN} aria-valuemax={LIB_MAX} aria-valuenow={Math.round(libWidth)} tabIndex={0}
+            title="Ziehen = Breite ändern · ganz nach links = einklappen · Doppelklick = Standardbreite"
+            onPointerDown={startLibResize} onDoubleClick={() => setLibWidth(LIB_DEFAULT)}
+            onKeyDown={(e) => { if (e.key === "ArrowLeft") setLibWidth((w) => Math.max(LIB_MIN, w - 16)); else if (e.key === "ArrowRight") setLibWidth((w) => Math.min(LIB_MAX, w + 16)); }}>
+            <span aria-hidden="true">‹‖›</span>
+          </div>
           <div className="notiz-library-brand flex items-center justify-between px-3 pt-3 pb-1">
-            <img src={import.meta.env.BASE_URL + "notizraum-logo.svg"} alt="Notizraum" className="h-9 w-auto" />
+            <img src={import.meta.env.BASE_URL + "notizraum-logo.svg"} alt="XNTS" className="h-9 w-auto" />
             <button className="notiz-library-close" onClick={() => setLib(false)} aria-label="Bibliothek schließen">✕</button>
           </div>
-          <div className="p-2 space-y-2 border-b border-slate-200">
-            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Suchen (Semester, Fach, Thema)…" className="w-full px-3 py-2 rounded-lg bg-slate-100 text-sm outline-none focus:ring-2 focus:ring-blue-400" />
-            <div className="flex gap-1">
-              <Btn on={() => add(null, "folder")}>+ Semester / Ordner</Btn>
-              <Btn on={() => add(null, "note")}>+ Notiz</Btn>
+          <div className="notiz-library-tools p-2 border-b border-slate-200">
+            <label className="notiz-library-search"><span aria-hidden="true">⌕</span><input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Bibliothek durchsuchen" aria-label="Bibliothek durchsuchen" />{q && <button aria-label="Suche leeren" onClick={() => setQ("")}>×</button>}</label>
+            <div className="notiz-library-primary-actions">
+              <button className="notiz-library-add notiz-library-add--primary" onClick={() => add(null, "note")}>＋ <span>Notiz</span></button>
+              <button className="notiz-library-add" onClick={() => add(null, "folder")}>＋ <span>Ordner</span></button>
             </div>
-            <div className="flex gap-1">
-              <Btn on={backup}>Backup speichern</Btn>
-              <Btn on={() => restoreInput.current?.click()}>Backup laden</Btn>
+            {GROUPS_ENABLED && <button onClick={() => setStudySpace(true)} className="notiz-library-groups"><span>👥 Lerngruppen &amp; Chat</span><small>Prototyp</small><b aria-hidden="true">›</b></button>}
+            <div className="notiz-library-more-wrap">
+              <button className="notiz-library-more" aria-haspopup="menu" aria-expanded={libraryMenu} onClick={() => setLibraryMenu((v) => !v)}>⋯ <span>Mehr</span></button>
+              {libraryMenu && <div className="notiz-library-more-menu" role="menu" onKeyDown={(e) => { if (e.key === "Escape") setLibraryMenu(false); }}>
+                <button role="menuitem" onClick={() => { setLibraryMenu(false); backup(); }}>Backup speichern</button>
+                <button role="menuitem" onClick={() => { setLibraryMenu(false); restoreInput.current?.click(); }}>Backup laden</button>
+                <button role="menuitem" onClick={() => { setLibraryMenu(false); openTutorial("overview"); }}>Hilfe · Visuelle Anleitungen</button>
+                {installPrompt && <button role="menuitem" onClick={() => { setLibraryMenu(false); installApp(); }}>XNTS installieren</button>}
+              </div>}
             </div>
-            <button onClick={() => setStudySpace(true)} className="w-full rounded-lg bg-indigo-600 px-3 py-2 text-left text-sm font-semibold text-white hover:bg-indigo-700">👥 Lerngruppen · MVP</button>
-            {installPrompt && <button onClick={installApp} className="w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white">Notizraum installieren</button>}
             {moving && (
-              <div className="p-2 rounded-lg bg-blue-50 text-xs text-blue-900 space-y-1.5">
-                <div>„{byId(moving)?.name}“ verschieben nach …</div>
-                <div className="flex gap-1"><Btn on={() => moveTo(null)}>Oberste Ebene</Btn><Btn on={() => setMoving(null)}>Abbrechen</Btn></div>
+              <div className="notiz-library-move-notice" role="status">
+                <strong>Eintrag verschieben</strong>
+                <span>„{byId(moving)?.name}“ · Zielordner in der Liste wählen</span>
+                <span className="notiz-library-move-path">Aktuell: {pathOf(moving)}</span>
+                <div><button onClick={() => moveTo(null)}>An oberste Ebene</button><button onClick={() => setMoving(null)}>Abbrechen</button></div>
               </div>
             )}
           </div>
           <nav className="flex-1 overflow-auto p-2 space-y-0.5">
-            {hits ? (hits.length ? hits.map((n) => row(n, 0, true)) : <p className="text-sm text-slate-500 p-2">Nichts gefunden.</p>)
+            {hits ? (hits.length ? hits.map((n) => row(n, 0, true)) : <div className="notiz-library-empty notiz-library-empty--search"><span aria-hidden="true">⌕</span><strong>Keine Treffer</strong><p>Versuche einen anderen Suchbegriff.</p><button onClick={() => setQ("")}>Suche leeren</button></div>)
               : nodes.length ? nodes.filter((n) => !n.parentId).map((n) => row(n, 0))
-              : <p className="text-sm text-slate-500 p-2">Lege oben dein erstes Semester an.</p>}
+              : <div className="notiz-library-empty"><div className="notiz-library-empty-art" aria-hidden="true"><span>✳</span><i>✎</i></div><strong>Dein Notizraum beginnt hier</strong><p>Erstelle eine Notiz für deine Ideen oder einen Ordner, um Themen zu sammeln.</p><button className="notiz-library-empty-primary" onClick={() => add(null, "note")}>＋ Erste Notiz</button><button onClick={() => add(null, "folder")}>Ordner anlegen</button></div>}
           </nav>
+          <div className="xnts-sidebar-art" aria-hidden="true">
+            <img src={import.meta.env.BASE_URL + "xnts-art-collage.webp"} alt="" />
+            <span>IDEAS · STUDY · ART</span>
+          </div>
         </aside>
       )}
+      <Tutorial />
       <main className="flex-1 min-w-0 flex h-screen">
-        {studySpace ? (
+        {GROUPS_ENABLED && studySpace ? (
           <StudySpace onBack={() => setStudySpace(false)} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
         ) : active && byId(active) ? (
-          <NoteCanvas key={active} noteId={active} title={pathOf(active)} onLibrary={() => setLib(!lib)} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
+          <NoteCanvas key={active} noteId={active} title={pathOf(active)} onLibrary={() => setLib(!lib)} onFocusChange={onNoteFocus} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
         ) : (
           <div className="m-auto text-center text-slate-500 space-y-3">
             <p>Wähle ein Thema oder lege eine Notiz an.</p>
@@ -263,7 +315,7 @@ export default function App() {
       {(offlineReady || needRefresh) && (
         <div role="status" className="fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border border-slate-200 bg-white p-4 shadow-xl">
           <p className="text-sm text-slate-800">
-            {needRefresh ? "Eine neue Version von Notizraum ist bereit." : "Notizraum ist jetzt offline verfügbar."}
+            {needRefresh ? "Eine neue Version von XNTS ist bereit." : "XNTS ist jetzt offline verfügbar."}
           </p>
           <div className="mt-3 flex justify-end gap-2">
             {needRefresh && <button onClick={() => updateServiceWorker(true)} className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white">Jetzt aktualisieren</button>}

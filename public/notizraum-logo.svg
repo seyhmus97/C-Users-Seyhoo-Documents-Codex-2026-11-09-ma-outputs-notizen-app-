@@ -1,21 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 690 170" role="img" aria-labelledby="title desc">
-  <title id="title">Notizraum</title>
-  <desc id="desc">Ein aufgeschlagenes Notizblatt mit blauem Stift.</desc>
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#182644"/><stop offset="1" stop-color="#101528"/></linearGradient>
-    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#75dcff"/><stop offset="1" stop-color="#4389ff"/></linearGradient>
-  </defs>
-  <g transform="translate(9 9) scale(.3)">
-    <rect width="512" height="512" rx="118" fill="url(#bg)"/>
-    <circle cx="380" cy="128" r="104" fill="#4389ff" opacity=".08"/>
-    <path d="M131 94h150l99 99v205a23 23 0 0 1-23 23H131a23 23 0 0 1-23-23V117a23 23 0 0 1 23-23Z" fill="#263750" opacity=".72" transform="translate(14 17)"/>
-    <path d="M131 78h150l99 99v205a23 23 0 0 1-23 23H131a23 23 0 0 1-23-23V101a23 23 0 0 1 23-23Z" fill="#f7fbff"/>
-    <path d="M281 78v76a23 23 0 0 0 23 23h76" fill="#dbeaff" stroke="#c4d8f3" stroke-width="5" stroke-linejoin="round"/>
-    <path d="M158 222h156M158 266h132M158 310h156" fill="none" stroke="#aec4e3" stroke-width="12" stroke-linecap="round"/>
-    <path d="M158 354h82" fill="none" stroke="url(#blue)" stroke-width="14" stroke-linecap="round"/>
-    <path d="m330 349 65-108a20 20 0 0 1 35 21l-65 108-48 30 13-51Z" fill="url(#blue)"/>
-    <path d="m330 349 35 21-48 30 13-51Z" fill="#f7fbff" opacity=".94"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 132" role="img" aria-labelledby="title desc">
+  <title id="title">XNTS</title>
+  <desc id="desc">XNTS — Xnotes für Ideen, Notizen und Kunst.</desc>
+  <g transform="translate(10 15)">
+    <path d="M19 5h40l23 22v48c0 5-3 8-8 9l-50 9c-6 1-10-3-10-8V15c0-6 2-10 5-10Z" fill="#f3df35"/>
+    <path d="M59 5v17c0 4 3 6 7 6h16" fill="#5738df"/>
+    <path d="M27 62c6-19 11 14 18 0 6-13 11-14 17 0 5 12 11 14 17-3" fill="none" stroke="#191620" stroke-linecap="round" stroke-linejoin="round" stroke-width="5"/>
+    <path d="M28 76h39" fill="none" stroke="#5738df" stroke-linecap="round" stroke-width="3"/>
+    <circle cx="29" cy="39" r="3" fill="#5738df"/>
   </g>
-  <text x="174" y="83" fill="#11182e" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="52" font-weight="720" letter-spacing="-2">notizraum</text>
-  <text x="178" y="120" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="16" font-weight="600" letter-spacing="3.2">IDEEN · PDF · SKIZZEN</text>
+  <text x="137" y="78" fill="#191620" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="59" font-weight="850" letter-spacing="3">XNTS</text>
+  <text x="142" y="108" fill="#5738df" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="750" letter-spacing="3.2">XNOTES · IDEAS · ART</text>
 </svg>

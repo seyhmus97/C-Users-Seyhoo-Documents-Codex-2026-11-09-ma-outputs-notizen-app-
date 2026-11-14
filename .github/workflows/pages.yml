@@ -45,7 +45,7 @@ jobs:
             echo "VITE_BASE_PATH=/$repo/" >> "$GITHUB_ENV"
           fi
       - name: Website und App bauen
-        run: pnpm run build
+        run: pnpm run build:solo
       - name: GitHub Pages vorbereiten
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
       - name: Build veröffentlichen
@@ -56,4 +56,3 @@ jobs:
         run: sleep 10
       - name: GitHub Pages deployen
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
-

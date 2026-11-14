@@ -4,11 +4,12 @@ android {
     namespace = "de.notizraum.app"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "de.notizraum.app"
+        // Edition „ohne Gruppenchat“: ./gradlew assembleDebug -PxntsAppIdSuffix=.solo → eigene App-ID, beide Versionen parallel installierbar
+        applicationId "de.notizraum.app" + (project.hasProperty("xntsAppIdSuffix") ? project.property("xntsAppIdSuffix") : "")
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode 8
+        versionName "1.0.8"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

@@ -1,4 +1,4 @@
-name: Build installable Notizraum apps
+name: Build installable XNTS apps
 
 on:
   push:
@@ -6,7 +6,6 @@ on:
     tags: ["v*"]
     paths-ignore:
       - index.html
-      - .github/workflows/native-builds.yml
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -52,7 +51,7 @@ jobs:
       - name: App-Symbole erzeugen
         run: pnpm run icons:generate
       - name: Native Windows-App bauen
-        run: pnpm tauri build --target ${{ matrix.target }}
+        run: pnpm tauri build --config src-tauri/tauri.solo.conf.json --target ${{ matrix.target }}
       - name: Windows-Installer sammeln
         shell: pwsh
         run: |
@@ -61,13 +60,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $msi = Get-ChildItem -Path "$bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
           $exe = Get-ChildItem -Path "$bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($msi) { Copy-Item $msi.FullName "$out/Notizraum-Windows-${{ matrix.label }}.msi" }
-          if ($exe) { Copy-Item $exe.FullName "$out/Notizraum-Windows-${{ matrix.label }}-Setup.exe" }
+          if ($msi) { Copy-Item $msi.FullName "$out/XNTS-Windows-${{ matrix.label }}.msi" }
+          if ($exe) { Copy-Item $exe.FullName "$out/XNTS-Windows-${{ matrix.label }}-Setup.exe" }
           if (-not $msi -and -not $exe) { throw "Kein Windows-Installer für ${{ matrix.label }} erzeugt." }
       - name: Installer als CI-Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
-          name: Notizraum-Windows-${{ matrix.label }}
+          name: XNTS-Windows-${{ matrix.label }}
           path: release-assets/*
           if-no-files-found: error
 
@@ -100,14 +99,14 @@ jobs:
       - name: Abhängigkeiten installieren
         run: pnpm install --frozen-lockfile
       - name: Android-Projekt synchronisieren
-        run: pnpm run native:sync:android
+        run: pnpm run native:sync:android:solo
       - name: Installierbare Android-APK bauen
         working-directory: android
-        run: ./gradlew assembleDebug
+        run: bash ./gradlew assembleDebug
       - name: APK als CI-Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
-          name: Notizraum-Android
+          name: XNTS-Android
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
@@ -126,13 +125,16 @@ jobs:
           path: release-assets
           merge-multiple: true
       - name: APK eindeutig benennen
-        run: mv release-assets/app-debug.apk release-assets/Notizraum-Android.apk
+        run: mv release-assets/app-debug.apk release-assets/XNTS-Android.apk
       - name: Release veröffentlichen
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
-          name: Notizraum ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          name: XNTS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
           files: release-assets/*
-          generate_release_notes: true
-          make_latest: true
+          body: |
+            XNTS — persönliche Notizen, PDFs und virtuelle Laborgeräte.
 
+            Diese Version aktualisiert die reguläre XNTS-App. Notizen und PDFs bleiben lokal auf deinem Gerät. Die Webversion und Installationsdateien stehen auf der XNTS-Website bereit.
+          generate_release_notes: false
+          make_latest: true

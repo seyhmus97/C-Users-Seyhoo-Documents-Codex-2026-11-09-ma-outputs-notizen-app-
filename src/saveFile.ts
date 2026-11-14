@@ -9,7 +9,7 @@ const asBase64 = async (blob: Blob) => {
 
 /** Save via the platform share sheet in native mobile apps; use a browser download on desktop/web. */
 export async function saveFile(blob: Blob, filename: string) {
-  const safeName = filename.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").trim() || "Notizraum-Datei";
+  const safeName = filename.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").trim() || "XNTS-Datei";
   if (Capacitor.isNativePlatform()) {
     const [{ Filesystem, Directory }, { Share }] = await Promise.all([
       import("@capacitor/filesystem"),

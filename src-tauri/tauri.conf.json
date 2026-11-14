@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Notizraum",
-  "version": "1.0.0",
+  "productName": "XNTS",
+  "version": "1.0.8",
   "identifier": "de.notizraum.app",
   "build": {
     "beforeDevCommand": "pnpm dev -- --host 127.0.0.1",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Notizraum",
+        "title": "XNTS — Xnotes",
         "width": 1360,
         "height": 900,
         "minWidth": 720,
@@ -36,7 +36,7 @@
       "icons/icon.ico"
     ],
     "category": "Productivity",
-    "shortDescription": "Notizen und PDFs im lokalen Lernraum",
-    "longDescription": "Notizraum verbindet PDF-Unterlagen mit eigenen Schreibflächen, Stiften und Skizzen. Deine Daten bleiben lokal auf dem Gerät."
+    "shortDescription": "Xnotes, PDFs und kunstinspirierte Schreibflächen",
+    "longDescription": "XNTS — Xnotes verbindet PDF-Unterlagen, eigene Schreibflächen, Skizzen und Lerngruppen. Deine Daten bleiben lokal auf dem Gerät."
   }
 }

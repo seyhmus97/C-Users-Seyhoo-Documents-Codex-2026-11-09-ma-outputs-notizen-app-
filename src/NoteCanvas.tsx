@@ -1,10 +1,17 @@
 // NoteCanvas.tsx v2 – unendliche Leinwand, PDF-Import, Zwischenraum, Teil-Radierer,
 // Undo/Redo (Zeichnen, Radieren, Verschieben, Platz), Zoom, dauerhafte Speicherung (IndexedDB)
 // npm i react react-dom pdfjs-dist | Tailwind CSS einrichten
+import { PenDiagnostic, PenPreview } from "./PenExtras";
+import { openTutorial } from "./Tutorial";
+import { GROUPS_ENABLED } from "./features";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import type { RasterIn, RasterOut } from "./pdfRaster.worker";
 import { saveFile } from "./saveFile";
+import LabBench, { type LabRecord } from "./LabBench";
+import { extendCollinearLine, lineAngleDegrees, snapRadians, snapToAngle, straightLineSpan } from "./lineGeometry";
+import { adjustPressure, fountainTaper, inkWidth, pencilLook, recognizePolyline, smoothInk, stabilize, trimHoldTail, type PolylineOptions } from "./inkEngine";
+import { straightenWire, tidyCircuit, type TidyItem } from "./circuitTidy";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 let pdfjsPromise: Promise<PdfJsModule> | undefined;
@@ -26,7 +33,7 @@ type LineStyle = "solid" | "dashed" | "dotted" | "arrow" | "dashedArrow" | "dott
 type ThemePreference = "system" | "light" | "dark";
 type Pt = { x: number; y: number; p: number };
 // y ist RELATIV zum Block → Notizen wandern mit, wenn davor Platz eingefügt wird
-type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color: string; size: number; pts: Pt[]; raw?: boolean; penKind?: PenKind; lineStyle?: LineStyle }; // raw: Formen (Ecken) nicht glätten
+type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color: string; size: number; pts: Pt[]; raw?: boolean; penKind?: PenKind; lineStyle?: LineStyle; auto?: boolean }; // raw: Formen (Ecken) nicht glätten · auto: von der Automatik/„Halten“ begradigt, Winkel NICHT von Hand eingestellt → die Schaltbildhilfe darf ihn ausrichten
 type PenProfile = { id: string; name: string; kind: PenKind; color: string; size: number };
 type Block = { id: string; kind: "pdf" | "blank"; height: number; gap: number; docId?: string; pageNum?: number };
 // Textfeld: y ist (wie bei Strichen) RELATIV zur Oberkante des Blocks → wandert beim Platz-Einfügen mit
@@ -150,7 +157,7 @@ const simplifyPoints = (pts: Pt[], tolerance: number): Pt[] => {
 };
 
 const recognizeShape = (pts: Pt[]): Shape | null => {
-  if (pts.length < 4) return null;
+  if (pts.length < 3) return null;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, pathLength = 0;
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i]; x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
@@ -174,42 +181,94 @@ const recognizeShape = (pts: Pt[]): Shape | null => {
   return pathLength > 0 && direct / pathLength > 0.91 ? "line" : null;
 };
 
+/** Offener, eckiger Linienzug (Leitung mit Knicken): gerade Segmente, Eckpunkte und Winkel bleiben wie gezeichnet. */
+const perfectPolyline = (s: Stroke, options?: PolylineOptions): Stroke | null => {
+  if (hasArrow(s.lineStyle)) return null;
+  // Standard auch für Halten und „Schaltbild glätten“: höchstens 5 Teilstücke, mindestens 24 Einheiten lang –
+  // kleine Zickzack-Schrift (mm, ww, nn) wird so nicht zur Leitung. Der Aufrufer kann das verschärfen.
+  const corners = recognizePolyline(s.pts, { maxSegments: 5, minSegment: 24, ...options });
+  return corners ? { ...s, pts: corners.map((c) => ({ x: c.x, y: c.y, p: 0.5 })), raw: true } : null;
+};
 const perfectStroke = (s: Stroke): Stroke | null => {
   const kind = recognizeShape(s.pts);
-  if (!kind) return null;
+  if (!kind) return perfectPolyline(s);
+  if (kind === "line") { const bent = perfectPolyline(s); if (bent) return bent; } // langer Strich mit deutlichem Knick ist eine Leitung, keine Gerade
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const p of s.pts) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
   if (kind === "ellipse") { const d = Math.max(x1 - x0, y1 - y0), cx = (x0 + x1) / 2, cy = (y0 + y1) / 2; x0 = cx - d / 2; x1 = cx + d / 2; y0 = cy - d / 2; y1 = cy + d / 2; }
   const geometry = kind === "line" && hasArrow(s.lineStyle) ? "arrow" : kind;
-  return { ...s, pts: shapePts(geometry, { x: x0, y: y0 }, { x: x1, y: y1 }), raw: true };
-};
-const straightenCircuitWire = (s: Stroke): Stroke | null => {
-  if (s.pts.length < 3) return null;
-  const first = s.pts[0], last = s.pts[s.pts.length - 1];
-  const dx = last.x - first.x, dy = last.y - first.y, direct = Math.hypot(dx, dy);
-  if (direct < 24) return null;
-  let length = 0;
-  for (let i = 1; i < s.pts.length; i++) length += Math.hypot(s.pts[i].x - s.pts[i - 1].x, s.pts[i].y - s.pts[i - 1].y);
-  if (!length || direct / length < 0.68) return null;
-  let a = { x: first.x, y: first.y }, b = { x: last.x, y: last.y };
-  const horizontal = Math.abs(dx) >= Math.abs(dy);
-  const tolerance = Math.max(14, direct * 0.42);
-  if (horizontal && Math.abs(dy) <= tolerance) {
-    const y = s.pts.reduce((sum, p) => sum + p.y, 0) / s.pts.length;
-    a = { x: first.x, y }; b = { x: last.x, y };
-  } else if (!horizontal && Math.abs(dx) <= tolerance) {
-    const x = s.pts.reduce((sum, p) => sum + p.x, 0) / s.pts.length;
-    a = { x, y: first.y }; b = { x, y: last.y };
-  } else if (direct / length < 0.86) return null;
-  const geometry = hasArrow(s.lineStyle) ? "arrow" : "line";
+  const a = kind === "line" ? s.pts[0] : { x: x0, y: y0 };
+  const b = kind === "line" ? s.pts[s.pts.length - 1] : { x: x1, y: y1 };
   return { ...s, pts: shapePts(geometry, a, b), raw: true };
 };
+const straightenCircuitWire = (s: Stroke): Stroke | null => {
+  const wire = straightenWire(s.pts); // streng: nur wirklich gerade gemeint (siehe circuitTidy.ts)
+  if (!wire) return null;
+  return { ...s, pts: shapePts(hasArrow(s.lineStyle) ? "arrow" : "line", wire[0], wire[1]), raw: true };
+};
+/** Endpunkte eines geraden Strichs (geglättete Linie, Pfeil oder fast gerader Freihandstrich), sonst null. */
+const lineEnds = (s: Stroke): { a: Pt; b: Pt } | null => {
+  const P = s.pts;
+  if (P.length === 2) return { a: P[0], b: P[1] };
+  if (s.raw && hasArrow(s.lineStyle) && P.length === 5 && P[1].x === P[3].x && P[1].y === P[3].y) return { a: P[0], b: P[1] };
+  if (!s.raw && P.length > 2 && straightLineSpan(P, 14)) return { a: P[0], b: P[P.length - 1] };
+  return null;
+};
+/** Von Hand eingestellte Linie/Pfeil (Endpunktgriff, Formwerkzeug): wird von „Schaltbild glätten“ nicht mehr waagerecht/senkrecht gezwungen.
+ *  Automatisch oder per Halten begradigte Linien (auto) zählen nicht dazu – sonst bliebe jede leicht schiefe Leitung schief. */
+const isCleanLine = (s: Stroke) => !!s.raw && !s.auto && (s.pts.length === 2 || (hasArrow(s.lineStyle) && s.pts.length === 5));
+/** Kleines Winkel-Etikett auf der Zeichenfläche (skaliert gegen den Zoom). */
+const angleTag = (ctx: CanvasRenderingContext2D, x: number, y: number, text: string, z: number) => {
+  ctx.save(); ctx.setLineDash([]);
+  ctx.font = `600 ${12 / z}px Inter, system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const w = ctx.measureText(text).width + 12 / z, h = 20 / z;
+  ctx.fillStyle = "#191620"; ctx.beginPath(); ctx.roundRect?.(x - w / 2, y - h / 2, w, h, 4 / z); if (!ctx.roundRect) ctx.rect(x - w / 2, y - h / 2, w, h); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.fillText(text, x, y + 0.5 / z);
+  ctx.restore();
+};
 const IDENT: XF = { px: 0, py: 0, s: 1, rot: 0 };
+// Bleistift-Körnung: kleine Rauschkachel in der Tintenfarbe, je Farbe einmal erzeugt
+const grainCache = new Map<string, CanvasPattern | null>();
+const pencilGrain = (ctx: CanvasRenderingContext2D, ink: string): CanvasPattern | string => {
+  let pattern = grainCache.get(ink);
+  if (pattern === undefined) {
+    pattern = null;
+    try {
+      const size = 48, tile = document.createElement("canvas"); tile.width = tile.height = size;
+      const tctx = tile.getContext("2d")!;
+      tctx.fillStyle = ink; tctx.fillRect(0, 0, size, size);
+      const img = tctx.getImageData(0, 0, size, size);
+      let seed = 1234567;
+      for (let i = 3; i < img.data.length; i += 4) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; img.data[i] = 120 + ((seed >> 16) % 136); } // feste Folge → ruhiges, nicht flimmerndes Korn
+      tctx.putImageData(img, 0, 0);
+      pattern = ctx.createPattern(tile, "repeat");
+      pattern?.setTransform?.(new DOMMatrix().scale(0.5)); // feines Korn, wächst beim Zoomen mit
+    } catch { pattern = null; }
+    if (grainCache.size > 64) grainCache.clear();
+    grainCache.set(ink, pattern);
+  }
+  return pattern ?? ink;
+};
 const PRESSURE_LERP = 0.2; // Tiefpass: Anteil des neuen Druckwerts pro Punkt
 const MIN_DIST = 0.8;      // Punkte näher als 0,8 Bildschirm-px werden verworfen (Zittern, weniger Punkte)
 const PALM_MAX = 25;       // Touch-Kontaktfläche (CSS-px), ab der ein Finger als Handballen gilt
-const PALM_GRACE_MS = 600; // so lange nach dem letzten Stiftereignis werden Finger ignoriert
-const isPalm = (e: PointerEvent): boolean => e.pointerType === "touch" && Math.max(e.width, e.height) > PALM_MAX; // Stift/Maus: immer false
+const PALM_AREA = 380;     // … oder Kontaktfläche Breite×Höhe (manche Treiber melden flache, breite Ballen)
+const PALM_GRACE_MS = 900; // so lange nach dem letzten Stiftereignis (auch Schweben) werden Finger ignoriert
+const PALM_ZONE_MS = 5000; // so lange nach dem Schreiben gilt die Fläche unter/neben der Schreibhand als Handballen-Zone
+const PALM_ZONE_R = 560;   // Radius dieser Zone (CSS-px) um die letzte Stiftposition
+const PALM_EDGE = 36;      // Randstreifen (CSS-px) an der Seite der Schreibhand: dort aufliegende Ballen nie als Finger werten
+const PALM_REVERT_MS = 900;// setzt der Stift so kurz nach einer Finger-Geste auf, war es der Ballen → Scrollen/Zoomen zurücknehmen
+const TOUCH_SLOP = 10;     // ein Finger muss sich so weit bewegen, bevor gescrollt wird (filtert Auflegen/Zittern)
+const PINCH_LOCK = 0.07;   // Zwei-Finger-Geste: erst ab 7 % Abstandsänderung zoomen, darunter nur verschieben
+const A4_H = 1123;         // A4-Höhe bei Seitenbreite 794 px (identisch mit den Seiten des PDF-Exports)
+const isPalm = (e: PointerEvent): boolean => e.pointerType === "touch" && (Math.max(e.width, e.height) > PALM_MAX || e.width * e.height > PALM_AREA); // Stift/Maus: immer false
+type Handedness = "right" | "left";
+type TouchPt = { x: number; y: number; sx: number; sy: number };
+type TouchGesture = {
+  mode: "idle" | "pending" | "pan" | "pinch" | "blocked";
+  t0: number; scrollLeft: number; scrollTop: number; zoom: number; // Zustand beim Beginn – zum Zurücknehmen, falls es der Handballen war
+  pinch?: { d0: number; z0: number; docX: number; docY: number; locked: boolean };
+};
 // Globale Zwischenablage auf Modul-Ebene (überlebt Notizwechsel); ABSOLUTE Koordinaten, blockId ""
 const sharedClip: { noteId: string; strokes: Stroke[]; texts: TextField[] } = { noteId: "", strokes: [], texts: [] };
 let clipWrite: Promise<void> = Promise.resolve();
@@ -443,7 +502,46 @@ function PdfPage({ doc, docId, pageNum, height, zoom, getRoot }: { doc: PDFDocum
 }
 
 /* ───────── Hauptkomponente ───────── */
-export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, onThemeChange, onBackup, onRestore }: { noteId: string; title?: string; onLibrary?: () => void; darkMode: boolean; theme: ThemePreference; onThemeChange: (theme: ThemePreference) => void; onBackup: () => void; onRestore: () => void }) {
+/** Schmale eigene Bildlaufleiste für die Notizfläche. Sie reagiert nur auf die Maus: Die native Leiste am rechten Rand
+ *  wurde von aufliegenden Handballen „gegriffen“ und ließ die Seite springen (vor allem nahe am rechten Tabletrand). */
+function MouseScrollbar({ getEl, contentKey }: { getEl: () => HTMLDivElement | null; contentKey: string }) {
+  const [m, setM] = useState({ top: 0, size: 0, show: false });
+  useEffect(() => {
+    const el = getEl();
+    if (!el) return;
+    let raf = 0;
+    const update = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const h = el.clientHeight, sh = el.scrollHeight;
+        if (sh <= h + 1) { setM((o) => (o.show ? { top: 0, size: 0, show: false } : o)); return; }
+        const size = Math.max(40, (h * h) / sh);
+        setM({ top: (el.scrollTop / (sh - h)) * (h - size), size, show: true });
+      });
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    const ro = new ResizeObserver(update); ro.observe(el);
+    return () => { cancelAnimationFrame(raf); el.removeEventListener("scroll", update); ro.disconnect(); };
+  }, [getEl, contentKey]);
+  const startDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    if (e.pointerType !== "mouse" || e.button !== 0) return; // Finger, Handballen und Stift greifen die Leiste nicht
+    e.preventDefault();
+    const el = getEl();
+    if (!el) return;
+    const t = e.currentTarget, y0 = e.clientY, s0 = el.scrollTop, h = el.clientHeight, sh = el.scrollHeight;
+    const ratio = (sh - h) / Math.max(1, h - Math.max(40, (h * h) / sh));
+    t.setPointerCapture(e.pointerId);
+    const mv = (ev: PointerEvent) => { el.scrollTop = s0 + (ev.clientY - y0) * ratio; };
+    const up = () => { t.removeEventListener("pointermove", mv); t.removeEventListener("pointerup", up); t.removeEventListener("pointercancel", up); };
+    t.addEventListener("pointermove", mv); t.addEventListener("pointerup", up); t.addEventListener("pointercancel", up);
+  };
+  if (!m.show) return null;
+  return <div className="xnts-scrollbar" aria-hidden="true"><div className="xnts-scrollbar__thumb" style={{ top: m.top, height: m.size }} onPointerDown={startDrag} /></div>;
+}
+
+export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, onThemeChange, onBackup, onRestore, compact, readOnly, onFocusChange }: { noteId: string; title?: string; onLibrary?: () => void; darkMode: boolean; theme: ThemePreference; onThemeChange: (theme: ThemePreference) => void; onBackup: () => void; onRestore: () => void; /** Lernraum: ohne Kunstbanner, damit die Notizfläche mehr Platz bekommt */ compact?: boolean; /** Nur ansehen (z. B. Gruppenmitglied ohne Schreibrecht): scrollen, zoomen, Seiten wechseln – aber nichts verändern */ readOnly?: boolean; /** meldet den Fokusmodus nach außen, damit Bibliothek bzw. Gruppenleisten mit ausgeblendet werden */ onFocusChange?: (on: boolean) => void }) {
   const [blocks, setBlocks] = useState<Block[]>([{ id: uid(), kind: "blank", height: 1600, gap: 0 }]);
   const [tool, setTool] = useState<Tool>("pen");
   const [eraseMode, setEraseMode] = useState<"pixel" | "stroke">("pixel");
@@ -464,16 +562,42 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     try { const saved = Number(localStorage.getItem("notizraum-pressure-sensitivity")); return Number.isFinite(saved) && saved >= 0.25 && saved <= 2 ? saved : 1; }
     catch { return 1; }
   });
+  // Glättung der Handschrift (0 = aus … 1 = stark): beruhigt die Eingabe live und glättet beim Absetzen nach
+  const [inkSmoothing, setInkSmoothing] = useState(() => {
+    try { const raw = localStorage.getItem("notizraum-ink-smoothing"), saved = Number(raw); return raw !== null && Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 0.5; }
+    catch { return 0.5; }
+  });
+  const inkSmoothingRef = useRef(inkSmoothing); inkSmoothingRef.current = inkSmoothing;
+  // Seitentaste des Stifts (z. B. Surface Pen / Slim Pen 2): Lasso wie in OneNote, Radierer oder ohne Funktion
+  const [barrelAction, setBarrelAction] = useState<"lasso" | "eraser" | "none">(() => {
+    try { const saved = localStorage.getItem("notizraum-pen-barrel"); return saved === "eraser" || saved === "none" ? saved : "lasso"; }
+    catch { return "lasso"; }
+  });
+  // Gerade gezogene Linien und Leitungen beim Absetzen automatisch begradigen (ohne Lasso, ohne Halten)
+  const [autoStraighten, setAutoStraighten] = useState(() => { try { return localStorage.getItem("notizraum-auto-straighten") !== "false"; } catch { return true; } });
+  useEffect(() => { try { localStorage.setItem("notizraum-auto-straighten", String(autoStraighten)); } catch { /* preference still works for this session */ } }, [autoStraighten]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [labOpen, setLabOpen] = useState(false);
   const [smartShapesEnabled, setSmartShapesEnabled] = useState(() => { try { return localStorage.getItem("notizraum-smart-shapes") !== "false"; } catch { return true; } });
   const [circuitAssistEnabled, setCircuitAssistEnabled] = useState(() => { try { return localStorage.getItem("notizraum-circuit-assist") !== "false"; } catch { return true; } });
+  const collapseKey = compact ? "xnts-study-toolbar-collapsed" : "notizraum-toolbar-collapsed";
   const [toolbarCollapsed, setToolbarCollapsed] = useState(() => {
     try {
-      const saved = localStorage.getItem("notizraum-toolbar-collapsed");
-      return saved === null ? window.matchMedia("(max-width: 1279px)").matches : saved === "true";
-    } catch { return window.matchMedia("(max-width: 1279px)").matches; }
+      const saved = localStorage.getItem(collapseKey);
+      return saved === null ? compact || window.matchMedia("(max-width: 1279px)").matches : saved === "true"; // Lernraum: standardmäßig schmale Leiste
+    } catch { return !!compact || window.matchMedia("(max-width: 1279px)").matches; }
   });
-  const [sidebar, setSidebar] = useState(() => window.matchMedia("(min-width: 1280px)").matches);
+  // Fokusmodus: Werkzeugleiste und Banner verschwinden, eine kleine schwebende Leiste bleibt → maximale Notizfläche
+  const focusKey = compact ? "xnts-study-focus" : "xnts-focus";
+  const [focus, setFocus] = useState(() => { try { return localStorage.getItem(focusKey) === "true"; } catch { return false; } });
+  useEffect(() => { try { localStorage.setItem(focusKey, String(focus)); } catch { /* gilt dann nur für diese Sitzung */ } }, [focus, focusKey]);
+  const [focusMini, setFocusMini] = useState(false);
+  const focusCb = useRef(onFocusChange); focusCb.current = onFocusChange;
+  useEffect(() => { focusCb.current?.(focus); }, [focus]);
+  const canEdit = !readOnly;
+  const readOnlyRef = useRef(!!readOnly); readOnlyRef.current = !!readOnly;
+  const viewPan = useRef<{ id: number; x: number; y: number } | null>(null); // Nur-ansehen: Stift/Maus ziehen verschiebt die Ansicht
+  const [sidebar, setSidebar] = useState(() => !compact && window.matchMedia("(min-width: 1280px)").matches); // Lernraum: Seitenliste erst auf Wunsch
   const [zoom, setZoomState] = useState(() => {
     const desktopSidebars = window.matchMedia("(min-width: 1280px)").matches ? 480 : 0;
     return Math.max(MIN_Z, Math.min(1, (window.innerWidth - desktopSidebars - 16) / PAGE_W));
@@ -507,22 +631,50 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const bump = () => bump1((n) => n + 1);
   const past = useRef<Snap[]>([]);
   const future = useRef<Snap[]>([]);
-  const touches = useRef(new Map<number, { x: number; y: number }>());
-  const pinch = useRef<{ d0: number; z0: number } | null>(null);
+  const touches = useRef(new Map<number, TouchPt>());
+  const gesture = useRef<TouchGesture>({ mode: "idle", t0: 0, scrollLeft: 0, scrollTop: 0, zoom: 1 });
+  const gestureRaf = useRef(0);
+  const penPos = useRef<{ x: number; y: number; t: number } | null>(null); // letzte Stiftposition (Schweben oder Schreiben)
+  const penSeen = useRef(false);                                            // auf diesem Gerät wurde ein Stift benutzt
+  const restoreScroll = useRef<{ left: number; top: number } | null>(null);
+  const [handedness, setHandedness] = useState<Handedness>(() => { try { return localStorage.getItem("xnts-handedness") === "left" ? "left" : "right"; } catch { return "right"; } });
+  const handednessRef = useRef(handedness); handednessRef.current = handedness;
+  const [oneFingerScroll, setOneFingerScroll] = useState(() => { try { return localStorage.getItem("xnts-one-finger-scroll") !== "false"; } catch { return true; } });
+  const oneFingerRef = useRef(oneFingerScroll); oneFingerRef.current = oneFingerScroll;
+  const [pageMarkers, setPageMarkers] = useState(() => { try { return localStorage.getItem("xnts-page-markers") !== "false"; } catch { return true; } });
+  const [pdfDeleteMode, setPdfDeleteMode] = useState(false); // bewusst NICHT gespeichert: beim Öffnen einer Notiz ist Löschen immer aus
   const zoomRef = useRef(zoom);
   const anchor = useRef<{ dx: number; dy: number; cx: number; cy: number } | null>(null);
   const loaded = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const smartHoldTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const rawBeforeSmartSnap = useRef<Stroke | null>(null);
+  const gestureOn = useRef(false);                 // Stift/Maus berührt gerade die Fläche
+  const gTool = useRef<Tool>("pen");               // Werkzeug DIESER Geste (Stiftrückseite → Radierer, Seitentaste → Lasso/Radierer)
+  const eraserHover = useRef(false);               // Radierkreis zeigen, auch wenn das Stift-Werkzeug gewählt ist
+  const eraseLast = useRef<{ x: number; y: number } | null>(null);  // letzte Radierposition (schnelle Bewegungen lückenlos radieren)
+  const holdAnchor = useRef<{ x: number; y: number } | null>(null); // Bildschirmposition, an der der Stift gerade ruht
+  const snapInfo = useRef<{ line: boolean; x: number; y: number } | null>(null); // Form wurde durch Halten geglättet
+  const endDrag = useRef<{ id: string; which: 0 | 1; orig: Stroke; fixed: { x: number; y: number }; snapped: boolean } | null>(null);
+  const [angleSnap, setAngleSnap] = useState(() => { try { return localStorage.getItem("notizraum-angle-snap") === "true"; } catch { return false; } });
+  const angleSnapRef = useRef(angleSnap); angleSnapRef.current = angleSnap;
+  const [notice, setNotice] = useState("");
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const flash = (text: string) => { setNotice(text); clearTimeout(noticeTimer.current); noticeTimer.current = setTimeout(() => setNotice(""), 3800); };
   const raf = useRef(0);
   const activePen = penProfiles.find((p) => p.id === activePenId) ?? penProfiles[0] ?? DEFAULT_PENS[0];
   const updatePenProfiles = (next: PenProfile[]) => { setPenProfiles(next); try { localStorage.setItem("notizraum-pen-profiles", JSON.stringify(next)); } catch { /* profiles still work for this session */ } };
   const choosePen = (p: PenProfile) => { setActivePenId(p.id); setColor(p.color); setSize(p.size); setTool(p.kind === "marker" ? "highlighter" : "pen"); };
   const changePen = (patch: Partial<PenProfile>) => updatePenProfiles(penProfiles.map((p) => p.id === activePen.id ? { ...p, ...patch } : p));
   useEffect(() => { try { localStorage.setItem("notizraum-smart-shapes", String(smartShapesEnabled)); } catch { /* preference still works for this session */ } }, [smartShapesEnabled]);
+  useEffect(() => { try { localStorage.setItem("notizraum-ink-smoothing", String(inkSmoothing)); } catch { /* preference still works for this session */ } }, [inkSmoothing]);
+  useEffect(() => { try { localStorage.setItem("notizraum-pen-barrel", barrelAction); } catch { /* preference still works for this session */ } }, [barrelAction]);
+  useEffect(() => { try { localStorage.setItem("notizraum-angle-snap", String(angleSnap)); } catch { /* preference still works for this session */ } }, [angleSnap]);
+  useEffect(() => { try { localStorage.setItem("xnts-handedness", handedness); } catch { /* preference still works for this session */ } }, [handedness]);
+  useEffect(() => { try { localStorage.setItem("xnts-one-finger-scroll", String(oneFingerScroll)); } catch { /* preference still works for this session */ } }, [oneFingerScroll]);
+  useEffect(() => { try { localStorage.setItem("xnts-page-markers", String(pageMarkers)); } catch { /* preference still works for this session */ } }, [pageMarkers]);
   useEffect(() => { try { localStorage.setItem("notizraum-circuit-assist", String(circuitAssistEnabled)); } catch { /* preference still works for this session */ } }, [circuitAssistEnabled]);
-  useEffect(() => { try { localStorage.setItem("notizraum-toolbar-collapsed", String(toolbarCollapsed)); } catch { /* preference still works for this session */ } }, [toolbarCollapsed]);
+  useEffect(() => { try { localStorage.setItem(collapseKey, String(toolbarCollapsed)); } catch { /* preference still works for this session */ } }, [toolbarCollapsed, collapseKey]);
   useEffect(() => { try { localStorage.setItem("notizraum-custom-colors", JSON.stringify(customColors)); } catch { /* palette still works for this session */ } }, [customColors]);
   useEffect(() => { try { localStorage.setItem("notizraum-pressure-sensitivity", String(pressureSensitivity)); } catch { /* sensitivity still works for this session */ } }, [pressureSensitivity]);
   useEffect(() => {
@@ -541,26 +693,74 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     setCustomColors((old) => old.includes(normalized) ? old : [...old, normalized].slice(-12));
   };
   const perfectSelected = () => {
-    const beforeSelection = snap(); let changed = false;
-    strokes.current = strokes.current.map((s) => {
-      if (!sel.current.has(s.id)) return s;
+    const beforeSelection = snap(); let changed = 0;
+    // 1) Jeden markierten Strich einzeln begradigen: Linie, Leitung mit Knicken, Rechteck, Dreieck, Kreis
+    const cleaned = new Map<string, Stroke>(), items: TidyItem[] = [];
+    for (const s of strokes.current) {
+      if (!sel.current.has(s.id) || s.tool !== "pen") continue;
+      const top = topsRef.current[s.blockId] ?? 0, abs = (st: Stroke) => st.pts.map((p) => ({ x: p.x, y: p.y + top }));
+      if (isCleanLine(s)) { items.push({ id: s.id, kind: "fixed", pts: abs(s) }); continue; } // bewusst eingestellte Winkel bleiben erhalten
+      if (s.raw) { // bereits geglättete Formen: nicht erneut umformen, nur aneinander ausrichten
+        const first = s.pts[0], last = s.pts[s.pts.length - 1], closed = first.x === last.x && first.y === last.y;
+        const shape = s.pts.length === 65 ? "circle" : closed && s.pts.length === 5 ? "rect" : closed || hasArrow(s.lineStyle) ? "fixed" : "poly";
+        items.push({ id: s.id, kind: shape, pts: abs(s) });
+        continue;
+      }
+      const shape = recognizeShape(s.pts);
       const clean = perfectStroke(s) ?? (circuitAssistEnabled ? straightenCircuitWire(s) : null);
-      if (clean) { changed = true; return clean; }
-      return s;
-    });
-    if (changed) { pushHist(beforeSelection); setSaved("Schaltbild und Grundformen geglättet"); schedule(); }
-    else setSaved("Keine passende Form erkannt");
+      if (!clean) continue;
+      cleaned.set(s.id, clean); changed++;
+      const arrow = hasArrow(clean.lineStyle);
+      items.push({ id: s.id, kind: arrow || shape === "triangle" ? "fixed" : shape === "ellipse" ? "circle" : shape === "rect" ? "rect" : clean.pts.length === 2 ? "line" : "poly", pts: abs(clean) });
+    }
+    // 2) Schaltbildhilfe: fast waagerechte/senkrechte Leitungen ausrichten, auf gemeinsame Fluchten ziehen, Enden andocken
+    if (circuitAssistEnabled && items.length) {
+      const z = zoomRef.current;
+      const tidy = tidyCircuit(items, { axisDegrees: 10, alignDistance: Math.max(6, 9 / z), attachDistance: Math.max(9, 14 / z) });
+      for (const s of strokes.current) {
+        const pts = tidy.get(s.id); if (!pts) continue;
+        const base = cleaned.get(s.id) ?? s, top = topsRef.current[s.blockId] ?? 0;
+        if (pts.length !== base.pts.length) continue;
+        const shifted = pts.some((p, i) => Math.abs(p.x - base.pts[i].x) > 0.01 || Math.abs(p.y - top - base.pts[i].y) > 0.01);
+        if (!shifted) continue;
+        cleaned.set(s.id, { ...base, pts: pts.map((p, i) => ({ x: p.x, y: p.y - top, p: base.pts[i].p })), raw: true }); changed++;
+      }
+    }
+    if (changed) {
+      strokes.current = strokes.current.map((s) => cleaned.get(s.id) ?? s);
+      pushHist(beforeSelection); schedule();
+      const skipped = [...sel.current].filter((id) => strokes.current.some((s) => s.id === id && !s.raw)).length;
+      flash(`Schaltbild geglättet: ${cleaned.size} Striche ausgerichtet${skipped ? ` · ${skipped} unverändert (Schrift/Kurven)` : ""} · Rückgängig mit Strg+Z`);
+      setSaved("Schaltbild und Grundformen geglättet");
+    } else { setSaved("Keine passende Form erkannt"); flash("Keine Leitung oder Grundform in der Auswahl erkannt"); }
   };
+  const HOLD_MS = 500;   // Haltezeit bis zum Glätten
+  const HOLD_RADIUS = 6; // Bildschirm-px: so weit darf der Stift beim „Halten“ zittern
   const cancelSmartHold = () => { if (smartHoldTimer.current) clearTimeout(smartHoldTimer.current); smartHoldTimer.current = undefined; };
   const armSmartHold = () => {
     if (!smartShapesEnabled) return;
     cancelSmartHold();
     smartHoldTimer.current = setTimeout(() => {
       const current = cur.current;
-      if (!current || current.tool !== "pen" || current.pts.length < 4) return;
-      const clean = perfectStroke(current);
-      if (clean) { rawBeforeSmartSnap.current = current; cur.current = clean; schedule(); }
-    }, 650);
+      if (!current || current.tool !== "pen" || snapInfo.current) return;
+      // Zittern am Strichende (Stift ruht) zählt nicht zur Form
+      const steady = { ...current, pts: trimHoldTail(current.pts, (HOLD_RADIUS + 2) / zoomRef.current) };
+      if (steady.pts.length < 3) return;
+      const clean = perfectStroke(steady);
+      if (!clean) return;
+      const isLine = clean.pts.length === 2 || (hasArrow(clean.lineStyle) && clean.pts.length === 5);
+      rawBeforeSmartSnap.current = current; cur.current = isLine ? { ...clean, auto: true } : clean;
+      snapInfo.current = { line: isLine, x: holdAnchor.current?.x ?? 0, y: holdAnchor.current?.y ?? 0 };
+      flash(isLine ? "Linie geglättet · Stift weiterziehen ändert Winkel und Länge" : "Form geglättet · weiterzeichnen hebt die Glättung auf");
+      schedule();
+    }, HOLD_MS);
+  };
+  /** Der Halte-Timer läuft nur neu an, wenn sich der Stift wirklich wegbewegt – Zittern beim Stillhalten setzt ihn nicht zurück. */
+  const noteHoldPosition = (cx: number, cy: number) => {
+    const a = holdAnchor.current;
+    if (a && Math.hypot(cx - a.x, cy - a.y) <= HOLD_RADIUS) return;
+    holdAnchor.current = { x: cx, y: cy };
+    armSmartHold();
   };
 
   const { tops, total } = useMemo(() => {
@@ -570,6 +770,19 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     return { tops: t, total: y };
   }, [blocks]);
   const topsRef = useRef(tops); topsRef.current = tops;
+  const hasPdf = blocks.some((b) => b.kind === "pdf");
+  useEffect(() => { if (!hasPdf) setPdfDeleteMode(false); }, [hasPdf]); // letzte PDF-Seite gelöscht → Modus aus
+  // A4-Seitengrenzen (alle 1123 px, wie die Seiten des PDF-Exports) – nur auf Schreibflächen, nicht über PDF-Seiten
+  const pageBreaks = useMemo(() => {
+    const out: number[] = [];
+    for (const b of blocks) {
+      const top = tops[b.id];
+      const y0 = b.kind === "blank" ? top : top + b.height, y1 = top + b.height + (b.kind === "blank" ? 0 : b.gap);
+      if (b.kind === "pdf" && b.gap <= MIN_GAP) continue;
+      for (let k = Math.max(1, Math.floor(y0 / A4_H) + 1); k * A4_H < y1; k++) out.push(k * A4_H);
+    }
+    return out;
+  }, [blocks, tops]);
   const blocksRef = useRef(blocks); blocksRef.current = blocks;
 
   const paperAtY = (y: number): "pdf" | "blank" | "gap" => {
@@ -654,8 +867,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     zoomRef.current = z; setZoomState(z);
   }, []);
   useLayoutEffect(() => {
-    const a = anchor.current, sc = scRef.current;
-    if (a && sc) { sc.scrollLeft = a.dx * zoom + offX() - a.cx; sc.scrollTop = a.dy * zoom - a.cy; anchor.current = null; }
+    const a = anchor.current, sc = scRef.current, rs = restoreScroll.current;
+    if (rs && sc) { sc.scrollLeft = rs.left; sc.scrollTop = rs.top; restoreScroll.current = null; anchor.current = null; } // Handballen-Geste zurückgenommen
+    else if (a && sc) { sc.scrollLeft = a.dx * zoom + offX() - a.cx; sc.scrollTop = a.dy * zoom - a.cy; anchor.current = null; }
     schedule();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zoom]);
@@ -673,46 +887,57 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   /* ───── Zeichenebene (nur sichtbarer Ausschnitt) ───── */
   // Zero-Allocation: nur Zahlen und Indexschleifen, keine Arrays, Objekte oder Closures pro Aufruf
-  const paint = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0, ink = s.color) => {
+  const paint = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0, ink = s.color, taperStart = true, taperEnd = true) => {
     const top = (topsRef.current[s.blockId] ?? 0) + oy, hl = s.tool === "highlighter", P = s.pts, n = P.length;
     const dash = dashFor(s.lineStyle);
-    const pressureWidth = (p: number) => {
-      const pressure = clamp(0.5 + (p - 0.5) * pressureSensitivity, 0.05, 1);
-      return s.size * (s.penKind === "fountain" ? 0.12 + pressure * 1.75 : s.penKind === "pencil" ? 0.35 + pressure * 0.8 : 0.4 + pressure * 1.2);
+    const kind = s.penKind, shaped = !!s.raw || n < 3;
+    // Breite je Stiftart: Kugelschreiber fast gleichmäßig, Füller nach Druck und Strichrichtung, Bleistift dünn
+    const widthAt = (i: number, dx: number, dy: number) => {
+      const w = inkWidth(kind, s.size, adjustPressure(P[i].p, pressureSensitivity), dx, dy, shaped);
+      return kind === "fountain" && !shaped ? w * fountainTaper(i, n, taperStart, taperEnd) : w;
     };
     ctx.save();
     ctx.lineCap = ctx.lineJoin = "round";
     ctx.strokeStyle = ctx.fillStyle = ink;
-    if (s.penKind === "pencil" && !hl) ctx.globalAlpha = 0.62;
     if (dash.length) ctx.setLineDash(dash);
     if (hl) { ctx.globalAlpha = 0.35; ctx.lineWidth = s.size * 5; ctx.lineCap = "butt"; }
-    if (n === 1) {
-      ctx.beginPath(); ctx.arc(P[0].x + ox, top + P[0].y, (hl ? s.size * 2.5 : s.size * (0.4 + P[0].p * 1.2)) / 2, 0, 7); ctx.fill();
-    } else if (hl) { // Textmarker: ein einziger Pfad, Kurve durch die Mittelpunkte (Kontrollpunkt = Messpunkt)
+    const centerline = () => { // sichtbare Mittellinie als EIN Pfad (identisch zur Radierer-Geometrie curveAt)
       ctx.beginPath(); ctx.moveTo(P[0].x + ox, top + P[0].y);
-      if (s.raw || n < 3) { for (let i = 1; i < n; i++) ctx.lineTo(P[i].x + ox, top + P[i].y); }
+      if (shaped) { for (let i = 1; i < n; i++) ctx.lineTo(P[i].x + ox, top + P[i].y); }
       else {
         for (let i = 1; i < n - 1; i++) ctx.quadraticCurveTo(P[i].x + ox, top + P[i].y, (P[i].x + P[i + 1].x) / 2 + ox, top + (P[i].y + P[i + 1].y) / 2);
         ctx.lineTo(P[n - 1].x + ox, top + P[n - 1].y);
       }
-      ctx.stroke();
-    } else if (dash.length && !s.raw && n >= 3) {
-      ctx.lineWidth = pressureWidth(0.5);
-      ctx.beginPath(); ctx.moveTo(P[0].x + ox, top + P[0].y);
-      for (let i = 1; i < n - 1; i++) ctx.quadraticCurveTo(P[i].x + ox, top + P[i].y, (P[i].x + P[i + 1].x) / 2 + ox, top + (P[i].y + P[i + 1].y) / 2);
-      ctx.lineTo(P[n - 1].x + ox, top + P[n - 1].y); ctx.stroke();
-    } else if (s.raw || n < 3) { // Formen und sehr kurze Striche: gerade Segmente, Ecken bleiben scharf
+    };
+    if (kind === "pencil" && !hl) {
+      // Bleistift: ein einziger Pfad mit Körnung. Früher wurde jedes Segment einzeln halbtransparent gezeichnet –
+      // die überlappenden runden Enden ergaben die dunkle „Perlenkette“ entlang des Strichs.
+      let sum = 0; for (let i = 0; i < n; i++) sum += adjustPressure(P[i].p, pressureSensitivity);
+      const look = pencilLook(s.size, sum / n);
+      ctx.globalAlpha = look.alpha; ctx.lineWidth = look.width;
+      ctx.strokeStyle = ctx.fillStyle = pencilGrain(ctx, ink);
+      if (n === 1) { ctx.beginPath(); ctx.arc(P[0].x + ox, top + P[0].y, look.width / 2, 0, 7); ctx.fill(); }
+      else { centerline(); ctx.stroke(); }
+    } else if (n === 1) {
+      ctx.beginPath(); ctx.arc(P[0].x + ox, top + P[0].y, (hl ? s.size * 2.5 : widthAt(0, 0, 0)) / 2, 0, 7); ctx.fill();
+    } else if (hl) { // Textmarker: ein einziger Pfad, Kurve durch die Mittelpunkte (Kontrollpunkt = Messpunkt)
+      centerline(); ctx.stroke();
+    } else if (dash.length) { // gestrichelt/gepunktet: ein Pfad mit gleichmäßiger Breite, damit das Muster ruhig bleibt
+      ctx.lineWidth = inkWidth(kind, s.size, 0.5, 0, 0, true);
+      centerline(); ctx.stroke();
+    } else if (shaped) { // Formen und sehr kurze Striche: gerade Segmente, Ecken bleiben scharf
       for (let i = 1; i < n; i++) {
-        ctx.lineWidth = pressureWidth(P[i].p);
+        ctx.lineWidth = widthAt(i, 0, 0);
         ctx.beginPath(); ctx.moveTo(P[i - 1].x + ox, top + P[i - 1].y); ctx.lineTo(P[i].x + ox, top + P[i].y); ctx.stroke();
       }
-    } else { // Stift: je Segment eine quadratische Kurve von Mitte zu Mitte, Breite aus dem (geglätteten) Druck
-      let sx = P[0].x + ox, sy = top + P[0].y;
+    } else { // Kugelschreiber/Füller: je Segment eine quadratische Kurve von Mitte zu Mitte, Breite gleitend angepasst
+      let sx = P[0].x + ox, sy = top + P[0].y, w = widthAt(1, P[1].x - P[0].x, P[1].y - P[0].y);
       for (let i = 1; i < n; i++) {
         const last = i === n - 1;
         const ex = last ? P[i].x + ox : (P[i].x + P[i + 1].x) / 2 + ox;
         const ey = last ? top + P[i].y : top + (P[i].y + P[i + 1].y) / 2;
-        ctx.lineWidth = pressureWidth(P[i].p);
+        w += (widthAt(i, ex - sx, ey - sy) - w) * 0.45; // keine sprunghaften Breitenwechsel zwischen Segmenten
+        ctx.lineWidth = w;
         ctx.beginPath(); ctx.moveTo(sx, sy);
         if (last) ctx.lineTo(ex, ey); else ctx.quadraticCurveTo(P[i].x + ox, top + P[i].y, ex, ey);
         ctx.stroke();
@@ -728,10 +953,10 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       return;
     }
     const top = topsRef.current[s.blockId] ?? 0;
-    let run: Pt[] = [], region: "pdf" | "blank" | "gap" | null = null;
+    let run: Pt[] = [], runStart = 0, runEnd = 0, region: "pdf" | "blank" | "gap" | null = null;
     const flush = () => {
       if (!run.length || !region) return;
-      paint(ctx, { ...s, pts: run }, ox, oy, displayInk(s.color, region));
+      paint(ctx, { ...s, pts: run }, ox, oy, displayInk(s.color, region), runStart === 0, runEnd === s.pts.length - 1);
     };
     for (let i = 0; i < s.pts.length; i++) {
       const p = s.pts[i], nextRegion = paperAtY(top + oy + p.y);
@@ -739,11 +964,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
         if (run.length) {
           const last = run[run.length - 1];
           flush();
-          run = [{ ...last }]; // keep joins clean where a stroke crosses a paper boundary
+          run = [{ ...last }]; runStart = i - 1; runEnd = i - 1; // keep joins clean without treating the boundary as a stroke end
         }
         region = nextRegion;
       }
-      run.push(p);
+      run.push(p); runEnd = i;
     }
     flush();
   };
@@ -789,10 +1014,26 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       const hs = 10 / z, hp = handlePts(bb);
       ctx.setLineDash([]); ctx.fillStyle = "#fff"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5 / z;
       ctx.beginPath(); ctx.moveTo((bb.x0 + bb.x1) / 2, bb.y0); ctx.lineTo(hp.rot.x, hp.rot.y); ctx.stroke();
-      hp.corners.forEach((c) => { ctx.fillRect(c.x - hs / 2, c.y - hs / 2, hs, hs); ctx.strokeRect(c.x - hs / 2, c.y - hs / 2, hs, hs); });
-      ctx.beginPath(); ctx.arc(hp.rot.x, hp.rot.y, hs * 0.6, 0, 7); ctx.fill(); ctx.stroke();
+      const el = !xf.current && !drag.current ? editableLine() : null;
+      if (!el) hp.corners.forEach((c) => { ctx.fillRect(c.x - hs / 2, c.y - hs / 2, hs, hs); ctx.strokeRect(c.x - hs / 2, c.y - hs / 2, hs, hs); }); // bei einer Linie ersetzen die Endpunkte die Eckgriffe
+      ctx.beginPath(); ctx.arc(hp.rot.x, hp.rot.y, hs * 0.85, 0, 7); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.arc(hp.rot.x, hp.rot.y, hs * 0.42, -2.4, 1.6); ctx.stroke(); // Drehsymbol ↻
+      if (xf.current?.mode === "rotate") {
+        let deg = Math.round((-xf.current.rot * 180) / Math.PI) % 360; if (deg > 180) deg -= 360; if (deg <= -180) deg += 360;
+        angleTag(ctx, hp.rot.x, hp.rot.y - 20 / z, `${deg > 0 ? "+" : ""}${deg}°`, z);
+      }
+      if (el) { // Endpunktgriffe: Ziehen ändert Winkel und Länge der Linie
+        ctx.save(); ctx.setLineDash([]);
+        for (const p of [el.a, el.b]) {
+          ctx.beginPath(); ctx.arc(p.x, p.y, 9 / z, 0, 7); ctx.fillStyle = "#fff"; ctx.fill(); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = "#5738df"; ctx.stroke();
+          ctx.beginPath(); ctx.arc(p.x, p.y, 3.5 / z, 0, 7); ctx.fillStyle = "#5738df"; ctx.fill();
+        }
+        const label = `${lineAngleDegrees(el.a, el.b)}°${endDrag.current?.snapped ? " · Raster" : ""}`;
+        angleTag(ctx, (el.a.x + el.b.x) / 2, (el.a.y + el.b.y) / 2 - 18 / z, label, z);
+        ctx.restore();
+      }
     }
-    if (tool === "eraser" && hover.current) { ctx.setLineDash([]); ctx.strokeStyle = "#64748b"; ctx.beginPath(); ctx.arc(hover.current.x, hover.current.y, eraseR(), 0, 7); ctx.stroke(); }
+    if ((tool === "eraser" || eraserHover.current) && hover.current) { ctx.setLineDash([]); ctx.strokeStyle = "#64748b"; ctx.beginPath(); ctx.arc(hover.current.x, hover.current.y, eraseR(), 0, 7); ctx.stroke(); }
     ctx.restore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tool, size, darkMode, pressureSensitivity]);
@@ -806,6 +1047,15 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   /* ───── Hilfsfunktionen ───── */
   const absPts = (s: Stroke) => s.pts.map((p) => ({ x: p.x, y: (topsRef.current[s.blockId] ?? 0) + p.y }));
+  /** Genau eine gerade Linie ausgewählt (keine Textfelder)? Dann gibt es Endpunktgriffe. */
+  const editableLine = () => {
+    if (sel.current.size !== 1) return null;
+    const s = strokes.current.find((x) => sel.current.has(x.id));
+    const ends = s ? lineEnds(s) : null;
+    if (!s || !ends) return null;
+    const top = topsRef.current[s.blockId] ?? 0, o = dragOff.current;
+    return { stroke: s, a: { x: ends.a.x + o.x, y: ends.a.y + top + o.y }, b: { x: ends.b.x + o.x, y: ends.b.y + top + o.y } };
+  };
   function selBox() {
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, n = 0;
     for (const s of strokes.current) if (sel.current.has(s.id))
@@ -867,8 +1117,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const liveText = (t: TextField): TextField =>
     sel.current.has(t.id) && (xf.current || dragOff.current.x || dragOff.current.y) ? xformText(t, xf.current ?? IDENT, dragOff.current.x, dragOff.current.y) : t;
 
-  const buildShape = (d: { x: number; y: number }) => {
+  const buildShape = (d: { x: number; y: number }, snapAngle = false) => {
     const a = shapeA.current!, b = blockAt(a.y), top = topsRef.current[b.id];
+    if (snapAngle && (shapeKind === "line" || shapeKind === "arrow")) d = snapToAngle(a, d, 15);
     const kind = shapeKind === "line" && hasArrow(lineStyle) ? "arrow" : shapeKind;
     cur.current = { id: cur.current?.id ?? uid(), blockId: b.id, tool: activePen.kind === "marker" ? "highlighter" : "pen", color, size, penKind: activePen.kind, lineStyle, pts: shapePts(kind, a, d).map((p) => ({ ...p, y: p.y - top })), raw: true };
     growTail(d.y);
@@ -939,41 +1190,190 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     strokes.current = out;
   };
 
-  /* ───── Pointer-Events: Stift/Maus zeichnen, 1 Finger scrollt, 2 Finger zoomen ───── */
-  const onDown = (e: React.PointerEvent) => {
-    if (e.pointerType === "touch") {
-      if (isPalm(e.nativeEvent) || penActive.current || performance.now() - penLast.current < PALM_GRACE_MS || touches.current.size >= 3) {
-        rejected.current.add(e.pointerId); return; // Handballen: komplett ignorieren
-      }
-      touches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (touches.current.size === 2) { const [a, b] = [...touches.current.values()]; pinch.current = { d0: Math.hypot(a.x - b.x, a.y - b.y), z0: zoomRef.current }; }
+  const connectLineExtension = (incoming: Stroke): Stroke | null => {
+    if (!smartShapesEnabled || incoming.tool !== "pen" || hasArrow(incoming.lineStyle)) return incoming;
+    const z = zoomRef.current;
+    // Nur fluchtende Linien (≤ 2,5°, ≤ 4 px neben der Achse) verbinden – sonst bleibt der gezeichnete Winkel unverändert.
+    const options = { maxGap: 16 / z, alignmentTolerance: 4 / z, minExtension: 6 / z, minLength: 14 / z };
+    let match: { stroke: Stroke; extension: NonNullable<ReturnType<typeof extendCollinearLine>> } | null = null;
+    for (const existing of strokes.current) {
+      if (existing.id === incoming.id || existing.blockId !== incoming.blockId || existing.tool !== "pen" || hasArrow(existing.lineStyle)) continue;
+      if ((existing.lineStyle ?? "solid") !== (incoming.lineStyle ?? "solid")) continue;
+      const extension = extendCollinearLine(existing.pts, incoming.pts, options);
+      if (extension && (!match || extension.gap < match.extension.gap)) match = { stroke: existing, extension };
+    }
+    if (!match) return incoming;
+
+    const { stroke: existing, extension } = match;
+    const pressure = (point: { x: number; y: number }, fallback: number) => ({ ...point, p: fallback });
+    const oldStartPressure = existing.pts[0]?.p ?? 0.5;
+    const oldEndPressure = existing.pts[existing.pts.length - 1]?.p ?? 0.5;
+    const sameAppearance = existing.color === incoming.color
+      && existing.size === incoming.size
+      && (existing.penKind ?? "ballpoint") === (incoming.penKind ?? "ballpoint");
+    if (sameAppearance) {
+      const merged: Stroke = {
+        ...existing,
+        pts: [pressure(extension.joinedStart, oldStartPressure), pressure(extension.joinedEnd, oldEndPressure)],
+        raw: true,
+      };
+      strokes.current = strokes.current.map((stroke) => stroke.id === existing.id ? merged : stroke);
+      flash("Linie verlängert · Rückgängig mit Strg+Z");
+      return null;
+    }
+
+    const nearPressure = extension.incomingNearAtStart
+      ? incoming.pts[0]?.p ?? 0.5
+      : incoming.pts[incoming.pts.length - 1]?.p ?? 0.5;
+    const outerPressure = extension.incomingNearAtStart
+      ? incoming.pts[incoming.pts.length - 1]?.p ?? 0.5
+      : incoming.pts[0]?.p ?? 0.5;
+    const points = extension.incomingNearAtStart
+      ? [pressure(extension.join, nearPressure), pressure(extension.outer, outerPressure)]
+      : [pressure(extension.outer, outerPressure), pressure(extension.join, nearPressure)];
+    flash("An vorhandene Linie angesetzt · Rückgängig mit Strg+Z");
+    return { ...incoming, pts: points, raw: true };
+  };
+
+  /* ───── Finger: 1 Finger scrollt (erst nach kurzer Strecke), 2 Finger verschieben + zoomen gemeinsam, Handballen werden ignoriert ───── */
+  // Handballen-Zone: rechts unterhalb der Stiftspitze (Rechtshänder) bzw. links unterhalb (Linkshänder)
+  const inPalmZone = (x: number, y: number) => {
+    const p = penPos.current;
+    if (!p || performance.now() - p.t > PALM_ZONE_MS) return false;
+    const dx = (x - p.x) * (handednessRef.current === "left" ? -1 : 1), dy = y - p.y;
+    return dx > -160 && dy > -240 && Math.hypot(dx, dy) < PALM_ZONE_R;
+  };
+  // Randstreifen auf der Seite der Schreibhand: Dort liegt die Hand beim Schreiben oft teilweise auf dem Rahmen auf
+  // und das Gerät meldet nur kleine Kontaktpunkte – die sehen für die Größenprüfung wie Finger aus.
+  const onHandEdge = (x: number) => {
+    if (!penSeen.current) return false;
+    const r = scRef.current!.getBoundingClientRect();
+    return handednessRef.current === "left" ? x < r.left + PALM_EDGE : x > r.right - PALM_EDGE;
+  };
+  const stopGestureFrame = () => { cancelAnimationFrame(gestureRaf.current); gestureRaf.current = 0; };
+  // Scrollen/Zoomen der laufenden Finger-Geste zurücknehmen (wenn sich herausstellt, dass es der Handballen war)
+  const revertGesture = () => {
+    const g = gesture.current, sc = scRef.current;
+    if (!sc || g.mode === "idle" || performance.now() - g.t0 > PALM_REVERT_MS) return;
+    stopGestureFrame();
+    if (Math.abs(zoomRef.current - g.zoom) > 1e-4) { restoreScroll.current = { left: g.scrollLeft, top: g.scrollTop }; zoomRef.current = g.zoom; setZoomState(g.zoom); }
+    else { sc.scrollLeft = g.scrollLeft; sc.scrollTop = g.scrollTop; schedule(); }
+  };
+  // Alle laufenden Finger verwerfen (Stift setzt auf)
+  const endTouches = () => {
+    revertGesture();
+    touches.current.forEach((_, id) => rejected.current.add(id)); touches.current.clear();
+    stopGestureFrame();
+    gesture.current = { ...gesture.current, mode: "idle", pinch: undefined };
+  };
+  const beginPinch = () => {
+    const sc = scRef.current!, r = sc.getBoundingClientRect(), [a, b] = [...touches.current.values()], z = zoomRef.current;
+    const cx = (a.x + b.x) / 2 - r.left, cy = (a.y + b.y) / 2 - r.top;
+    gesture.current.mode = "pinch";
+    gesture.current.pinch = { d0: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), z0: z, docX: (sc.scrollLeft + cx - offX()) / z, docY: (sc.scrollTop + cy) / z, locked: true };
+  };
+  // Höchstens einmal pro Bild: Der Dokumentpunkt, der beim Aufsetzen unter der Fingermitte lag, bleibt unter der Fingermitte.
+  // Dadurch verschieben und zoomen zwei Finger gleichzeitig, ohne zu springen oder zu zittern.
+  const applyPinch = () => {
+    gestureRaf.current = 0;
+    const g = gesture.current, p = g.pinch, sc = scRef.current;
+    if (g.mode !== "pinch" || !p || !sc || touches.current.size < 2) return;
+    const [a, b] = [...touches.current.values()], r = sc.getBoundingClientRect(), d = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+    const cx = (a.x + b.x) / 2 - r.left, cy = (a.y + b.y) / 2 - r.top;
+    if (p.locked && Math.abs(d / p.d0 - 1) > PINCH_LOCK) { p.locked = false; p.d0 = d; p.z0 = zoomRef.current; } // ab jetzt zoomen – ohne Sprung
+    const z = p.locked ? zoomRef.current : clamp((p.z0 * d) / p.d0, MIN_Z, MAX_Z);
+    if (Math.abs(z - zoomRef.current) > 1e-4) { anchor.current = { dx: p.docX, dy: p.docY, cx, cy }; zoomRef.current = z; setZoomState(z); }
+    else { sc.scrollLeft = p.docX * z + offX() - cx; sc.scrollTop = p.docY * z - cy; schedule(); }
+  };
+  const touchDown = (e: React.PointerEvent) => {
+    const now = performance.now(), g = gesture.current, x = e.clientX, y = e.clientY;
+    const palm = isPalm(e.nativeEvent) || penActive.current || now - penLast.current < PALM_GRACE_MS || inPalmZone(x, y) || onHandEdge(x);
+    if (palm || g.mode === "blocked" || touches.current.size >= 2) {
+      rejected.current.add(e.pointerId);
+      // Dritter Kontakt oder Ballen neben einem laufenden Finger: Geste stoppen (und zurücknehmen, falls sie gerade erst begann)
+      if (touches.current.size > 0 && g.mode !== "blocked") { revertGesture(); stopGestureFrame(); g.mode = "blocked"; g.pinch = undefined; }
       return;
     }
-    if (e.pointerType === "pen") { // Stift setzt auf: laufende Finger-Gesten abbrechen
-      penActive.current = true; penLast.current = performance.now();
-      touches.current.forEach((_, id) => rejected.current.add(id)); touches.current.clear(); pinch.current = null;
+    touches.current.set(e.pointerId, { x, y, sx: x, sy: y });
+    if (touches.current.size === 1) { const sc = scRef.current!; gesture.current = { mode: "pending", t0: now, scrollLeft: sc.scrollLeft, scrollTop: sc.scrollTop, zoom: zoomRef.current }; }
+    else beginPinch();
+  };
+  const touchMove = (e: React.PointerEvent) => {
+    if (rejected.current.has(e.pointerId)) return;
+    const t = touches.current.get(e.pointerId);
+    if (!t) return;
+    const g = gesture.current;
+    if (isPalm(e.nativeEvent) || penActive.current) { // Kontakt wächst zum Ballen oder der Stift schreibt: Geste beenden
+      rejected.current.add(e.pointerId); touches.current.delete(e.pointerId);
+      revertGesture(); stopGestureFrame();
+      g.mode = touches.current.size ? "blocked" : "idle"; g.pinch = undefined;
+      return;
     }
+    const dx = e.clientX - t.x, dy = e.clientY - t.y;
+    t.x = e.clientX; t.y = e.clientY;
+    if (g.mode === "pending" && touches.current.size === 1) {
+      if (oneFingerRef.current && Math.hypot(t.x - t.sx, t.y - t.sy) > TOUCH_SLOP) {
+        g.mode = "pan";
+        const sc = scRef.current!; sc.scrollTop -= t.y - t.sy; sc.scrollLeft -= t.x - t.sx; schedule(); // aufgelaufene Strecke nachholen
+      }
+    } else if (g.mode === "pan") { const sc = scRef.current!; sc.scrollTop -= dy; sc.scrollLeft -= dx; schedule(); }
+    else if (g.mode === "pinch" && !gestureRaf.current) gestureRaf.current = requestAnimationFrame(applyPinch);
+  };
+  const touchUp = (e: React.PointerEvent) => {
+    rejected.current.delete(e.pointerId);
+    if (!touches.current.delete(e.pointerId)) return;
+    const g = gesture.current;
+    if (touches.current.size === 0) { stopGestureFrame(); g.mode = "idle"; g.pinch = undefined; }
+    else if (g.mode === "pinch") { stopGestureFrame(); g.mode = "blocked"; g.pinch = undefined; } // ein Finger bleibt liegen: nicht plötzlich losscrollen
+  };
+
+  /* ───── Pointer-Events: Stift/Maus zeichnen, Finger navigieren ───── */
+  const onDown = (e: React.PointerEvent) => {
+    if (e.pointerType === "touch") { touchDown(e); return; }
+    if (e.pointerType === "pen") { // Stift setzt auf: laufende Finger-Gesten abbrechen (und zurücknehmen, falls der Ballen kurz vorher gescrollt hat)
+      const now = performance.now();
+      penSeen.current = true; penPos.current = { x: e.clientX, y: e.clientY, t: now };
+      endTouches();
+      penActive.current = true; penLast.current = now;
+    }
+    if (e.pointerType === "mouse" && e.button !== 0) return; // nur die linke Maustaste zeichnet
+    if (readOnlyRef.current) { // Nur ansehen: nichts zeichnen, Ziehen verschiebt die Ansicht
+      viewPan.current = { id: e.pointerId, x: e.clientX, y: e.clientY };
+      try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* ohne Capture geht es auch */ }
+      return;
+    }
+    // Stiftrückseite (Radierer-Ende) und Seitentaste erkennen: Pointer Events melden button 5 / buttons 32 bzw. button 2 / buttons 2
+    const penTail = e.pointerType === "pen" && (e.button === 5 || (e.buttons & 32) !== 0);
+    const penBarrel = e.pointerType === "pen" && !penTail && (e.button === 2 || (e.buttons & 2) !== 0);
+    const useTool: Tool = penTail ? "eraser" : penBarrel && barrelAction !== "none" ? barrelAction : tool;
+    gTool.current = useTool; gestureOn.current = true; eraserHover.current = useTool === "eraser" && tool !== "eraser";
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const d = toDoc(e.clientX, e.clientY);
     if (document.activeElement instanceof HTMLTextAreaElement) document.activeElement.blur(); // laufende Texteingabe abschließen
     before.current = snap();
     growTail(d.y);
-    if (tool === "pen" || tool === "highlighter") {
-      cancelSmartHold(); rawBeforeSmartSnap.current = null;
+    if (useTool === "pen" || useTool === "highlighter") {
+      cancelSmartHold(); rawBeforeSmartSnap.current = null; snapInfo.current = null;
+      holdAnchor.current = { x: e.clientX, y: e.clientY };
       const b = blockAt(d.y);
-      const strokeTool = activePen.kind === "marker" ? "highlighter" : tool;
+      const strokeTool = activePen.kind === "marker" ? "highlighter" : useTool;
       cur.current = { id: uid(), blockId: b.id, tool: strokeTool, color, size, penKind: activePen.kind, lineStyle, pts: [{ x: d.x, y: d.y - topsRef.current[b.id], p: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 0.5 }] };
-    } else if (tool === "text") {
+    } else if (useTool === "text") {
       const b = blockAt(d.y), id = uid();
       textBefore.current = snap(); creating.current = true; focusId.current = id;
       textFields.current = [...textFields.current, { id, blockId: b.id, text: "", x: d.x, y: d.y - topsRef.current[b.id], width: Math.max(80, Math.min(260, PAGE_W - d.x - 8)), height: 28, fontSize: Math.round(10 + size * 3), color }];
       bump();
-    } else if (tool === "shape") { shapeA.current = d; buildShape(d); }
-    else if (tool === "eraser") erase(d);
+    } else if (useTool === "shape") { shapeA.current = d; buildShape(d); }
+    else if (useTool === "eraser") { erase(d); eraseLast.current = d; }
     else {
       const bb = selBox();
-      const h = bb ? handleAt(bb, d) : null;
-      if (bb && h) { // Anfasser gegriffen: Skalieren relativ zur gegenüberliegenden Ecke, Drehen um die Mitte
+      const el = editableLine();
+      const endHit = el ? [el.a, el.b].findIndex((p) => Math.hypot(d.x - p.x, d.y - p.y) < 18 / zoomRef.current) : -1;
+      const h0 = bb && endHit < 0 ? handleAt(bb, d) : null;
+      const h = h0 && (!el || h0.kind === "rotate") ? h0 : null; // einzelne Linie: nur Drehgriff, Länge/Winkel über die Endpunkte
+      if (el && endHit >= 0) { // Endpunkt greifen: der andere Endpunkt bleibt fest
+        endDrag.current = { id: el.stroke.id, which: endHit as 0 | 1, orig: el.stroke, fixed: endHit === 0 ? el.b : el.a, snapped: false };
+      } else if (bb && h) { // Anfasser gegriffen: Skalieren relativ zur gegenüberliegenden Ecke, Drehen um die Mitte
         const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2;
         if (h.kind === "rotate") xf.current = { mode: "rotate", px: cx, py: cy, s: 1, rot: 0, d0: 1, a0: Math.atan2(d.y - cy, d.x - cx) };
         else { const o = h.corners[(h.i + 2) % 4], c = h.corners[h.i]; xf.current = { mode: "scale", px: o.x, py: o.y, s: 1, rot: 0, d0: Math.max(1, Math.hypot(c.x - o.x, c.y - o.y)), a0: 0 }; }
@@ -983,42 +1383,78 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     schedule();
   };
   const onMove = (e: React.PointerEvent) => {
-    if (e.pointerType === "touch") {
-      if (rejected.current.has(e.pointerId)) return;
-      if (isPalm(e.nativeEvent) || penActive.current) { rejected.current.add(e.pointerId); touches.current.delete(e.pointerId); pinch.current = null; return; }
-      const t = touches.current.get(e.pointerId);
-      if (!t) return;
-      const dy = e.clientY - t.y, dx = e.clientX - t.x;
-      touches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (pinch.current && touches.current.size >= 2) {
-        const [a, b] = [...touches.current.values()], r = scRef.current!.getBoundingClientRect();
-        setZoom((pinch.current.z0 * Math.hypot(a.x - b.x, a.y - b.y)) / pinch.current.d0, (a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top);
-      } else if (touches.current.size === 1) { scRef.current!.scrollTop -= dy; scRef.current!.scrollLeft -= dx; }
+    if (e.pointerType === "touch") { touchMove(e); return; }
+    if (viewPan.current) {
+      const v = viewPan.current, sc = scRef.current!;
+      if (v.id === e.pointerId) { sc.scrollLeft -= e.clientX - v.x; sc.scrollTop -= e.clientY - v.y; v.x = e.clientX; v.y = e.clientY; }
       return;
     }
-    if (e.pointerType === "pen") { penLast.current = performance.now(); if (!(e.buttons & 1)) penActive.current = false; }
+    // „Gedrückt“ über das eigene Flag statt über buttons & 1: das Radierer-Ende meldet buttons 32, die Seitentaste buttons 2
+    const pressed = gestureOn.current && (e.pointerType !== "mouse" || (e.buttons & 1) !== 0);
+    if (e.pointerType === "pen") { // auch schwebend: merkt sich, wo die Schreibhand gerade ist (Handballen-Zone)
+      const now = performance.now();
+      penLast.current = now; penSeen.current = true; penPos.current = { x: e.clientX, y: e.clientY, t: now };
+      if (!pressed) penActive.current = false;
+    }
     hover.current = toDoc(e.clientX, e.clientY);
-    if (!(e.buttons & 1)) { if (tool === "eraser") schedule(); return; }
-    const evs = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent];
+    if (!pressed) {
+      const tailNear = e.pointerType === "pen" && (e.buttons & 32) !== 0; // umgedrehter Stift schwebt über der Fläche
+      if (tool === "eraser" || tailNear || eraserHover.current) { eraserHover.current = tailNear; schedule(); }
+      return;
+    }
+    const activeTool = gTool.current;
+    const coalesced = e.nativeEvent.getCoalescedEvents?.();
+    const evs = coalesced && coalesced.length ? coalesced : [e.nativeEvent]; // manche WebViews liefern eine leere Liste
     for (const ev of evs) {
       const d = toDoc(ev.clientX, ev.clientY);
-      if (shapeA.current) buildShape(d);
+      if (shapeA.current) buildShape(d, ev.shiftKey || angleSnapRef.current);
       else if (cur.current) {
-        if (rawBeforeSmartSnap.current) { cur.current = rawBeforeSmartSnap.current; rawBeforeSmartSnap.current = null; }
+        const si = snapInfo.current;
+        if (si) { // durch Halten geglättet
+          const far = Math.hypot(ev.clientX - si.x, ev.clientY - si.y);
+          if (si.line) { // Linie: der Endpunkt folgt dem Stift – Winkel und Länge frei wählbar, 15°-Raster nur mit Umschalt/Schalter
+            if (far > HOLD_RADIUS) {
+              const c = cur.current, a = c.pts[0], free = { x: d.x, y: d.y - topsRef.current[c.blockId] };
+              const b = ev.shiftKey || angleSnapRef.current ? snapToAngle(a, free, 15) : free;
+              if (Math.hypot(b.x - a.x, b.y - a.y) >= 6 / zoomRef.current) cur.current = { ...c, pts: shapePts(hasArrow(c.lineStyle) ? "arrow" : "line", a, b), auto: undefined }; // Winkel jetzt bewusst gewählt
+              growTail(d.y);
+            }
+            continue;
+          }
+          if (far <= 14) continue; // Form bleibt stehen, solange der Stift nur zittert
+          if (rawBeforeSmartSnap.current) cur.current = rawBeforeSmartSnap.current; // bewusst weitergezeichnet: Glättung aufheben
+          rawBeforeSmartSnap.current = null; snapInfo.current = null;
+        }
         const pts = cur.current.pts, last = pts[pts.length - 1], ly = d.y - topsRef.current[cur.current.blockId], md = MIN_DIST / zoomRef.current;
-        const ddx = d.x - last.x, ddy = ly - last.y;
+        // Stabilisierung: der Punkt folgt dem Stift leicht verzögert und nimmt Zittern heraus
+        const f = inkSmoothingRef.current > 0 ? stabilize(last, { x: d.x, y: ly }, inkSmoothingRef.current) : { x: d.x, y: ly };
+        const ddx = f.x - last.x, ddy = f.y - last.y;
         if (ddx * ddx + ddy * ddy >= md * md) { // Mikro-Zittern überspringen
           const rawP = e.pointerType === "pen" ? (ev.pressure > 0 ? ev.pressure : last.p) : 0.5;
-          pts.push({ x: d.x, y: ly, p: last.p + (rawP - last.p) * PRESSURE_LERP }); // Tiefpass: p = lerp(letzter, neuer, 0,2)
-          armSmartHold();
+          pts.push({ x: f.x, y: f.y, p: last.p + (rawP - last.p) * PRESSURE_LERP }); // Tiefpass: p = lerp(letzter, neuer, 0,2)
         }
+        noteHoldPosition(ev.clientX, ev.clientY);
         growTail(d.y);
-      } else if (tool === "eraser") erase(d);
+      } else if (endDrag.current) {
+        const ed = endDrag.current, snapIt = ev.shiftKey || angleSnapRef.current;
+        const free = snapIt ? snapToAngle(ed.fixed, d, 15) : d;
+        if (Math.hypot(free.x - ed.fixed.x, free.y - ed.fixed.y) >= 6 / zoomRef.current) {
+          const top = topsRef.current[ed.orig.blockId] ?? 0, a = ed.which === 0 ? free : ed.fixed, b = ed.which === 0 ? ed.fixed : free;
+          const pts = shapePts(hasArrow(ed.orig.lineStyle) ? "arrow" : "line", { x: a.x, y: a.y - top }, { x: b.x, y: b.y - top });
+          pts[0] = { ...pts[0], p: ed.orig.pts[0]?.p ?? 0.5 }; pts[1] = { ...pts[1], p: ed.orig.pts[ed.orig.pts.length - 1]?.p ?? 0.5 };
+          strokes.current = strokes.current.map((s) => (s.id === ed.id ? { ...ed.orig, pts, raw: true, auto: undefined } : s)); // Winkel von Hand eingestellt
+          ed.snapped = snapIt; growTail(d.y);
+        }
+      } else if (activeTool === "eraser") { // zwischen zwei Ereignissen in kleinen Schritten radieren, damit schnelle Züge nichts überspringen
+        const from = eraseLast.current ?? d, dist = Math.hypot(d.x - from.x, d.y - from.y), steps = Math.max(1, Math.ceil(dist / Math.max(2, eraseR() * 0.6)));
+        for (let k = 1; k <= steps; k++) erase({ x: from.x + ((d.x - from.x) * k) / steps, y: from.y + ((d.y - from.y) * k) / steps });
+        eraseLast.current = d;
+      }
       else if (lasso.current) lasso.current.push(d);
       else if (xf.current) {
         const t = xf.current;
         if (t.mode === "scale") t.s = clamp(Math.hypot(d.x - t.px, d.y - t.py) / t.d0, 0.1, 10);
-        else t.rot = Math.atan2(d.y - t.py, d.x - t.px) - t.a0;
+        else { const r = Math.atan2(d.y - t.py, d.x - t.px) - t.a0; t.rot = ev.shiftKey || angleSnapRef.current ? snapRadians(r, 15) : r; }
       }
       else if (drag.current) { dragOff.current = { x: dragOff.current.x + d.x - drag.current.x, y: dragOff.current.y + d.y - drag.current.y }; drag.current = d; }
     }
@@ -1026,19 +1462,69 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     schedule();
   };
   const onUp = (e: React.PointerEvent) => {
-    if (e.pointerType === "touch") { rejected.current.delete(e.pointerId); touches.current.delete(e.pointerId); if (touches.current.size < 2) pinch.current = null; return; }
+    if (e.pointerType === "touch") { touchUp(e); return; }
+    if (viewPan.current) { if (viewPan.current.id === e.pointerId) viewPan.current = null; return; }
     cancelSmartHold();
+    if (!gestureOn.current) return; // z. B. rechte Maustaste: es lief keine Geste
+    const usedTool = gTool.current;
+    gestureOn.current = false; eraserHover.current = false; holdAnchor.current = null; eraseLast.current = null;
     if (e.pointerType === "pen") { penActive.current = false; penLast.current = performance.now(); }
     if (cur.current) {
-      const stroke = cur.current;
+      let stroke = cur.current;
+      if (!stroke.raw && !snapInfo.current && stroke.pts.length > 1) {
+        // Die Stabilisierung hinkt dem Stift minimal hinterher: beim Absetzen den echten Endpunkt ergänzen …
+        const d = toDoc(e.clientX, e.clientY), last = stroke.pts[stroke.pts.length - 1], ly = d.y - (topsRef.current[stroke.blockId] ?? 0);
+        const gap = Math.hypot(d.x - last.x, ly - last.y);
+        if (e.type !== "pointercancel" && gap >= MIN_DIST / zoomRef.current && gap < 40 / zoomRef.current) stroke.pts.push({ x: d.x, y: ly, p: last.p });
+        // … und den fertigen Strich nachglätten (Start, Ende und Ecken bleiben erhalten)
+        if (inkSmoothingRef.current > 0) stroke = { ...stroke, pts: smoothInk(stroke.pts, inkSmoothingRef.current, 1 / zoomRef.current) };
+      }
+      snapInfo.current = null;
       const finalStroke = !stroke.raw && hasArrow(stroke.lineStyle) && stroke.pts.length > 1
         ? { ...stroke, pts: shapePts("arrow", stroke.pts[0], stroke.pts[stroke.pts.length - 1]), raw: true }
         : stroke;
-      strokes.current = [...strokes.current, finalStroke]; cur.current = null; rawBeforeSmartSnap.current = null;
+      // Automatisch begradigen: nur eindeutig gerade, ausreichend lange Striche (Handschrift bleibt unberührt).
+      // Start, Ende und Winkel bleiben wie gezeichnet. Der Freihandstrich wird als eigener Undo-Schritt abgelegt.
+      let auto: Stroke | null = null;
+      if (autoStraighten && smartShapesEnabled && finalStroke.tool === "pen" && !finalStroke.raw && finalStroke.pts.length > 2) {
+        const z = zoomRef.current, P = finalStroke.pts;
+        if (straightLineSpan(P, 45 / z)) auto = { ...finalStroke, pts: shapePts("line", P[0], P[P.length - 1]).map((q, i) => ({ ...q, p: i ? P[P.length - 1].p : P[0].p })), raw: true, auto: true };
+        else {
+          let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+          for (const q of P) { x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); y0 = Math.min(y0, q.y); y1 = Math.max(y1, q.y); }
+          // Leitung mit Knicken – automatisch nur bei klarem Schaltbild-Charakter: höchstens 4 lange, waagerechte/senkrechte Stücke.
+          // Kleine Zickzack-Schrift (mm, ww, nn), große Z/N und Kurven bleiben unberührt; Halten und „Schaltbild glätten“ sind großzügiger.
+          if (Math.hypot(x1 - x0, y1 - y0) >= 90 / z) auto = perfectPolyline(finalStroke, { maxSegments: 4, minSegment: 40 / z, axisDegrees: 14 });
+          if (auto) auto = { ...auto, auto: true };
+        }
+      }
+      if (auto) {
+        strokes.current = [...strokes.current, finalStroke];
+        pushHist(before.current); before.current = snap(); // 1. Rückgängig = zurück zum Freihandstrich
+        strokes.current = strokes.current.filter((x) => x.id !== finalStroke.id);
+        flash(auto.pts.length === 2 ? "Linie begradigt · Strg+Z stellt den Freihandstrich wieder her" : "Leitung begradigt · Strg+Z stellt den Freihandstrich wieder her");
+      }
+      const connectedStroke = connectLineExtension(auto ?? finalStroke);
+      if (connectedStroke) strokes.current = [...strokes.current, connectedStroke];
+      cur.current = null; rawBeforeSmartSnap.current = null;
     }
     shapeA.current = null;
     if (focusId.current) { document.getElementById("tf-" + focusId.current)?.focus(); focusId.current = null; }
-    if (lasso.current && lasso.current.length > 2) {
+    if (endDrag.current) { // Linie im passenden Block verankern; der Undo-Schritt entsteht unten über pushHist
+      const ed = endDrag.current, edited = strokes.current.find((s) => s.id === ed.id);
+      if (edited && edited !== ed.orig) {
+        strokes.current = strokes.current.map((s) => (s.id === ed.id ? moved(s, 0, 0) : s));
+        const ends = lineEnds(edited); if (ends) flash(`Winkel ${lineAngleDegrees(ends.a, ends.b)}° gespeichert · Rückgängig mit Strg+Z`);
+      }
+      endDrag.current = null;
+    }
+    const tapSpan = lasso.current ? Math.max(...lasso.current.map((p) => Math.hypot(p.x - lasso.current![0].x, p.y - lasso.current![0].y))) : 0;
+    if (lasso.current && (lasso.current.length <= 2 || tapSpan < 8 / zoomRef.current)) { // Antippen wählt den obersten Strich direkt aus
+      const p = lasso.current[0], r = 10 / zoomRef.current;
+      const hit = [...strokes.current].reverse().find((s) => strokeHit(s, topsRef.current[s.blockId] ?? 0, p.x, p.y, r, 1.5));
+      sel.current = hit ? new Set([hit.id]) : new Set();
+      if (hit && lineEnds(hit)) flash("Linie ausgewählt · Endpunkt ziehen ändert den Winkel");
+    } else if (lasso.current && lasso.current.length > 2) {
       const poly = lasso.current;
       const hitS = strokes.current.filter((s) => { const a = absPts(s); return a.filter((p) => inPoly(p, poly)).length > a.length / 2; }).map((s) => s.id);
       const hitT = textFields.current.filter((t) => { // Textfeld gilt als erfasst, wenn alle 4 Ecken seiner Box im Lasso liegen
@@ -1067,7 +1553,10 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       dragOff.current = { x: 0, y: 0 };
     }
     lasso.current = null; drag.current = null;
-    if (strokes.current !== before.current.strokes || (tool !== "text" && textFields.current !== before.current.texts)) pushHist(before.current);
+    if (usedTool === "lasso" && tool !== "lasso" && sel.current.size > 0) { // Seitentaste: Auswahl sofort bearbeitbar (Griffe, Kopieren, Löschen)
+      setTool("lasso"); flash("Auswahl mit der Stift-Seitentaste · Lasso ist jetzt aktiv");
+    }
+    if (strokes.current !== before.current.strokes || (usedTool !== "text" && textFields.current !== before.current.texts)) pushHist(before.current);
     bump(); // 1 Geste = 1 Undo-Schritt
     schedule();
   };
@@ -1110,14 +1599,65 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     pushHist(s0);
   };
 
+  /** Löscht eine einzelne PDF-Seite samt Strichen und Texten darauf. Nur im Löschmodus erreichbar; Rückgängig stellt alles wieder her. */
+  const deletePdfPage = (blockId: string) => {
+    const bs = blocksRef.current, b = bs.find((x) => x.id === blockId);
+    if (!pdfDeleteMode || !b || b.kind !== "pdf") return;
+    const s0 = snap();
+    strokes.current = strokes.current.filter((s) => s.blockId !== blockId);
+    textFields.current = textFields.current.filter((t) => t.blockId !== blockId);
+    sel.current = new Set();
+    setBlocks(bs.filter((x) => x.id !== blockId));
+    pushHist(s0); bump(); schedule();
+    flash(`PDF-Seite ${b.pageNum} gelöscht · Rückgängig mit Strg+Z`);
+  };
+  const togglePdfDeleteMode = () => {
+    const next = !pdfDeleteMode;
+    setPdfDeleteMode(next);
+    flash(next ? "Löschmodus AN: ✕ an einer PDF-Seite löscht sie" : "Löschmodus AUS: PDF-Seiten sind geschützt");
+  };
+
   /* ───── Zwischenraum ───── */
   const setGap = (id: string, gap: number) => setBlocks((bs) => bs.map((b) => (b.id === id ? { ...b, gap: Math.max(MIN_GAP, gap) } : b)));
+  /** Messprotokoll aus dem Labor einfügen: Textfeld + Oszillogramm als normale Striche (Lasso, Radierer, Undo, Export funktionieren). */
+  const insertLabRecord = (rec: LabRecord) => {
+    const sc = scRef.current!, z = zoomRef.current, s0 = snap();
+    const viewTop = sc.scrollTop / z + 24, b = blockAt(viewTop), top = topsRef.current[b.id] ?? 0;
+    const x0 = 40, fontSize = 13, width = Math.min(PAGE_W - 2 * x0, 700);
+    const lines = [rec.title, ...rec.lines];
+    const estRows = lines.reduce((n, l) => n + Math.max(1, Math.ceil((l.length * fontSize * 0.55) / (width - 16))), 0);
+    const textHeight = Math.ceil(estRows * fontSize * 1.5 + 18);
+    let y = viewTop - top;
+    const newTexts: TextField[] = [{ id: uid(), blockId: b.id, text: lines.join("\n"), x: x0, y, width, height: textHeight, fontSize, color: "#1f2937" }];
+    const newStrokes: Stroke[] = [];
+    y += textHeight + 14;
+    if (rec.scope) {
+      const W = 400, H = 320, dx = W / 10, dy = H / 8, P = (x: number, yy: number): Pt => ({ x, y: yy, p: 0.5 });
+      const line = (pts: Pt[], color: string, sz: number, lineStyle: LineStyle = "solid"): Stroke => ({ id: uid(), blockId: b.id, tool: "pen", color, size: sz, penKind: "ballpoint", lineStyle, pts, raw: true });
+      for (let i = 1; i < 10; i++) newStrokes.push(line([P(x0 + i * dx, y), P(x0 + i * dx, y + H)], "#cbd5e1", 0.8, i === 5 ? "solid" : "dotted"));
+      for (let j = 1; j < 8; j++) newStrokes.push(line([P(x0, y + j * dy), P(x0 + W, y + j * dy)], "#cbd5e1", 0.8, j === 4 ? "solid" : "dotted"));
+      newStrokes.push(line([P(x0, y), P(x0 + W, y), P(x0 + W, y + H), P(x0, y + H), P(x0, y)], "#475569", 1.4));
+      for (const t of rec.scope.traces) {
+        const step = Math.max(1, Math.floor(t.points.length / 600)), pts: Pt[] = [];
+        for (let i = 0; i < t.points.length; i += step) pts.push(P(x0 + (i / (t.points.length - 1)) * W, y + H / 2 - clamp(t.points[i], -4, 4) * dy));
+        newStrokes.push(line(pts, t.color, 1.8));
+      }
+      newTexts.push({ id: uid(), blockId: b.id, text: `${rec.scope.caption} · ${rec.scope.traces.map((t) => `${t.label} ${t.color === "#b45309" ? "braun" : "blau"}`).join(", ")}`, x: x0, y: y + H + 6, width: W + 160, height: 24, fontSize: 11, color: "#475569" });
+      y += H + 36;
+    }
+    growTail(top + y + 200);
+    strokes.current = [...strokes.current, ...newStrokes];
+    textFields.current = [...textFields.current, ...newTexts];
+    pushHist(s0); bump(); schedule();
+    flash("Messprotokoll eingefügt · Rückgängig mit Strg+Z");
+  };
   const addSpaceAtView = () => {
     const sc = scRef.current!, b = blockAt((sc.scrollTop + sc.clientHeight / 2) / zoomRef.current), s0 = snap();
     setBlocks((bs) => bs.map((x) => (x.id === b.id ? { ...x, gap: Math.max(x.gap, MIN_GAP) + SPACE_STEP } : x)));
     pushHist(s0);
   };
   const startGapDrag = (e: React.PointerEvent, b: Block) => {
+    if (e.pointerType === "touch" || readOnlyRef.current) return; // Finger/Handballen: nicht den Zwischenraum ziehen, sondern normal scrollen (Zeichenfläche entscheidet)
     e.stopPropagation();
     const y0 = e.clientY, g0 = b.gap, s0 = snap();
     const mv = (ev: PointerEvent) => setGap(b.id, g0 + (ev.clientY - y0) / zoomRef.current);
@@ -1231,9 +1771,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !(e.target as HTMLElement)?.closest?.("textarea, input, select")) { setFocus(false); return; }
       if (!(e.ctrlKey || e.metaKey)) return;
       if ((e.target as HTMLElement)?.closest?.("textarea, input, select")) return; // in Textfeldern gilt das native Undo
       const key = e.key.toLowerCase();
+      if (readOnlyRef.current) { if (key === "0") { e.preventDefault(); setZoom(1); } return; }
       if (key === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); }
       else if (key === "y") { e.preventDefault(); redo(); }
       else if (key === "0") { e.preventDefault(); setZoom(1); }
@@ -1288,6 +1830,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     const k = (e: KeyboardEvent) => {
       const el = (e.target as HTMLElement)?.closest?.("textarea, input, select");
       if (el && !(el instanceof HTMLTextAreaElement && el.readOnly)) return; // echte Texteingabe hat Vorrang
+      if (readOnlyRef.current) return;
       const mod = e.ctrlKey || e.metaKey, key = e.key.toLowerCase();
       if ((e.key === "Delete" || e.key === "Backspace") && sel.current.size) { e.preventDefault(); deleteSel(); }
       else if (mod && key === "c" && sel.current.size) { e.preventDefault(); copySel(); }
@@ -1298,7 +1841,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   });
 
   const clipFilled = clipCount > 0;
-  const showBar = sel.current.size > 0 || (tool === "lasso" && clipFilled);
+  const showBar = !readOnly && (sel.current.size > 0 || (tool === "lasso" && clipFilled));
   // pointerdown feuert sofort (keine 300-ms-Klickverzögerung) und gilt für Finger, Stift und Maus
   const abtn = (label: string, on: () => void, off: boolean) => (
     <button key={label} disabled={off} style={{ touchAction: "manipulation" }}
@@ -1312,7 +1855,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     : tpl === "grid" ? { backgroundImage: `linear-gradient(${darkMode ? "#334155" : "#e2e8f0"} 1px, transparent 1px), linear-gradient(90deg, ${darkMode ? "#334155" : "#e2e8f0"} 1px, transparent 1px)`, backgroundSize: "24px 24px" }
     : tpl === "dots" ? { backgroundImage: `radial-gradient(circle, ${darkMode ? "#475569" : "#cbd5e1"} 1px, transparent 1.2px)`, backgroundSize: "24px 24px", backgroundPosition: "12px 12px" }
     : {};
-  const btn = (on: boolean) => `px-3 py-2 rounded-lg text-sm transition select-none ${on ? "bg-slate-900 text-white" : "hover:bg-slate-200 text-slate-700"}`;
+  const btn = (on: boolean) => `px-2.5 py-1.5 rounded-lg text-sm transition select-none ${on ? "bg-slate-900 text-white" : "hover:bg-slate-200 text-slate-700"}`;
   const palette = [...COLORS, ...customColors.filter((c) => !COLORS.includes(c))];
   const tools: [Tool, string][] = [["pen", "✒ Stift"], ["highlighter", "▰ Marker"], ["eraser", "Radierer"], ["lasso", "Lasso"], ["shape", "Form"], ["text", "Text"]];
   const toolIcon = (kind: Tool) => {
@@ -1327,48 +1870,66 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     return <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[kind]}</svg>;
   };
   const Sep = () => <span className="w-px h-6 bg-slate-200" />;
+  const pickTool = (t: Tool) => {
+    if (t === "pen") { const p = activePen.kind === "marker" ? penProfiles.find((x) => x.kind !== "marker") : activePen; if (p) choosePen(p); else setTool(t); }
+    else if (t === "highlighter") { const p = penProfiles.find((x) => x.kind === "marker"); if (p) choosePen(p); else setTool(t); }
+    else setTool(t);
+  };
+  const focusIcon = <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>;
+  const penHint = smartShapesEnabled ? "Gerade Linien werden beim Absetzen begradigt · Strich-Ende 0,5 s halten = Form glätten / Winkel ändern" : "Automatisches Glätten und Verbinden deaktiviert";
+  const lassoHint = "Linie antippen · Endpunkt ziehen = Winkel ändern · ↻ dreht die Auswahl";
 
   return (
     <div className="notiz-workspace relative h-full flex-1 min-w-0 flex flex-col bg-slate-100 text-slate-800 select-none overscroll-none" data-theme={darkMode ? "dark" : "light"}>
-      <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-2 bg-white border-b border-slate-200 flex-wrap">
+      {/* Kunstbanner liegt HINTER der Werkzeugleiste (spart die eigene Bannerzeile → mehr Platz für die Notiz) */}
+      <div className={(compact ? "xnts-topbar xnts-topbar--plain" : "xnts-topbar") + (focus ? " xnts-hidden" : "")}>
+      {!compact && <div className="xnts-topbar__art" aria-hidden="true"><img src={import.meta.env.BASE_URL + "xnts-art-collage.webp"} alt="" /></div>}
+      {!compact && <div className="xnts-art-banner__lockup xnts-topbar__lockup" aria-hidden="true"><strong>XNTS</strong><span>NOTES · STUDY · ART</span></div>}
+      <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-1.5 bg-white border-b border-slate-200 flex-wrap" data-collapsed={toolbarCollapsed}>
         <div className="notiz-toolbar__row notiz-toolbar__primary">
           {onLibrary && <button className={btn(false)} onClick={onLibrary} aria-label="Bibliothek öffnen">Bibliothek</button>}
           <button className={btn(sidebar)} onClick={() => setSidebar(!sidebar)} aria-pressed={sidebar}>Seiten</button>
-          <button className={btn(toolbarCollapsed) + " notiz-toolbar__collapse"} onClick={() => setToolbarCollapsed(!toolbarCollapsed)} aria-pressed={toolbarCollapsed} title={toolbarCollapsed ? "Werkzeugleiste ausklappen" : "Werkzeugleiste einklappen"}>
+          <button className={btn(toolbarCollapsed) + " notiz-toolbar__collapse"} onClick={() => setToolbarCollapsed(!toolbarCollapsed)} aria-pressed={toolbarCollapsed} title={toolbarCollapsed ? "Werkzeugleiste ausklappen (alle Zeilen zeigen)" : "Werkzeugleiste auf eine Zeile verkleinern – mehr Platz für die Notiz"}>
             {toolbarCollapsed ? "Leiste +" : "Leiste −"}
           </button>
+          <button className={btn(false) + " notiz-toolbar__focus inline-flex items-center gap-1.5"} onClick={() => setFocus(true)} title="Fokus: alle Leisten ausblenden – die ganze Fläche gehört der Notiz (Esc beendet)" aria-label="Fokusmodus">{focusIcon}<span className="notiz-toolbar__tool-label">Fokus</span></button>
+          {readOnly && <span className="xnts-chip" title="Du kannst diese Notiz ansehen, scrollen und zoomen. Zum Mitschreiben „Meine privat“ wählen oder einen Admin um das Schreibrecht bitten.">👁 Nur ansehen</span>}
+          {canEdit && <>
+          <button className={btn(false)} onClick={undo} title="Rückgängig (Strg+Z)" aria-label="Rückgängig">↶</button>
+          <button className={btn(false)} onClick={redo} title="Wiederholen (Strg+Y)" aria-label="Wiederholen">↷</button>
           <Sep />
-          {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => {
-            if (t === "pen") { const p = activePen.kind === "marker" ? penProfiles.find((x) => x.kind !== "marker") : activePen; if (p) choosePen(p); else setTool(t); }
-            else if (t === "highlighter") { const p = penProfiles.find((x) => x.kind === "marker"); if (p) choosePen(p); else setTool(t); }
-            else setTool(t);
-          }}>{toolIcon(t)}{!toolbarCollapsed && <span className="notiz-toolbar__tool-label">{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
+          {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => pickTool(t)}>{toolIcon(t)}{!toolbarCollapsed && <span className="notiz-toolbar__tool-label">{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
+          <button title="Labor: Geräte wählen, messen und virtuelle Versuche (Simulation)" aria-label="Labor" aria-pressed={labOpen} className={btn(labOpen) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => setLabOpen(!labOpen)}>
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 3h6M10 3v6l-5.2 9.1A2 2 0 0 0 6.5 21h11a2 2 0 0 0 1.7-2.9L14 9V3"/><path d="M7.4 15h9.2"/></svg>
+            {!toolbarCollapsed && <span className="notiz-toolbar__tool-label">Labor</span>}
+          </button>
           {(tool === "pen" || tool === "highlighter") && (
             <>
-              <select aria-label="Stifttyp" title="Strichverhalten" className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
+              <select aria-label="Stifttyp" title="Strichverhalten" className="notiz-toolbar__penopt px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
                 onChange={(e) => { const kind = e.target.value as PenKind; changePen({ kind }); setTool(kind === "marker" ? "highlighter" : "pen"); }}>
                 <option value="ballpoint">Kugelschreiber</option><option value="fountain">Füller</option><option value="pencil">Bleistift</option><option value="marker">Textmarker</option>
               </select>
-              {toolbarCollapsed && <select aria-label="Gespeichertes Stiftprofil" title="Meine Stifte" className="max-w-36 px-2 py-2 rounded-lg bg-slate-100 text-sm" value={activePen.id} onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
+              {toolbarCollapsed && <select aria-label="Gespeichertes Stiftprofil" title="Meine Stifte" className="notiz-toolbar__penopt max-w-36 px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={activePen.id} onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
                 {penProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.color}</option>)}
               </select>}
-              {toolbarCollapsed && <button className={btn(false)} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>}
+              {toolbarCollapsed && <button className={btn(false) + " notiz-toolbar__penopt"} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>}
             </>
           )}
           {tool === "eraser" && (
-            <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={eraseMode} onChange={(e) => setEraseMode(e.target.value as "pixel" | "stroke")}>
+            <select className="px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={eraseMode} onChange={(e) => setEraseMode(e.target.value as "pixel" | "stroke")}>
               <option value="pixel">Nur berührter Teil</option>
               <option value="stroke">Ganzer Strich</option>
             </select>
           )}
           {tool === "shape" && (
-            <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
+            <select className="px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
               <option value="rect">Rechteck</option><option value="triangle">Dreieck</option><option value="ellipse">Kreis</option><option value="line">Gerade Linie</option><option value="arrow">Pfeil</option>
             </select>
           )}
+          </>}
         </div>
-        <div className="notiz-toolbar__row notiz-toolbar__ink">
-          {(tool === "pen" || tool === "shape") && <div className="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5" aria-label="Linienstil">
+        {canEdit && <div className="notiz-toolbar__row notiz-toolbar__ink">
+          {(tool === "pen" || tool === "shape") && <div className="notiz-toolbar__lines flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5" aria-label="Linienstil">
             {LINE_STYLES.map((s) => <button key={s.id} title={s.title} aria-label={s.title} onClick={() => setLineStyle(s.id)} className={`rounded px-1.5 py-1 text-xs font-mono ${lineStyle === s.id ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}>{s.label}</button>)}
           </div>}
           <Sep />
@@ -1379,38 +1940,42 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
             <span aria-hidden="true">＋</span><input type="color" className="absolute inset-0 h-full w-full cursor-pointer opacity-0" onChange={(e) => addCustomColor(e.target.value)} aria-label="Eigene Stiftfarbe" />
           </label>
           <input type="range" min={1} max={10} step={0.5} value={size} onChange={(e) => { const v = +e.target.value; setSize(v); changePen({ size: v }); }} className="w-24" aria-label="Strichstärke / Radiergröße" />
-          {(tool === "pen" || tool === "shape") && <span className="notiz-toolbar__hold-hint text-[10px] text-slate-500">Am Ende 0,65 s halten = glätten</span>}
+          {tool === "pen" && <button className={btn(false) + " notiz-toolbar__hint"} onClick={() => flash(penHint)} title={penHint} aria-label="Hinweis zu Linien und Formen">ⓘ</button>}
+          {(tool === "lasso" || tool === "shape") && <button className={btn(angleSnap) + " notiz-toolbar__angle-snap"} aria-pressed={angleSnap} onClick={() => setAngleSnap(!angleSnap)} title="Winkel beim Ziehen, Drehen und Linienzeichnen auf 15°-Schritte einrasten. Ohne Raster ist jeder Winkel möglich; Umschalttaste rastet vorübergehend ein.">15°-Raster</button>}
+          {tool === "lasso" && <button className={btn(false) + " notiz-toolbar__hint"} onClick={() => flash(lassoHint)} title={lassoHint} aria-label="Hinweis zum Lasso">ⓘ</button>}
           {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Markierte Linien und Grundformen eines Schaltbilds begradigen">Schaltbild glätten</button>}
-        </div>
+        </div>}
         <div className="notiz-toolbar__row notiz-toolbar__document">
-          <Sep />
-          <button className={btn(false)} onClick={undo} title="Strg+Z">Rückgängig</button>
-          <button className={btn(false)} onClick={redo} title="Strg+Y">Wiederholen</button>
           <Sep />
           <button className={btn(false)} onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
           <button className={btn(false)} onClick={() => setZoom(1)} title="Strg+0">{Math.round(zoom * 100)} %</button>
           <button className={btn(false)} onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
           <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
-          <Sep />
-          <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>
-          {title && <span className="notiz-toolbar__title text-sm font-medium truncate max-w-[18rem] ml-2">{title}</span>}
-          <span className="notiz-toolbar__saved text-xs text-slate-500 ml-2">{saved}</span>
-          <select className="px-2 py-2 rounded-lg bg-slate-100 text-sm" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
+          {canEdit && <Sep />}
+          {canEdit && <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>}
+          {canEdit && hasPdf && <button className={btn(pdfDeleteMode) + " notiz-toolbar__pdf-delete"} aria-pressed={pdfDeleteMode} onClick={togglePdfDeleteMode}
+            title={pdfDeleteMode ? "Löschmodus beenden – PDF-Seiten können dann nicht mehr gelöscht werden" : "Löschmodus einschalten: an jeder PDF-Seite erscheint ein Löschknopf"}>
+            {pdfDeleteMode ? "🗑 Löschen AN – beenden" : "🗑 PDF-Seiten löschen"}
+          </button>}
+          {canEdit && <select className="px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
             <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
-          </select>
-          <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
-          <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
-          <label className={btn(false) + " cursor-pointer ml-auto"}>
+          </select>}
+          {canEdit && <label className={btn(false) + " notiz-toolbar__import cursor-pointer"}>
             PDF importieren
             <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
-          </label>
+          </label>}
+          <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
+          <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
+          {title && <span className="notiz-toolbar__title text-sm font-medium truncate max-w-[18rem] ml-auto">{title}</span>}
+          <span className="notiz-toolbar__saved text-xs text-slate-500">{saved}</span>
         </div>
       </header>
+      </div>
 
-      {(tool === "pen" || tool === "highlighter") && !toolbarCollapsed && <div className="notiz-pen-strip flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white px-3 py-2" role="group" aria-label="Meine Stiftprofile">
+      {canEdit && !focus && (tool === "pen" || tool === "highlighter") && !toolbarCollapsed && <div className="notiz-pen-strip flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white px-3 py-1" role="group" aria-label="Meine Stiftprofile">
         <span className="shrink-0 text-xs font-semibold text-slate-500">Meine Stifte</span>
         {penProfiles.map((p) => <button key={p.id} type="button" aria-pressed={activePen.id === p.id} onClick={() => choosePen(p)}
-          className={`notiz-pen-preset inline-flex shrink-0 items-center gap-2 rounded-xl border px-3 py-1.5 text-left ${activePen.id === p.id ? "border-blue-400 bg-blue-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}>
+          className={`notiz-pen-preset inline-flex shrink-0 items-center gap-2 rounded-xl border px-3 py-1 text-left ${activePen.id === p.id ? "border-blue-400 bg-blue-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}>
           <span className="h-3 w-3 rounded-full border border-slate-300" style={{ backgroundColor: p.color }} />
           <span className="text-xs font-medium text-slate-700">{p.name}</span>
           <span className="text-[10px] text-slate-500">{p.kind === "marker" ? "Marker" : p.kind === "fountain" ? "Füller" : p.kind === "pencil" ? "Bleistift" : "Kugel"} · {p.size.toFixed(1)}</span>
@@ -1418,19 +1983,22 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
         <button className={btn(false) + " shrink-0"} onClick={addPenProfile}>＋ Stift hinzufügen</button>
       </div>}
 
-      <div className="flex flex-1 min-h-0">
-        {sidebar && (
+      <div className="relative flex flex-1 min-h-0">
+        {labOpen && <LabBench onClose={() => setLabOpen(false)} onInsert={insertLabRecord} />}
+        {sidebar && !focus && (
           <aside className="notiz-page-sidebar w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2 space-y-1">
             {blocks.map((b, i) => (
               <div key={b.id}>
-                <button onClick={() => insertEmptyPageAt(i)} title="Leere Seite hier einfügen" aria-label={"Leere Seite vor Seite " + (i + 1) + " einfügen"}
-                  className="w-full h-6 rounded text-[11px] text-slate-400 hover:text-blue-600 hover:bg-blue-50 select-none">＋ Seite</button>
+                {canEdit && <button onClick={() => insertEmptyPageAt(i)} title="Leere Seite hier einfügen" aria-label={"Leere Seite vor Seite " + (i + 1) + " einfügen"}
+                  className="w-full h-6 rounded text-[11px] text-slate-400 hover:text-blue-600 hover:bg-blue-50 select-none">＋ Seite</button>}
                 <div className="flex items-center gap-0.5">
                   <button className="flex-1 min-w-0 text-left px-2 py-2 rounded-md text-sm truncate hover:bg-slate-100"
                     onClick={() => scRef.current!.scrollTo({ top: tops[b.id] * zoom - 12, behavior: "smooth" })}>
                     {i + 1}. {b.kind === "pdf" ? `PDF S. ${b.pageNum}` : i === blocks.length - 1 ? "Freier Bereich" : "Leere Seite"}
                   </button>
-                  {i < blocks.length - 1 && (
+                  {pdfDeleteMode && b.kind === "pdf" && <button onClick={() => deletePdfPage(b.id)} aria-label={`PDF-Seite ${b.pageNum} löschen`} title="Diese PDF-Seite löschen"
+                    className="w-8 h-9 rounded-md text-xs text-red-600 hover:bg-red-50">🗑</button>}
+                  {canEdit && i < blocks.length - 1 && !(pdfDeleteMode && b.kind === "pdf") && (
                     <>
                       <button disabled={i === 0} onClick={() => moveBlock(i, i - 1)} aria-label="Seite nach oben"
                         className="w-8 h-9 rounded-md text-xs hover:bg-slate-100 disabled:opacity-25">▲</button>
@@ -1443,10 +2011,30 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
             ))}
           </aside>
         )}
-        <div ref={scRef} className="flex-1 overflow-auto relative" style={{ touchAction: "none", cursor: tool === "lasso" ? "crosshair" : tool === "eraser" ? "none" : tool === "text" ? "text" : "default" }}
+        <div className="relative flex flex-1 min-w-0">
+        {focus && <div className={"xnts-focusbar" + (focusMini ? " is-mini" : "")} role="toolbar" aria-label="Fokus-Leiste">
+          {canEdit && !focusMini && tools.map(([t, l]) => <button key={t} type="button" title={l.replace("✒ ", "").replace("▰ ", "")} aria-label={l} aria-pressed={tool === t} onClick={() => pickTool(t)}>{toolIcon(t)}</button>)}
+          {canEdit && !focusMini && <i aria-hidden="true" />}
+          {canEdit && !focusMini && palette.slice(0, 8).map((c) => <button key={c} type="button" aria-label={`Farbe ${c}`} aria-pressed={color === c} className="xnts-focusbar__swatch" style={{ background: c }} onClick={() => { setColor(c); changePen({ color: c }); }} />)}
+          {canEdit && !focusMini && <i aria-hidden="true" />}
+          {canEdit && !focusMini && <button type="button" onClick={undo} title="Rückgängig" aria-label="Rückgängig">↶</button>}
+          {canEdit && !focusMini && <button type="button" onClick={redo} title="Wiederholen" aria-label="Wiederholen">↷</button>}
+          {!focusMini && <button type="button" onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>}
+          {!focusMini && <button type="button" onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)} title="Auf Breite einpassen" className="xnts-focusbar__zoom">{Math.round(zoom * 100)} %</button>}
+          {!focusMini && <button type="button" onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>}
+          <button type="button" onClick={() => setFocusMini(!focusMini)} title={focusMini ? "Werkzeuge einblenden" : "Fokus-Leiste verkleinern"} aria-label={focusMini ? "Werkzeuge einblenden" : "Fokus-Leiste verkleinern"}>{focusMini ? (canEdit ? toolIcon(tool) : "＋") : "›"}</button>
+          <button type="button" className="xnts-focusbar__exit" onClick={() => setFocus(false)} title="Fokus beenden – Leisten wieder zeigen (Esc)">✕ Leisten</button>
+        </div>}
+        {pdfDeleteMode && <div className="xnts-delete-banner" role="status">
+          <span><strong>Löschmodus aktiv:</strong> ✕ an einer PDF-Seite tippen. Rückgängig mit Strg+Z.</span>
+          <button type="button" onClick={togglePdfDeleteMode}>Beenden</button>
+        </div>}
+        <div ref={scRef} className="xnts-canvas-scroll flex-1 min-w-0 overflow-auto relative" style={{ touchAction: "none", cursor: readOnly ? "grab" : tool === "lasso" ? "crosshair" : tool === "eraser" ? "none" : tool === "text" ? "text" : "default" }}
           onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+          onContextMenu={(e) => e.preventDefault() /* Stift-Seitentaste und „Gedrückt halten“ unter Windows öffnen sonst das Kontextmenü und brechen den Strich ab */}
           onDoubleClick={(e) => {
-            if (tool !== "lasso") return;
+            if (tool !== "lasso" || readOnly) return;
+            if (editableLine()) { flash("Winkel bleibt erhalten · Endpunkte ziehen oder 15°-Raster nutzen"); return; }
             if (sel.current.size === 0) {
               const p = toDoc(e.clientX, e.clientY), rx = PAGE_W * 0.45, ry = PAGE_W * 0.3;
               sel.current = new Set(strokes.current.filter((s) => {
@@ -1458,11 +2046,12 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
             if (sel.current.size > 0) perfectSelected(); else setSaved("Kein handgezeichnetes Schaltbild in der Nähe erkannt");
           }}>
           <canvas ref={cvRef} className="sticky top-0 left-0 z-10 pointer-events-none block" />
+          <div className="xnts-canvas-notice" role="status" aria-live="polite">{notice && <span>{notice}</span>}</div>
           <div className="relative mx-auto" style={{ width: PAGE_W * zoom, height: (total + 400) * zoom }}>
             <div className="absolute top-0 left-0" style={{ width: PAGE_W, transform: `scale(${zoom})`, transformOrigin: "0 0" }}>
               {blocks.map((b) => (
                 <div key={b.id}>
-                  <div className="absolute left-0 bg-white shadow-md" data-note-paper={b.kind} style={{ top: tops[b.id], width: PAGE_W, height: b.height, backgroundColor: b.kind === "blank" && darkMode ? "#111827" : "#fff", ...(b.kind === "blank" ? tplStyle : {}) }}>
+                  <div className={`absolute left-0 bg-white shadow-md${pdfDeleteMode && b.kind === "pdf" ? " xnts-pdf-deletable" : ""}`} data-note-paper={b.kind} style={{ top: tops[b.id], width: PAGE_W, height: b.height, backgroundColor: b.kind === "blank" && darkMode ? "#111827" : "#fff", ...(b.kind === "blank" ? tplStyle : {}) }}>
                     {b.kind === "pdf" && docs.current.get(b.docId!) && <PdfPage doc={docs.current.get(b.docId!)!} docId={b.docId!} pageNum={b.pageNum!} height={b.height} zoom={zoom} getRoot={getScroller} />}
                   </div>
                   {b.kind === "pdf" && (
@@ -1476,19 +2065,32 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
                   )}
                 </div>
               ))}
+              {pageMarkers && pageBreaks.map((y) => (
+                <div key={"a4-" + y} className="xnts-a4-break" aria-hidden="true" style={{ top: y, borderTopWidth: Math.max(1.5, 2.5 / zoom) }}>
+                  <span style={{ fontSize: Math.max(9, 11 / zoom), right: 6 / zoom }}>A4 · Seite {Math.round(y / A4_H) + 1}</span>
+                </div>
+              ))}
             </div>
             {textFields.current.map((tf0) => { const tf = liveText(tf0); return (
-              <div key={tf.id} className="absolute" style={{ left: tf.x * zoom, top: ((topsRef.current[tf.blockId] ?? 0) + tf.y) * zoom, width: tf.width * zoom, pointerEvents: tool === "text" ? "auto" : "none" }}>
+              <div key={tf.id} className="absolute" style={{ left: tf.x * zoom, top: ((topsRef.current[tf.blockId] ?? 0) + tf.y) * zoom, width: tf.width * zoom, pointerEvents: tool === "text" && !readOnly ? "auto" : "none" }}>
                 {tool === "text" && <div title="Verschieben" onPointerDown={(e) => startTextDrag(e, tf)} className="absolute -top-4 -left-1 w-6 h-4 rounded-t bg-blue-500/80 cursor-move" />}
-                <textarea id={"tf-" + tf.id} value={tf.text} rows={1} spellCheck={false} readOnly={tool !== "text" || sel.current.has(tf.id)} tabIndex={tool === "text" ? 0 : -1} onPointerDown={(e) => e.stopPropagation()}
+                <textarea id={"tf-" + tf.id} value={tf.text} rows={1} spellCheck={false} readOnly={readOnly || tool !== "text" || sel.current.has(tf.id)} tabIndex={tool === "text" ? 0 : -1} onPointerDown={(e) => e.stopPropagation()}
                   onFocus={(e) => { if (sel.current.has(tf.id)) { e.currentTarget.blur(); return; } if (!creating.current) textBefore.current = snap(); creating.current = false; }}
                   onChange={(e) => { const el = e.target; el.style.height = "auto"; editText(tf.id, { text: el.value, height: el.scrollHeight / zoom }); }}
                   onBlur={finishText}
-                  className="w-full bg-transparent outline-none resize-none overflow-hidden border border-dashed border-blue-300/70 rounded-sm leading-snug block"
+                  className={`w-full bg-transparent outline-none resize-none overflow-hidden border border-dashed rounded-sm leading-snug block ${readOnly || focus ? "border-transparent" : "border-blue-300/70"}`}
                   style={{ color: displayInk(tf.color, paperAtY((topsRef.current[tf.blockId] ?? 0) + tf.y)), fontSize: tf.fontSize * zoom, height: textH(tf) * zoom }} />
               </div>
             ); })}
+            {pdfDeleteMode && blocks.map((b) => b.kind === "pdf" ? (
+              <button key={"del-" + b.id} type="button" className="xnts-pdf-delete" style={{ top: tops[b.id] * zoom + 10, right: 10 }}
+                aria-label={`PDF-Seite ${b.pageNum} löschen`} title={`PDF-Seite ${b.pageNum} löschen (Rückgängig mit Strg+Z)`}
+                onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}
+                onClick={(e) => { e.stopPropagation(); deletePdfPage(b.id); }}>✕ Seite {b.pageNum} löschen</button>
+            ) : null)}
           </div>
+        </div>
+        <MouseScrollbar getEl={getScroller} contentKey={`${zoom}:${total}`} />
         </div>
       </div>
       {settingsOpen && <div className="notiz-settings-backdrop absolute inset-0 z-40 flex justify-end" onPointerDown={(e) => { if (e.target === e.currentTarget) setSettingsOpen(false); }}>
@@ -1507,28 +2109,58 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
             </section>
             <section className="notiz-settings-section">
               <h3>Zwischenraum</h3><label htmlFor="settings-template">Papierlayout</label>
-              <select id="settings-template" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} className="notiz-settings-select">
+              <select id="settings-template" disabled={readOnly} value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} className="notiz-settings-select">
                 <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
               </select><p>Gilt für eingefügte Schreibflächen zwischen PDF-Seiten. Das Raster bleibt an der Seite verankert.</p>
+              <label className="notiz-check-row"><input type="checkbox" checked={pageMarkers} onChange={(e) => setPageMarkers(e.target.checked)} /><span><strong>A4-Seitengrenzen anzeigen</strong><small>Wird eine Schreibfläche höher als ein A4-Blatt, zeigt eine gestrichelte Linie alle 1123 px die Grenze – genau dort beginnt beim PDF-Export die nächste Seite. Über PDF-Seiten wird nichts eingezeichnet.</small></span></label>
             </section>
             <section className="notiz-settings-section">
               <h3>Linien &amp; Formen</h3><label htmlFor="settings-line-style">Linienstil</label>
               <select id="settings-line-style" value={lineStyle} onChange={(e) => setLineStyle(e.target.value as LineStyle)} className="notiz-settings-select">
                 {LINE_STYLES.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
               </select>
-              <label className="notiz-check-row"><input type="checkbox" checked={smartShapesEnabled} onChange={(e) => setSmartShapesEnabled(e.target.checked)} /><span><strong>Smart Shapes</strong><small>Linie, Rechteck, Dreieck und Kreis beim Halten glätten.</small></span></label>
-              <label className="notiz-check-row"><input type="checkbox" checked={circuitAssistEnabled} onChange={(e) => setCircuitAssistEnabled(e.target.checked)} /><span><strong>Schaltbild-Hilfe</strong><small>Ausgewählte Leitungen und Grundformen beim Glätten ausrichten.</small></span></label>
-              <p>Wähle Linien mit dem Lasso. „Schaltbild glätten“ oder Doppelklicken richtet erkannte Leitungen und Grundformen aus. Bauteilnamen werden dabei nicht automatisch gelesen.</p>
+              <label className="notiz-check-row"><input type="checkbox" checked={smartShapesEnabled} onChange={(e) => setSmartShapesEnabled(e.target.checked)} /><span><strong>Smart Shapes</strong><small>Linien, Rechtecke, Dreiecke und Kreise beim Halten (0,5 s) glätten – Start, Ende und Winkel bleiben erhalten. Nur exakt fluchtende Linien (≤ 2,5°) werden automatisch verlängert; ein Hinweis zeigt das an.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={autoStraighten} disabled={!smartShapesEnabled} onChange={(e) => setAutoStraighten(e.target.checked)} /><span><strong>Linien automatisch begradigen</strong><small>Gerade gezogene Linien und Leitungen mit Knicken werden beim Absetzen sofort begradigt – ohne Lasso und ohne Halten. Winkel, Start und Ende bleiben erhalten; kurze Striche und Handschrift bleiben unverändert. „Rückgängig“ stellt den Freihandstrich wieder her.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={circuitAssistEnabled} onChange={(e) => setCircuitAssistEnabled(e.target.checked)} /><span><strong>Schaltbild-Hilfe</strong><small>„Schaltbild glätten“ richtet fast waagerechte oder senkrechte Leitungen (≈ 10°) aus, begradigt Leitungen mit Knicken, zieht benachbarte Leitungen auf eine Flucht und dockt Enden an Leitungen, Rechtecke und Kreise an. Schräge und bereits eingestellte Linien behalten ihren Winkel.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={angleSnap} onChange={(e) => setAngleSnap(e.target.checked)} /><span><strong>15°-Raster</strong><small>Nur wenn eingeschaltet (oder mit gedrückter Umschalttaste) rasten Linien, Endpunkte und Drehungen in 15°-Schritten ein.</small></span></label>
+              <p>Winkel ändern: Lasso wählen, Linie antippen und einen der violetten Endpunkte ziehen. Das Etikett zeigt den aktuellen Winkel; „Rückgängig“ nimmt die Änderung zurück. Wähle Linien mit dem Lasso. „Schaltbild glätten“ oder Doppelklicken richtet erkannte Leitungen und Grundformen aus. Bauteilnamen werden dabei nicht automatisch gelesen.</p>
               <label htmlFor="pressure-sensitivity">Stiftdruckempfindlichkeit · {pressureSensitivity.toFixed(2).replace(".", ",")}</label>
               <input id="pressure-sensitivity" type="range" min="0.25" max="2" step="0.05" value={pressureSensitivity} onChange={(e) => setPressureSensitivity(Number(e.target.value))} aria-label="Stiftdruckempfindlichkeit" />
               <p>Wirkt auf unterstützte druckempfindliche Stifte. Maus und Finger verwenden eine gleichmäßige Stärke.</p>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Stift &amp; Handschrift</h3>
+              <label htmlFor="ink-smoothing">Strichglättung · {inkSmoothing === 0 ? "aus" : `${Math.round(inkSmoothing * 100)} %`}</label>
+              <input id="ink-smoothing" type="range" min="0" max="1" step="0.05" value={inkSmoothing} onChange={(e) => setInkSmoothing(Number(e.target.value))} aria-label="Strichglättung" />
+              <p>Beruhigt zittrige Striche schon beim Schreiben und glättet sie beim Absetzen nach. Start, Ende und Ecken bleiben erhalten. Gilt für neue Striche.</p>
+              <label htmlFor="pen-barrel">Seitentaste des Stifts</label>
+              <select id="pen-barrel" value={barrelAction} onChange={(e) => setBarrelAction(e.target.value as "lasso" | "eraser" | "none")} className="notiz-settings-select">
+                <option value="lasso">Lasso-Auswahl (wie OneNote)</option><option value="eraser">Radierer</option><option value="none">Keine Funktion</option>
+              </select>
+              <p>Die Rückseite des Stifts (Radierer-Ende, z. B. Surface Pen oder Slim Pen 2) radiert immer – unabhängig vom gewählten Werkzeug. Kugelschreiber schreibt gleichmäßig, Füller reagiert auf Druck und Strichrichtung, Bleistift ist körnig und wird mit Druck dunkler. Voraussetzung: Das Gerät meldet Stiftrückseite, Seitentaste und Druck an die App (Windows Ink).</p>
+            <PenPreview kind={activePen.kind} size={size} color={color} smoothing={inkSmoothing} sensitivity={pressureSensitivity} />
+              <details className="xnts-diag-details"><summary>Stift testen (Diagnose)</summary><PenDiagnostic /></details>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Handballen &amp; Finger</h3>
+              <label htmlFor="handedness">Schreibhand</label>
+              <select id="handedness" value={handedness} onChange={(e) => setHandedness(e.target.value as Handedness)} className="notiz-settings-select">
+                <option value="right">Rechtshänder</option><option value="left">Linkshänder</option>
+              </select>
+              <p>Während du schreibst, werden Berührungen unterhalb und auf der Seite der Schreibhand sowie am Bildschirmrand dieser Seite als Handballen ignoriert. Scrollt oder zoomt der Ballen kurz bevor der Stift aufsetzt, wird das zurückgenommen. Finger zeichnen nie.</p>
+              <label className="notiz-check-row"><input type="checkbox" checked={oneFingerScroll} onChange={(e) => setOneFingerScroll(e.target.checked)} /><span><strong>Mit einem Finger scrollen</strong><small>Aus: Nur zwei Finger verschieben und zoomen. Das ist die sicherste Einstellung, wenn die aufgelegte Hand trotzdem noch scrollt.</small></span></label>
+              <p>Zwei Finger: gleichzeitig verschieben und zoomen. Kleine Abstandsänderungen verschieben nur, damit die Ansicht beim Scrollen nicht ungewollt zoomt.</p>
+            </section>
+            <section className="notiz-settings-section">
+              <h3>Hilfe</h3><button className={btn(false)} onClick={() => { setSettingsOpen(false); openTutorial("overview"); }}>Visuelle Anleitungen ansehen</button>
+              <p>Öffne jederzeit kurze Anleitungen zu Bibliothek, Stift, Linien, Gesten{GROUPS_ENABLED ? " und Lerngruppen (Prototyp)" : ""} sowie Datensicherung.</p>
             </section>
             <section className="notiz-settings-section">
               <h3>Werkzeugleiste</h3>
               <label className="notiz-check-row"><input type="checkbox" checked={toolbarCollapsed} onChange={(e) => setToolbarCollapsed(e.target.checked)} /><span><strong>Werkzeugleiste minimieren</strong><small>Die Schnellleiste mit Linienarten, Farben und Stiftstärke bleibt sichtbar.</small></span></label>
             </section>
             <section className="notiz-settings-section">
-              <h3>Speicherung &amp; Export</h3><p>Notizen und PDFs werden lokal auf diesem Gerät gespeichert.</p>
+              <h3>Speicherung &amp; Export</h3><p><span className="xnts-status xnts-status--local">lokal gespeichert</span> Notizen und PDFs werden lokal auf diesem Gerät gespeichert (IndexedDB).</p>
               <div className="flex flex-wrap gap-2"><button className={btn(false)} onClick={onBackup}>Backup speichern</button><button className={btn(false)} onClick={onRestore}>Backup laden</button><button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button></div>
               <p>Notizen, PDFs und Einstellungen bleiben lokal. Cloud-Backup ist nicht eingerichtet. Für ein anderes Gerät kannst du ein vollständiges Backup exportieren und dort wieder laden.</p>
             </section>

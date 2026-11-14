@@ -1,0 +1,24 @@
+{
+  "productName": "XNTS",
+  "identifier": "de.notizraum.app",
+  "build": {
+    "beforeBuildCommand": "pnpm run build:native:solo"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "XNTS — Xnotes",
+        "width": 1360,
+        "height": 900,
+        "minWidth": 720,
+        "minHeight": 560,
+        "center": true,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "Xnotes, PDFs und kunstinspirierte Schreibflächen",
+    "longDescription": "XNTS — persönliche Notizen, PDFs und virtuelle Laborgeräte. Deine Daten bleiben lokal auf dem Gerät."
+  }
+}

@@ -2,9 +2,9 @@ import type { CapacitorConfig } from "@capacitor/cli";
 
 const config: CapacitorConfig = {
   appId: "de.notizraum.app",
-  appName: "Notizraum",
+  appName: "XNTS",
   webDir: "dist",
-  backgroundColor: "#111827",
+  backgroundColor: "#f3df35",
   android: {
     allowMixedContent: false,
   },

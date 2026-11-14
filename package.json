@@ -1,20 +1,25 @@
 {
   "name": "notizen-app",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.8",
   "type": "module",
   "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:solo": "tsc -b && vite build --mode solo",
     "build:native": "tsc -b && vite build --mode native && node scripts/prepare-native.mjs",
+    "build:native:solo": "tsc -b && vite build --mode native-solo && node scripts/prepare-native.mjs",
     "preview": "vite preview",
     "generate-pwa-assets": "pwa-assets-generator",
     "icons:generate": "pnpm tauri icon public/pwa-512x512.png --output src-tauri/icons",
     "native:sync": "pnpm run icons:generate && pnpm run build:native && pnpm cap sync",
     "native:sync:android": "pnpm run icons:generate && pnpm run build:native && pnpm cap sync android",
+    "native:sync:android:solo": "pnpm run icons:generate && pnpm run build:native:solo && pnpm cap sync android",
     "native:sync:ios": "pnpm run icons:generate && pnpm run build:native && pnpm cap sync ios",
     "desktop:dev": "pnpm tauri dev",
-    "desktop:build": "pnpm run icons:generate && pnpm tauri build"
+    "desktop:build": "pnpm run icons:generate && pnpm tauri build",
+    "desktop:build:solo": "pnpm run icons:generate && pnpm tauri build --config src-tauri/tauri.solo.conf.json"
   },
   "devDependencies": {
     "@capacitor/cli": "8.6.0",

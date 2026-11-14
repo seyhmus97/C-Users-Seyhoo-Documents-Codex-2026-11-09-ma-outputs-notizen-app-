@@ -1,5 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import NoteCanvas, { kvGet, kvSet } from "./NoteCanvas";
+
+type StatusKind = "prototype" | "local" | "backend";
+const statusText: Record<StatusKind, string> = { prototype: "Prototyp", local: "lokal gespeichert", backend: "Backend/Realtime erforderlich" };
+function Status({ kind, title }: { kind: StatusKind; title?: string }) {
+  return <span className={`xnts-status xnts-status--${kind}`} title={title}>{statusText[kind]}</span>;
+}
 
 type Role = "admin" | "teacher" | "member";
 type Member = { id: string; name: string; role: Role; canTransmit: boolean; canEditShared: boolean };
@@ -16,7 +22,23 @@ type StudyGroup = {
   presenterId: string | null;
 };
 
+type ChatMsg = { id: string; authorId: string; author: string; text: string; ts: number };
+
 const SELF_ID = "me";
+const chatKey = (groupId: string) => `study:chat:${groupId}`;
+const timeLabel = (ts: number) => {
+  const d = new Date(ts), today = new Date().toDateString() === d.toDateString();
+  return today ? d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" }) : d.toLocaleString("de-DE", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+};
+// Beispielverlauf nur für die Demo-Gruppe, damit sichtbar ist, wie der Chat aussieht
+const demoChat = (): ChatMsg[] => {
+  const t = Date.now() - 3600_000;
+  return [
+    { id: "demo-c1", authorId: "teacher-1", author: "Frau Hartmann", text: "Schaut euch bis Donnerstag die Scheitelpunktform an. Fragen gerne hier im Chat.", ts: t },
+    { id: "demo-c2", authorId: "member-1", author: "Leonie Berger", text: "Bei Aufgabe 3: Ist der Scheitelpunkt S(3 | −4)?", ts: t + 600_000 },
+    { id: "demo-c3", authorId: "teacher-1", author: "Frau Hartmann", text: "Genau, d = 3 und e = −4.", ts: t + 900_000 },
+  ];
+};
 const uid = () => Math.random().toString(36).slice(2, 9);
 const code = () => Math.random().toString(36).slice(2, 7).toUpperCase();
 const sharedNoteId = (groupId: string, docId: string) => `study-shared:${groupId}:${docId}`;
@@ -85,6 +107,17 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
   const [layer, setLayer] = useState<"shared" | "private">("shared");
   const [callOpen, setCallOpen] = useState(false);
   const [privateLoading, setPrivateLoading] = useState(false);
+  const [focus, setFocus] = useState(false); // Fokusmodus der Notiz: Raumleiste, Gruppenleiste und Chat ausblenden
+  // Gruppenchat: Verlauf je Gruppe lokal (IndexedDB); Panel offen/zu wird gemerkt
+  const [chatOpen, setChatOpen] = useState(() => { try { return localStorage.getItem("xnts-study-chat") === "open"; } catch { return false; } }); // standardmäßig zu: die Notiz steht im Mittelpunkt
+  useEffect(() => { try { localStorage.setItem("xnts-study-chat", chatOpen ? "open" : "closed"); } catch { /* gilt dann nur für diese Sitzung */ } }, [chatOpen]);
+  const [chat, setChat] = useState<ChatMsg[]>([]);
+  const [chatGroupId, setChatGroupId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const chatListRef = useRef<HTMLDivElement>(null);
+  // Gruppenleiste einklappbar: so bleibt im Lernraum mehr Platz für die Notiz (Auswahl wird lokal gemerkt)
+  const [panelOpen, setPanelOpen] = useState(() => { try { return localStorage.getItem("xnts-study-panel") !== "closed"; } catch { return true; } });
+  useEffect(() => { try { localStorage.setItem("xnts-study-panel", panelOpen ? "open" : "closed"); } catch { /* gilt dann nur für diese Sitzung */ } }, [panelOpen]);
 
   useEffect(() => {
     void (async () => {
@@ -101,6 +134,19 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
   }, [groups, ready]);
 
   const group = groups.find((g) => g.id === selectedGroupId) ?? null;
+
+  useEffect(() => {
+    if (!selectedGroupId) { setChat([]); setChatGroupId(null); return; }
+    let alive = true;
+    void (async () => {
+      const saved = await kvGet<ChatMsg[]>(chatKey(selectedGroupId));
+      const list = Array.isArray(saved) ? saved : selectedGroupId === "study-demo-math" ? demoChat() : [];
+      if (alive) { setChat(list); setChatGroupId(selectedGroupId); }
+    })();
+    return () => { alive = false; };
+  }, [selectedGroupId]);
+  useEffect(() => { if (chatGroupId) void kvSet(chatKey(chatGroupId), chat); }, [chat, chatGroupId]);
+  useEffect(() => { const el = chatListRef.current; if (el) el.scrollTop = el.scrollHeight; }, [chat, chatOpen]);
   const doc = group?.docs.find((d) => d.id === group.selectedDocId) ?? group?.docs[0] ?? null;
   const self = group?.members.find((m) => m.id === SELF_ID) ?? null;
   const presenter = group?.members.find((m) => m.id === group.presenterId) ?? null;
@@ -169,6 +215,14 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
     updateGroup(group.id, (g) => ({ ...g, transmitting: false, presenterId: null }));
   };
 
+  const sendChat = () => {
+    const text = draft.trim();
+    if (!text || !group || chatGroupId !== group.id) return;
+    setChat((old) => [...old, { id: uid(), authorId: SELF_ID, author: self?.name ?? "Du", text: text.slice(0, 2000), ts: Date.now() }]);
+    setDraft("");
+  };
+  const clearChat = () => { if (canManage && window.confirm("Den Chatverlauf dieser Gruppe auf diesem Gerät löschen?")) setChat([]); };
+
   const callParticipants = useMemo(() => group?.members ?? [], [group]);
 
   if (!ready) {
@@ -177,34 +231,24 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
 
   return (
     <section className="notiz-study notiz-app h-full min-h-0 w-full flex flex-col bg-slate-50 text-slate-800" data-theme={darkMode ? "dark" : "light"}>
-      <header className="z-10 flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-white px-3 py-2.5 sm:px-5">
+      {mode === "groups" && <>
+      <header className="z-10 flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-white px-3 py-2 sm:px-5">
         <div className="flex min-w-0 items-center gap-3">
-          <button onClick={mode === "room" ? () => setMode("groups") : returnToPersonalNotes} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50">
-            {mode === "room" ? "← Gruppen" : "← Meine Notizen"}
-          </button>
+          <button onClick={returnToPersonalNotes} className="rounded-xl border border-slate-200 px-3 py-1.5 text-sm font-medium hover:bg-slate-50">← Meine Notizen</button>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold">{mode === "room" ? group?.name ?? "Lerngruppe" : "Lerngruppen"}</div>
-            <div className="text-[11px] text-slate-500">Notizraum · lokaler MVP</div>
+            <div className="truncate text-sm font-semibold">Lerngruppen</div>
+            <div className="flex flex-wrap items-center gap-1 text-[11px] text-slate-500"><span>XNTS</span><Status kind="prototype" /><Status kind="local" /></div>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {mode === "room" && group && (
-            <>
-              <span className={`hidden rounded-full px-2.5 py-1 text-xs font-semibold sm:inline-flex ${group.transmitting ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600"}`}>
-                <span className={`mr-1.5 mt-1 inline-block h-1.5 w-1.5 rounded-full ${group.transmitting ? "bg-emerald-500" : "bg-slate-400"}`} />
-                {group.transmitting ? `Live-Demo · ${presenter?.name ?? "Mitglied"}` : "Übertragung pausiert"}
-              </span>
-              <button onClick={() => setCallOpen(true)} className="rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700">Anruf</button>
-            </>
-          )}
-          <button onClick={onBackup} title="Lokales Backup speichern" className="hidden rounded-xl border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50 md:inline-flex">Backup</button>
-        </div>
+        <button onClick={onBackup} title="Lokales Backup speichern" className="hidden rounded-xl border border-slate-200 px-3 py-1.5 text-sm hover:bg-slate-50 md:inline-flex">Backup</button>
       </header>
 
       <div className="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs leading-5 text-amber-950">
         <span aria-hidden="true">ⓘ</span>
-        <p><strong>Prototyp auf diesem Gerät.</strong> Gruppen, Rollen und Notizen sind lokal gespeichert. Echte Einladungen und Synchronisierung brauchen Backend/Realtime; Gruppenanrufe brauchen Telefonie-Infrastruktur.</p>
+        <span className="flex shrink-0 flex-wrap gap-1"><Status kind="prototype" /><Status kind="local" /><Status kind="backend" /></span>
+        <p><strong>Prototyp auf diesem Gerät.</strong> Gruppen, Rollen, Chat und Notizen sind lokal gespeichert. Echte Einladungen und Synchronisierung brauchen Backend/Realtime; Gruppenanrufe brauchen Telefonie-Infrastruktur.</p>
       </div>
+      </>}
 
       {mode === "groups" ? (
         <main className="flex-1 min-h-0 overflow-auto px-4 py-6 sm:px-8 sm:py-9">
@@ -226,7 +270,7 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
                     <div className="mb-5 flex items-start justify-between gap-3">
                       <div className="grid h-11 w-11 place-items-center rounded-xl bg-indigo-50 text-xl">👥</div>
                       <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${g.transmitting ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600"}`}>
-                        {g.transmitting ? "● Live-Demo" : "Bereit"}
+                        {g.transmitting ? "● Übertragung · Prototyp" : "Bereit"}
                       </span>
                     </div>
                     <h2 className="text-lg font-semibold text-slate-900">{g.name}</h2>
@@ -244,20 +288,41 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
                 <span><span className="mx-auto mb-3 grid h-10 w-10 place-items-center rounded-full bg-white text-xl text-indigo-600 shadow-sm">＋</span><strong className="block text-sm text-slate-700">Eine Lerngruppe anlegen</strong><small className="mt-1 block">Gruppen und Mitglieder werden lokal verwaltet</small></span>
               </button>
             </div>
-            <div className="mt-7 grid gap-3 rounded-2xl border border-indigo-100 bg-indigo-50/70 p-4 sm:grid-cols-3">
-              <Feature label="Übertragung" detail="Steuerung und Sprecherwahl sind als lokale Demo abgebildet." />
-              <Feature label="Private Ergänzungen" detail="Eine persönliche Kopie je Gruppennotiz lässt sich direkt beschriften." />
-              <Feature label="Gruppenanruf" detail="Bedienoberfläche vorbereitet; Audio/Video benötigt einen Dienst." />
+            <div className="mt-7 grid gap-3 rounded-2xl border border-indigo-100 bg-indigo-50/70 p-4 sm:grid-cols-2 lg:grid-cols-4">
+              <Feature label="Gruppenchat" status="local" detail="Nachrichten je Gruppe im Lernraum (💬 Chat). Sie bleiben auf diesem Gerät; die Zustellung an andere Mitglieder braucht Backend/Realtime." />
+              <Feature label="Übertragung" status="backend" detail="Steuerung und Sprecherwahl sind nur auf diesem Gerät abgebildet. Andere Geräte sehen nichts, solange kein Realtime-Dienst angebunden ist." />
+              <Feature label="Private Ergänzungen" status="local" detail="Eine persönliche Kopie je Gruppennotiz lässt sich direkt beschriften und bleibt auf diesem Gerät." />
+              <Feature label="Gruppenanruf" status="prototype" detail="Nur Bedienoberfläche. Audio/Video benötigt Telefonie-Infrastruktur (Signalisierung, Medienserver)." />
             </div>
           </div>
         </main>
       ) : group ? (
-        <div className="flex flex-1 min-h-0 flex-col lg:flex-row">
-          <aside className="flex max-h-[42vh] shrink-0 flex-col overflow-y-auto border-b border-slate-200 bg-white lg:max-h-none lg:w-[292px] lg:border-b-0 lg:border-r">
+        <div className="flex flex-1 min-h-0 flex-col">
+          {/* EINE schmale Raumleiste statt Kopfzeile + Hinweisband + Unterzeile: die Höhe gehört der Notiz. Für Host und Mitglieder identisch. */}
+          {!focus && <div className="xnts-roombar" role="toolbar" aria-label="Gruppenraum">
+            <button type="button" className="xnts-roombar__btn" onClick={() => setMode("groups")} title="Zurück zur Gruppenübersicht">← Gruppen</button>
+            <button type="button" className="xnts-roombar__btn" onClick={() => setPanelOpen(!panelOpen)} aria-pressed={panelOpen} aria-label={panelOpen ? "Gruppenleiste ausblenden" : "Gruppenleiste einblenden"} title="Gruppennotizen, Mitglieder und Rechte ein-/ausblenden">☰ Gruppe</button>
+            <div className="xnts-roombar__title"><strong>{doc?.title ?? "Gruppennotiz"}</strong><span>{group.name}</span></div>
+            <div className="xnts-roombar__seg" role="group" aria-label="Gemeinsame oder private Notiz">
+              <button type="button" aria-pressed={layer === "shared"} onClick={() => setLayer("shared")} title="Gemeinsame Gruppennotiz">Gemeinsam</button>
+              <button type="button" aria-pressed={layer === "private"} disabled={privateLoading} onClick={() => void openPrivateCopy()} title="Deine private Kopie – nur du siehst deine Ergänzungen">{privateLoading ? "Kopiere …" : "Meine privat"}</button>
+            </div>
+            <span className="xnts-roombar__spacer" />
+            {group.transmitting ? <>
+              <span className="xnts-roombar__live" title={`${presenter?.name ?? "Ein Mitglied"} überträgt${liveDoc ? ` „${liveDoc.title}“` : ""} (Prototyp, nur auf diesem Gerät)`}><i aria-hidden="true" />Live · {presenter?.name ?? "Mitglied"}</span>
+              {liveDoc && liveDoc.id !== doc?.id && <button type="button" className="xnts-roombar__btn" onClick={() => { updateGroup(group.id, (g) => ({ ...g, selectedDocId: g.liveDocId ?? g.selectedDocId })); setLayer("shared"); }}>Zum Live-Inhalt</button>}
+              {(canManage || group.presenterId === SELF_ID) && <button type="button" className="xnts-roombar__btn" onClick={stopTransmission}>Stoppen</button>}
+            </> : <button type="button" className="xnts-roombar__btn xnts-roombar__btn--go" onClick={startTransmission} disabled={!self?.canTransmit || !doc} title={self?.canTransmit ? "Aktuelle Gruppennotiz übertragen" : "Ein Admin muss dir das Übertragungsrecht geben"}>Übertragen</button>}
+            <button type="button" className="xnts-roombar__btn" onClick={() => setChatOpen(!chatOpen)} aria-pressed={chatOpen} aria-label="Gruppenchat" title="Gruppenchat ein-/ausblenden (Prototyp, lokal gespeichert)">💬{chat.length ? ` ${chat.length}` : ""}</button>
+            <button type="button" className="xnts-roombar__btn" onClick={() => setCallOpen(true)} aria-label="Gruppenanruf (Vorschau)" title="Gruppenanruf – Vorschau, Telefonie ist nicht verbunden">☎</button>
+            <span className="xnts-status xnts-status--prototype" title="Prototyp auf diesem Gerät: Gruppen, Rollen, Chat und Notizen sind lokal gespeichert. Echte Einladungen und Synchronisierung brauchen Backend/Realtime; Gruppenanrufe brauchen Telefonie-Infrastruktur.">Prototyp</span>
+          </div>}
+          <div className="relative flex flex-1 min-h-0 flex-col lg:flex-row">
+          <aside hidden={!panelOpen || focus} className={`xnts-study-panel ${panelOpen && !focus ? "flex" : "hidden"} max-h-[42vh] shrink-0 flex-col overflow-y-auto border-b border-slate-200 bg-white lg:max-h-none lg:w-[292px] lg:border-b-0 lg:border-r`}>
             <div className="border-b border-slate-100 p-4">
               <div className="mb-2 flex items-center justify-between">
                 <h2 className="text-xs font-bold uppercase tracking-[0.14em] text-slate-500">Gruppenraum</h2>
-                <span className="rounded-md bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-500">{group.inviteCode} · Demo</span>
+                <span className="rounded-md bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-500" title="Einladungen brauchen Backend/Realtime">{group.inviteCode} · Prototyp</span>
               </div>
               <p className="text-sm leading-5 text-slate-600">Der Code dient nur zur Vorschau. Einladungen an andere Geräte sind noch nicht verbunden.</p>
             </div>
@@ -299,44 +364,49 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
                   <label className="flex items-center gap-2 py-1 text-[11px] text-slate-600"><input type="checkbox" checked={m.canTransmit} onChange={(e) => updateMember(group.id, m.id, { canTransmit: e.target.checked })} /> Darf übertragen</label>
                   <label className="flex items-center gap-2 py-1 text-[11px] text-slate-600"><input type="checkbox" checked={m.canEditShared} onChange={(e) => updateMember(group.id, m.id, { canEditShared: e.target.checked })} /> Darf gemeinsam bearbeiten</label>
                 </div>)}
-                <p className="px-1 text-[10px] leading-4 text-amber-800">Die Auswahl wird hier lokal gespeichert. Ein Server muss diese Rechte später für alle Mitglieder verbindlich durchsetzen.</p>
+                <p className="px-1 text-[10px] leading-4 text-amber-800"><Status kind="local" /> <Status kind="backend" /> Die Auswahl wird hier lokal gespeichert. Ein Server muss diese Rechte später für alle Mitglieder verbindlich durchsetzen.</p>
               </div> : <p className="mt-2 px-1 text-[11px] text-slate-500">Nur Gruppenadmins können Rechte verwalten. Die Prüfung über mehrere Geräte benötigt ein Backend.</p>}
             </details>
 
             <div className="mt-auto p-3">
-              <button onClick={() => setCallOpen(true)} className="flex w-full items-center justify-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2.5 text-sm font-semibold text-indigo-800 hover:bg-indigo-100">☎ Gruppenanruf öffnen <span className="text-[10px] font-medium">Vorschau</span></button>
+              <button onClick={() => setCallOpen(true)} className="flex w-full items-center justify-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2.5 text-sm font-semibold text-indigo-800 hover:bg-indigo-100">☎ Gruppenanruf öffnen <Status kind="prototype" /></button>
             </div>
           </aside>
 
           <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 py-2 sm:px-4">
-              <div className="flex min-w-0 flex-1 items-center gap-2">
-                <div className="min-w-0"><div className="truncate text-sm font-semibold text-slate-800">{doc?.title ?? "Gruppennotiz"}</div><div className="text-[11px] text-slate-500">{layer === "shared" ? "Gemeinsame Notiz" : "Deine private Notiz zu diesem Dokument"}</div></div>
-                <div className="ml-auto flex shrink-0 rounded-xl bg-slate-100 p-1">
-                  <button onClick={() => setLayer("shared")} className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold ${layer === "shared" ? "bg-white text-indigo-700 shadow-sm" : "text-slate-600"}`}>Gemeinsam</button>
-                  <button onClick={() => void openPrivateCopy()} disabled={privateLoading} className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold disabled:opacity-60 ${layer === "private" ? "bg-white text-indigo-700 shadow-sm" : "text-slate-600"}`}>{privateLoading ? "Kopiere …" : "Meine privat"}</button>
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {group.transmitting ? <>
-                  {liveDoc && <span className="hidden max-w-44 truncate text-[11px] text-emerald-700 sm:inline">Live: {presenter?.name ?? "Mitglied"} · {liveDoc.title}</span>}
-                  {liveDoc && liveDoc.id !== doc?.id && <button onClick={() => { updateGroup(group.id, (g) => ({ ...g, selectedDocId: g.liveDocId ?? g.selectedDocId })); setLayer("shared"); }} className="rounded-lg px-2 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50">Zum Live-Inhalt</button>}
-                  {(canManage || group.presenterId === SELF_ID) && <button onClick={stopTransmission} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">Stoppen</button>}
-                </> : <button onClick={startTransmission} disabled={!self?.canTransmit || !doc} title={self?.canTransmit ? "Aktuelle Gruppennotiz übertragen" : "Ein Admin muss dir das Übertragungsrecht geben"} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300">Übertragung starten</button>}
-              </div>
-            </div>
-
-            {layer === "private" && <div className="flex shrink-0 items-center gap-2 border-b border-violet-100 bg-violet-50 px-3 py-2 text-[11px] leading-4 text-violet-900 sm:px-4">
-              <span aria-hidden="true">🔒</span><span>Deine private Kopie des Gruppendokuments. Zeichne und schreibe direkt darauf; andere Mitglieder sehen deine Ergänzungen nicht. Neue Inhalte anderer Geräte brauchen Realtime-Synchronisierung.</span>
-            </div>}
-            {layer === "shared" && !self?.canEditShared && <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-1.5 text-[11px] text-slate-600 sm:px-4"><span>👁</span><span>Du kannst die Gruppennotiz ansehen. Bitte einen Admin um das gemeinsame Schreibrecht; private Notizen bleiben bearbeitbar.</span></div>}
-
             <div className="relative flex-1 min-h-0 min-w-0">
-              {privateLoading ? <div className="grid h-full place-items-center text-sm text-slate-500">Private Kopie wird gespeichert und vorbereitet …</div> : doc && group && layer === "shared" ? <div className="h-full min-h-0 min-w-0" inert={!self?.canEditShared} aria-disabled={!self?.canEditShared}>
-                <NoteCanvas key={sharedId} noteId={sharedId} title={editorTitle} darkMode={darkMode} theme={theme} onThemeChange={onThemeChange} onBackup={onBackup} onRestore={onRestore} />
-              </div> : doc && group ? <NoteCanvas key={privateId} noteId={privateId} title={`Privat · ${doc.title}`} darkMode={darkMode} theme={theme} onThemeChange={onThemeChange} onBackup={onBackup} onRestore={onRestore} /> : <div className="grid h-full place-items-center text-sm text-slate-500">Lege eine Gruppennotiz an, um loszulegen.</div>}
+              {privateLoading ? <div className="grid h-full place-items-center text-sm text-slate-500">Private Kopie wird gespeichert und vorbereitet …</div>
+                : doc && layer === "shared" ? <NoteCanvas compact readOnly={!self?.canEditShared} onFocusChange={setFocus} key={sharedId} noteId={sharedId} title={editorTitle} darkMode={darkMode} theme={theme} onThemeChange={onThemeChange} onBackup={onBackup} onRestore={onRestore} />
+                : doc ? <NoteCanvas compact onFocusChange={setFocus} key={privateId} noteId={privateId} title={`Privat · ${doc.title}`} darkMode={darkMode} theme={theme} onThemeChange={onThemeChange} onBackup={onBackup} onRestore={onRestore} />
+                : <div className="grid h-full place-items-center text-sm text-slate-500">Lege eine Gruppennotiz an, um loszulegen.</div>}
             </div>
           </main>
+
+          {chatOpen && !focus && <aside className="xnts-chat" aria-label="Gruppenchat">
+            <div className="xnts-chat__head">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-semibold">💬 Gruppenchat · {group.name}</div>
+                <div className="mt-0.5 flex flex-wrap gap-1"><Status kind="prototype" /><Status kind="local" /></div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1">
+                {canManage && chat.length > 0 && <button onClick={clearChat} title="Verlauf auf diesem Gerät löschen" className="rounded-lg px-2 py-1 text-xs text-slate-600 hover:bg-slate-100">Leeren</button>}
+                <button onClick={() => setChatOpen(false)} aria-label="Chat schließen" className="rounded-lg px-2 py-1 text-lg leading-none text-slate-500 hover:bg-slate-100">×</button>
+              </div>
+            </div>
+            <div ref={chatListRef} className="xnts-chat__list" role="log" aria-live="polite">
+              {chat.length === 0 && <p className="m-auto max-w-[16rem] text-center text-xs leading-5 text-slate-500">Noch keine Nachrichten. Schreib die erste Nachricht an deine Gruppe.</p>}
+              {chat.map((m) => <div key={m.id} className={`xnts-chat__msg${m.authorId === SELF_ID ? " xnts-chat__msg--self" : ""}`}>
+                <span className="xnts-chat__meta">{m.authorId === SELF_ID ? "Du" : m.author} · {timeLabel(m.ts)}</span>{m.text}
+              </div>)}
+            </div>
+            <p className="border-t border-amber-200 bg-amber-50 px-3 py-1.5 text-[10px] leading-4 text-amber-950">Nachrichten bleiben auf diesem Gerät. Zustellung an andere Mitglieder braucht Backend/Realtime.</p>
+            <form className="xnts-chat__form" onSubmit={(e) => { e.preventDefault(); sendChat(); }}>
+              <textarea value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Nachricht an die Gruppe …" aria-label="Nachricht" maxLength={2000} rows={1}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); sendChat(); } }} />
+              <button type="submit" disabled={!draft.trim()}>Senden</button>
+            </form>
+          </aside>}
+          </div>
         </div>
       ) : <div className="grid flex-1 place-items-center text-sm text-slate-500">Wähle eine Gruppe aus oder erstelle eine neue.</div>}
 
@@ -357,6 +427,6 @@ export default function StudySpace({ onBack, darkMode, theme, onThemeChange, onB
   );
 }
 
-function Feature({ label, detail }: { label: string; detail: string }) {
-  return <div className="rounded-xl bg-white/75 p-3"><div className="mb-1 text-xs font-bold text-slate-800">{label}</div><p className="text-[11px] leading-4 text-slate-600">{detail}</p></div>;
+function Feature({ label, detail, status }: { label: string; detail: string; status: StatusKind }) {
+  return <div className="rounded-xl bg-white/75 p-3"><div className="mb-1 flex flex-wrap items-center gap-1.5 text-xs font-bold text-slate-800">{label}<Status kind={status} /></div><p className="text-[11px] leading-4 text-slate-600">{detail}</p></div>;
 }

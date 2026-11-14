@@ -5,12 +5,15 @@ import { VitePWA } from "vite-plugin-pwa";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "VITE_");
-  const nativeShell = env.VITE_NATIVE_SHELL === "1";
+  // --mode native / native-solo: eingebettete App (Tauri/Capacitor); --mode solo / native-solo: Edition ohne Lerngruppen und Gruppenchat
+  const nativeShell = env.VITE_NATIVE_SHELL === "1" || mode === "native" || mode === "native-solo";
+  const solo = env.VITE_XNTS_EDITION === "solo" || mode === "solo" || mode === "native-solo";
   const base = nativeShell ? "./" : env.VITE_BASE_PATH || "/";
   const input: Record<string, string> = nativeShell ? { index: "app.html" } : { landing: "index.html", app: "app.html" };
 
   return {
     base,
+    define: { "import.meta.env.VITE_XNTS_EDITION": JSON.stringify(solo ? "solo" : "full") },
     build: {
       rolldownOptions: { input },
     },
@@ -21,21 +24,21 @@ export default defineConfig(({ mode }) => {
         disable: nativeShell,
         registerType: "prompt",
         includeAssets: [
-          "favicon.ico", "icon.svg", "notizraum-logo.svg", "apple-touch-icon-180x180.png",
+          "favicon.ico", "icon.svg", "notizraum-logo.svg", "xnts-art-collage.webp", "apple-touch-icon-180x180.png",
           "pwa-64x64.png", "pwa-192x192.png", "pwa-512x512.png", "maskable-icon-512x512.png",
         ],
         manifest: {
           id: base,
-          name: "Notizraum – Notizen & PDFs",
-          short_name: "Notizraum",
-          description: "Notizen, PDFs und Skizzen an einem Ort – auch offline.",
+          name: "XNTS — Xnotes",
+          short_name: "XNTS",
+          description: solo ? "Notizen, PDFs und kunstinspirierte Schreibflächen – auch offline." : "Notizen, PDFs, Lerngruppen mit Gruppenchat und kunstinspirierte Schreibflächen – auch offline.",
           lang: "de-DE",
           start_url: base + "app.html",
           scope: base,
           display: "standalone",
           orientation: "any",
-          background_color: "#f1f5f9",
-          theme_color: "#11182e",
+          background_color: "#fffdf4",
+          theme_color: "#f3df35",
           icons: [
             { src: base + "pwa-64x64.png", sizes: "64x64", type: "image/png" },
             { src: base + "pwa-192x192.png", sizes: "192x192", type: "image/png" },
