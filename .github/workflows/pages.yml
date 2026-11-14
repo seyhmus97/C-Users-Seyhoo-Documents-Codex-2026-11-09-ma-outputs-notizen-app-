@@ -1,4 +1,4 @@
-name: Publish Notizraum on GitHub Pages
+name: Publish XNTS on GitHub Pages
 
 on:
   push:
