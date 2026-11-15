@@ -9,6 +9,11 @@ import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import type { RasterIn, RasterOut } from "./pdfRaster.worker";
 import { saveFile } from "./saveFile";
 import LabBench, { type LabRecord } from "./LabBench";
+import FunctionPlot from "./FunctionPlot";
+import PenGlyph from "./PenGlyph";
+import { functionExpressionFromText, parseMathExpression } from "./mathExpression";
+import { analyzeCircuitStrokes, type CircuitAnalysis } from "./circuitRecognition";
+import type { PenKind } from "./penTypes";
 import { extendCollinearLine, lineAngleDegrees, snapRadians, snapToAngle, straightLineSpan } from "./lineGeometry";
 import { adjustPressure, fountainTaper, inkWidth, pencilLook, recognizePolyline, smoothInk, stabilize, trimHoldTail, type PolylineOptions } from "./inkEngine";
 import { straightenWire, tidyCircuit, type TidyItem } from "./circuitTidy";
@@ -28,7 +33,6 @@ const PAGE_W = 794, MIN_GAP = 16, SPACE_STEP = 200, TAIL_GROW = 1200, MIN_Z = 0.
 type Tool = "pen" | "highlighter" | "eraser" | "lasso" | "shape" | "text";
 type Shape = "rect" | "ellipse" | "triangle" | "line" | "arrow";
 type Tpl = "blank" | "lined" | "grid" | "dots";
-type PenKind = "ballpoint" | "fountain" | "pencil" | "marker";
 type LineStyle = "solid" | "dashed" | "dotted" | "arrow" | "dashedArrow" | "dottedArrow";
 type ThemePreference = "system" | "light" | "dark";
 type Pt = { x: number; y: number; p: number };
@@ -37,7 +41,7 @@ type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color:
 type PenProfile = { id: string; name: string; kind: PenKind; color: string; size: number };
 type Block = { id: string; kind: "pdf" | "blank"; height: number; gap: number; docId?: string; pageNum?: number };
 // Textfeld: y ist (wie bei Strichen) RELATIV zur Oberkante des Blocks → wandert beim Platz-Einfügen mit
-interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string }
+interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; role?: "function"; functionExpression?: string }
 type Snap = { strokes: Stroke[]; blocks: Block[]; texts: TextField[] };
 type XF = { px: number; py: number; s: number; rot: number }; // Live-Transformation: Pivot, Skalierung, Winkel
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -253,16 +257,11 @@ const PRESSURE_LERP = 0.2; // Tiefpass: Anteil des neuen Druckwerts pro Punkt
 const MIN_DIST = 0.8;      // Punkte näher als 0,8 Bildschirm-px werden verworfen (Zittern, weniger Punkte)
 const PALM_MAX = 25;       // Touch-Kontaktfläche (CSS-px), ab der ein Finger als Handballen gilt
 const PALM_AREA = 380;     // … oder Kontaktfläche Breite×Höhe (manche Treiber melden flache, breite Ballen)
-const PALM_GRACE_MS = 900; // so lange nach dem letzten Stiftereignis (auch Schweben) werden Finger ignoriert
-const PALM_ZONE_MS = 5000; // so lange nach dem Schreiben gilt die Fläche unter/neben der Schreibhand als Handballen-Zone
-const PALM_ZONE_R = 560;   // Radius dieser Zone (CSS-px) um die letzte Stiftposition
-const PALM_EDGE = 36;      // Randstreifen (CSS-px) an der Seite der Schreibhand: dort aufliegende Ballen nie als Finger werten
-const PALM_REVERT_MS = 900;// setzt der Stift so kurz nach einer Finger-Geste auf, war es der Ballen → Scrollen/Zoomen zurücknehmen
-const TOUCH_SLOP = 10;     // ein Finger muss sich so weit bewegen, bevor gescrollt wird (filtert Auflegen/Zittern)
+const PALM_REVERT_MS = 180;// nur eine direkt folgende Stiftberührung nimmt versehentliches Ballen-Scrollen zurück
+const TOUCH_SLOP = 3;      // Fingerbewegung startet fast sofort das Verschieben
 const PINCH_LOCK = 0.07;   // Zwei-Finger-Geste: erst ab 7 % Abstandsänderung zoomen, darunter nur verschieben
 const A4_H = 1123;         // A4-Höhe bei Seitenbreite 794 px (identisch mit den Seiten des PDF-Exports)
 const isPalm = (e: PointerEvent): boolean => e.pointerType === "touch" && (Math.max(e.width, e.height) > PALM_MAX || e.width * e.height > PALM_AREA); // Stift/Maus: immer false
-type Handedness = "right" | "left";
 type TouchPt = { x: number; y: number; sx: number; sy: number };
 type TouchGesture = {
   mode: "idle" | "pending" | "pan" | "pinch" | "blocked";
@@ -289,6 +288,61 @@ const bbox = (s: Stroke) => {
     bbCache.set(s, c);
   }
   return c;
+};
+const isScribbleGesture = (pts: Pt[]) => {
+  if (pts.length < 14) return false;
+  const x0 = Math.min(...pts.map((p) => p.x)), x1 = Math.max(...pts.map((p) => p.x));
+  const y0 = Math.min(...pts.map((p) => p.y)), y1 = Math.max(...pts.map((p) => p.y));
+  const diagonal = Math.hypot(x1 - x0, y1 - y0);
+  if (diagonal < 22) return false;
+  let length = 0, sharpTurns = 0, previousSign = 0, alternating = 0;
+  for (let i = 1; i < pts.length; i++) length += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  for (let i = 2; i < pts.length; i++) {
+    const a = { x: pts[i - 1].x - pts[i - 2].x, y: pts[i - 1].y - pts[i - 2].y };
+    const b = { x: pts[i].x - pts[i - 1].x, y: pts[i].y - pts[i - 1].y };
+    const al = Math.hypot(a.x, a.y), bl = Math.hypot(b.x, b.y);
+    if (al < 1.8 || bl < 1.8) continue;
+    const dot = (a.x * b.x + a.y * b.y) / (al * bl);
+    const cross = a.x * b.y - a.y * b.x;
+    if (dot < .2) {
+      sharpTurns++;
+      const sign = Math.sign(cross);
+      if (sign && previousSign && sign !== previousSign) alternating++;
+      if (sign) previousSign = sign;
+    }
+  }
+  return length / diagonal > 3.8 && sharpTurns >= 7 && alternating >= 3;
+};
+const pointSegmentDistance = (p: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) => {
+  const dx = b.x - a.x, dy = b.y - a.y, den = dx * dx + dy * dy;
+  const t = den ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / den)) : 0;
+  return Math.hypot(p.x - a.x - t * dx, p.y - a.y - t * dy);
+};
+const pathTouchesPath = (a: { x: number; y: number }[], b: { x: number; y: number }[], radius: number) => {
+  const sample = (pts: { x: number; y: number }[]) => {
+    if (pts.length <= 180) return pts;
+    const step = Math.ceil(pts.length / 180);
+    return pts.filter((_, i) => i % step === 0).concat(pts[pts.length - 1]);
+  };
+  const aa = sample(a), bb = sample(b), near = (p: { x: number; y: number }, path: { x: number; y: number }[]) => {
+    for (let i = 1; i < path.length; i++) if (pointSegmentDistance(p, path[i - 1], path[i]) <= radius) return true;
+    return false;
+  };
+  const cross = (p: { x: number; y: number }, q: { x: number; y: number }, r: { x: number; y: number }) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  for (let i = 1; i < aa.length; i++) for (let j = 1; j < bb.length; j++) {
+    const a0 = aa[i - 1], a1 = aa[i], b0 = bb[j - 1], b1 = bb[j];
+    const boxesMeet = Math.max(Math.min(a0.x, a1.x), Math.min(b0.x, b1.x)) <= Math.min(Math.max(a0.x, a1.x), Math.max(b0.x, b1.x)) + radius
+      && Math.max(Math.min(a0.y, a1.y), Math.min(b0.y, b1.y)) <= Math.min(Math.max(a0.y, a1.y), Math.max(b0.y, b1.y)) + radius;
+    if (boxesMeet && cross(a0, a1, b0) * cross(a0, a1, b1) <= 0 && cross(b0, b1, a0) * cross(b0, b1, a1) <= 0) return true;
+  }
+  return aa.some((p) => near(p, bb)) || bb.some((p) => near(p, aa));
+};
+const scratchTouchesRect = (scratch: { x: number; y: number }[], rect: { x0: number; x1: number; y0: number; y1: number }, radius: number) => {
+  if (scratch.some((p) => p.x >= rect.x0 && p.x <= rect.x1 && p.y >= rect.y0 && p.y <= rect.y1)) return true;
+  return pathTouchesPath(scratch, [
+    { x: rect.x0, y: rect.y0 }, { x: rect.x1, y: rect.y0 }, { x: rect.x1, y: rect.y1 },
+    { x: rect.x0, y: rect.y1 }, { x: rect.x0, y: rect.y0 },
+  ], radius);
 };
 
 /* ───────── Radierer-Geometrie: exakt die Kurve, die paint() zeichnet ───────── */
@@ -580,6 +634,10 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const [labOpen, setLabOpen] = useState(false);
   const [smartShapesEnabled, setSmartShapesEnabled] = useState(() => { try { return localStorage.getItem("notizraum-smart-shapes") !== "false"; } catch { return true; } });
   const [circuitAssistEnabled, setCircuitAssistEnabled] = useState(() => { try { return localStorage.getItem("notizraum-circuit-assist") !== "false"; } catch { return true; } });
+  const [scribbleEraseEnabled, setScribbleEraseEnabled] = useState(() => { try { return localStorage.getItem("notizraum-scribble-erase") !== "false"; } catch { return true; } });
+  const [circuitAnalysis, setCircuitAnalysis] = useState<CircuitAnalysis | null>(null);
+  const [functionDialog, setFunctionDialog] = useState(false);
+  const [functionDraft, setFunctionDraft] = useState("x^2");
   const collapseKey = compact ? "xnts-study-toolbar-collapsed" : "notizraum-toolbar-collapsed";
   const [toolbarCollapsed, setToolbarCollapsed] = useState(() => {
     try {
@@ -624,7 +682,6 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const focusId = useRef<string | null>(null);
   const xf = useRef<(XF & { mode: "scale" | "rotate"; d0: number; a0: number }) | null>(null);
   const penActive = useRef(false);
-  const penLast = useRef(0);
   const rejected = useRef(new Set<number>());
   const [clipCount, setClipCount] = useState(clipSize); // löst die UI-Aktualisierung der Action-Bar aus
   const [, bump1] = useState(0);
@@ -634,11 +691,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const touches = useRef(new Map<number, TouchPt>());
   const gesture = useRef<TouchGesture>({ mode: "idle", t0: 0, scrollLeft: 0, scrollTop: 0, zoom: 1 });
   const gestureRaf = useRef(0);
-  const penPos = useRef<{ x: number; y: number; t: number } | null>(null); // letzte Stiftposition (Schweben oder Schreiben)
-  const penSeen = useRef(false);                                            // auf diesem Gerät wurde ein Stift benutzt
   const restoreScroll = useRef<{ left: number; top: number } | null>(null);
-  const [handedness, setHandedness] = useState<Handedness>(() => { try { return localStorage.getItem("xnts-handedness") === "left" ? "left" : "right"; } catch { return "right"; } });
-  const handednessRef = useRef(handedness); handednessRef.current = handedness;
   const [oneFingerScroll, setOneFingerScroll] = useState(() => { try { return localStorage.getItem("xnts-one-finger-scroll") !== "false"; } catch { return true; } });
   const oneFingerRef = useRef(oneFingerScroll); oneFingerRef.current = oneFingerScroll;
   const [pageMarkers, setPageMarkers] = useState(() => { try { return localStorage.getItem("xnts-page-markers") !== "false"; } catch { return true; } });
@@ -670,10 +723,10 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   useEffect(() => { try { localStorage.setItem("notizraum-ink-smoothing", String(inkSmoothing)); } catch { /* preference still works for this session */ } }, [inkSmoothing]);
   useEffect(() => { try { localStorage.setItem("notizraum-pen-barrel", barrelAction); } catch { /* preference still works for this session */ } }, [barrelAction]);
   useEffect(() => { try { localStorage.setItem("notizraum-angle-snap", String(angleSnap)); } catch { /* preference still works for this session */ } }, [angleSnap]);
-  useEffect(() => { try { localStorage.setItem("xnts-handedness", handedness); } catch { /* preference still works for this session */ } }, [handedness]);
   useEffect(() => { try { localStorage.setItem("xnts-one-finger-scroll", String(oneFingerScroll)); } catch { /* preference still works for this session */ } }, [oneFingerScroll]);
   useEffect(() => { try { localStorage.setItem("xnts-page-markers", String(pageMarkers)); } catch { /* preference still works for this session */ } }, [pageMarkers]);
   useEffect(() => { try { localStorage.setItem("notizraum-circuit-assist", String(circuitAssistEnabled)); } catch { /* preference still works for this session */ } }, [circuitAssistEnabled]);
+  useEffect(() => { try { localStorage.setItem("notizraum-scribble-erase", String(scribbleEraseEnabled)); } catch { /* preference still works for this session */ } }, [scribbleEraseEnabled]);
   useEffect(() => { try { localStorage.setItem(collapseKey, String(toolbarCollapsed)); } catch { /* preference still works for this session */ } }, [toolbarCollapsed, collapseKey]);
   useEffect(() => { try { localStorage.setItem("notizraum-custom-colors", JSON.stringify(customColors)); } catch { /* palette still works for this session */ } }, [customColors]);
   useEffect(() => { try { localStorage.setItem("notizraum-pressure-sensitivity", String(pressureSensitivity)); } catch { /* sensitivity still works for this session */ } }, [pressureSensitivity]);
@@ -692,6 +745,23 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     setColor(normalized); changePen({ color: normalized });
     setCustomColors((old) => old.includes(normalized) ? old : [...old, normalized].slice(-12));
   };
+  const addFunctionField = () => {
+    const expression = functionDraft.trim();
+    try { parseMathExpression(expression); }
+    catch (error) { flash(error instanceof Error ? error.message : "Diese Funktion kann ich noch nicht lesen."); return; }
+    const sc = scRef.current;
+    if (!sc) return;
+    const r = sc.getBoundingClientRect(), d = toDoc(r.left + r.width / 2, r.top + r.height / 2), block = blockAt(d.y), top = topsRef.current[block.id] ?? 0;
+    const field: TextField = { id: uid(), blockId: block.id, text: `f(x) = ${expression}`, x: Math.max(24, Math.min(PAGE_W - 384, d.x - 180)), y: Math.max(24, d.y - top - 30), width: 360, height: 34, fontSize: 20, color, role: "function", functionExpression: expression };
+    const beforeFunction = snap();
+    textFields.current = [...textFields.current, field];
+    pushHist(beforeFunction); bump(); schedule(); markDirty();
+    setFunctionDialog(false); setTool("text"); flash("Funktion und interaktiver Graph eingefügt");
+  };
+  const analyzeSelection = () => analyzeCircuitStrokes(strokes.current.filter((s) => sel.current.has(s.id) && s.tool === "pen").map((s) => {
+    const top = topsRef.current[s.blockId] ?? 0;
+    return { id: s.id, color: s.color, pts: s.pts.map((p) => ({ x: p.x, y: p.y + top })) };
+  }));
   const perfectSelected = () => {
     const beforeSelection = snap(); let changed = 0;
     // 1) Jeden markierten Strich einzeln begradigen: Linie, Leitung mit Knicken, Rechteck, Dreieck, Kreis
@@ -730,9 +800,14 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       strokes.current = strokes.current.map((s) => cleaned.get(s.id) ?? s);
       pushHist(beforeSelection); schedule();
       const skipped = [...sel.current].filter((id) => strokes.current.some((s) => s.id === id && !s.raw)).length;
-      flash(`Schaltbild geglättet: ${cleaned.size} Striche ausgerichtet${skipped ? ` · ${skipped} unverändert (Schrift/Kurven)` : ""} · Rückgängig mit Strg+Z`);
+      const analysis = analyzeSelection(); setCircuitAnalysis(analysis);
+      flash(`Schaltbild geprüft: ${analysis?.summary ?? `${cleaned.size} Striche`} · ${cleaned.size} geglättet${skipped ? ` · ${skipped} unverändert` : ""} · Rückgängig mit Strg+Z`);
       setSaved("Schaltbild und Grundformen geglättet");
-    } else { setSaved("Keine passende Form erkannt"); flash("Keine Leitung oder Grundform in der Auswahl erkannt"); }
+    } else {
+      const analysis = analyzeSelection(); setCircuitAnalysis(analysis);
+      setSaved(analysis ? "Schaltbild erkannt · keine Glättung nötig" : "Keine passende Form erkannt");
+      flash(analysis ? `Schaltbild erkannt: ${analysis.summary}` : "Keine Leitung oder Grundform in der Auswahl erkannt");
+    }
   };
   const HOLD_MS = 500;   // Haltezeit bis zum Glätten
   const HOLD_RADIUS = 6; // Bildschirm-px: so weit darf der Stift beim „Halten“ zittern
@@ -1235,21 +1310,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     return { ...incoming, pts: points, raw: true };
   };
 
-  /* ───── Finger: 1 Finger scrollt (erst nach kurzer Strecke), 2 Finger verschieben + zoomen gemeinsam, Handballen werden ignoriert ───── */
-  // Handballen-Zone: rechts unterhalb der Stiftspitze (Rechtshänder) bzw. links unterhalb (Linkshänder)
-  const inPalmZone = (x: number, y: number) => {
-    const p = penPos.current;
-    if (!p || performance.now() - p.t > PALM_ZONE_MS) return false;
-    const dx = (x - p.x) * (handednessRef.current === "left" ? -1 : 1), dy = y - p.y;
-    return dx > -160 && dy > -240 && Math.hypot(dx, dy) < PALM_ZONE_R;
-  };
-  // Randstreifen auf der Seite der Schreibhand: Dort liegt die Hand beim Schreiben oft teilweise auf dem Rahmen auf
-  // und das Gerät meldet nur kleine Kontaktpunkte – die sehen für die Größenprüfung wie Finger aus.
-  const onHandEdge = (x: number) => {
-    if (!penSeen.current) return false;
-    const r = scRef.current!.getBoundingClientRect();
-    return handednessRef.current === "left" ? x < r.left + PALM_EDGE : x > r.right - PALM_EDGE;
-  };
+  /* ───── Finger: sofortiges Ein-Finger-Verschieben, zwei Finger verschieben + zoomen, große Ballenkontakte ignorieren ───── */
   const stopGestureFrame = () => { cancelAnimationFrame(gestureRaf.current); gestureRaf.current = 0; };
   // Scrollen/Zoomen der laufenden Finger-Geste zurücknehmen (wenn sich herausstellt, dass es der Handballen war)
   const revertGesture = () => {
@@ -1287,7 +1348,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   };
   const touchDown = (e: React.PointerEvent) => {
     const now = performance.now(), g = gesture.current, x = e.clientX, y = e.clientY;
-    const palm = isPalm(e.nativeEvent) || penActive.current || now - penLast.current < PALM_GRACE_MS || inPalmZone(x, y) || onHandEdge(x);
+    const palm = isPalm(e.nativeEvent) || penActive.current;
     if (palm || g.mode === "blocked" || touches.current.size >= 2) {
       rejected.current.add(e.pointerId);
       // Dritter Kontakt oder Ballen neben einem laufenden Finger: Geste stoppen (und zurücknehmen, falls sie gerade erst begann)
@@ -1331,10 +1392,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const onDown = (e: React.PointerEvent) => {
     if (e.pointerType === "touch") { touchDown(e); return; }
     if (e.pointerType === "pen") { // Stift setzt auf: laufende Finger-Gesten abbrechen (und zurücknehmen, falls der Ballen kurz vorher gescrollt hat)
-      const now = performance.now();
-      penSeen.current = true; penPos.current = { x: e.clientX, y: e.clientY, t: now };
       endTouches();
-      penActive.current = true; penLast.current = now;
+      penActive.current = true;
     }
     if (e.pointerType === "mouse" && e.button !== 0) return; // nur die linke Maustaste zeichnet
     if (readOnlyRef.current) { // Nur ansehen: nichts zeichnen, Ziehen verschiebt die Ansicht
@@ -1392,8 +1451,6 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     // „Gedrückt“ über das eigene Flag statt über buttons & 1: das Radierer-Ende meldet buttons 32, die Seitentaste buttons 2
     const pressed = gestureOn.current && (e.pointerType !== "mouse" || (e.buttons & 1) !== 0);
     if (e.pointerType === "pen") { // auch schwebend: merkt sich, wo die Schreibhand gerade ist (Handballen-Zone)
-      const now = performance.now();
-      penLast.current = now; penSeen.current = true; penPos.current = { x: e.clientX, y: e.clientY, t: now };
       if (!pressed) penActive.current = false;
     }
     hover.current = toDoc(e.clientX, e.clientY);
@@ -1468,7 +1525,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     if (!gestureOn.current) return; // z. B. rechte Maustaste: es lief keine Geste
     const usedTool = gTool.current;
     gestureOn.current = false; eraserHover.current = false; holdAnchor.current = null; eraseLast.current = null;
-    if (e.pointerType === "pen") { penActive.current = false; penLast.current = performance.now(); }
+    if (e.pointerType === "pen") penActive.current = false;
     if (cur.current) {
       let stroke = cur.current;
       if (!stroke.raw && !snapInfo.current && stroke.pts.length > 1) {
@@ -1483,6 +1540,28 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       const finalStroke = !stroke.raw && hasArrow(stroke.lineStyle) && stroke.pts.length > 1
         ? { ...stroke, pts: shapePts("arrow", stroke.pts[0], stroke.pts[stroke.pts.length - 1]), raw: true }
         : stroke;
+      if (scribbleEraseEnabled && usedTool === "pen" && (finalStroke.tool === "pen" || finalStroke.tool === "highlighter") && isScribbleGesture(finalStroke.pts)) {
+        const top = topsRef.current[finalStroke.blockId] ?? 0;
+        const scratch = finalStroke.pts.map((p) => ({ x: p.x, y: p.y + top }));
+        const scratchBounds = scratch.reduce((b, p) => ({ x0: Math.min(b.x0, p.x), x1: Math.max(b.x1, p.x), y0: Math.min(b.y0, p.y), y1: Math.max(b.y1, p.y) }), { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity });
+        const tolerance = Math.max(4, 9 / zoomRef.current);
+        const hitStrokes = new Set(strokes.current.filter((target) => {
+          if (target.id === finalStroke.id || (target.tool !== "pen" && target.tool !== "highlighter")) return false;
+          const targetTop = topsRef.current[target.blockId] ?? 0, box = bbox(target);
+          if (targetTop + box.y1 < scratchBounds.y0 - tolerance || targetTop + box.y0 > scratchBounds.y1 + tolerance || box.x1 < scratchBounds.x0 - tolerance || box.x0 > scratchBounds.x1 + tolerance) return false;
+          return pathTouchesPath(scratch, target.pts.map((p) => ({ x: p.x, y: p.y + targetTop })), tolerance + target.size / 2);
+        }).map((target) => target.id));
+        const hitTexts = new Set(textFields.current.filter((target) => scratchTouchesRect(scratch, textRect(target), tolerance)).map((target) => target.id));
+        if (hitStrokes.size || hitTexts.size) {
+          strokes.current = strokes.current.filter((target) => !hitStrokes.has(target.id));
+          textFields.current = textFields.current.filter((target) => !hitTexts.has(target.id));
+          sel.current = new Set([...sel.current].filter((id) => !hitStrokes.has(id) && !hitTexts.has(id)));
+          pushHist(before.current);
+          flash(`${hitStrokes.size + hitTexts.size} ${hitStrokes.size + hitTexts.size === 1 ? "Element gelöscht" : "Elemente gelöscht"} · Rückgängig mit Strg+Z`);
+        } else flash("Kritzelradierer · kein Inhalt getroffen");
+        cur.current = null; snapInfo.current = null; rawBeforeSmartSnap.current = null;
+        bump(); schedule(); return;
+      }
       // Automatisch begradigen: nur eindeutig gerade, ausreichend lange Striche (Handschrift bleibt unberührt).
       // Start, Ende und Winkel bleiben wie gezeichnet. Der Freihandstrich wird als eigener Undo-Schritt abgelegt.
       let auto: Stroke | null = null;
@@ -1553,6 +1632,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       dragOff.current = { x: 0, y: 0 };
     }
     lasso.current = null; drag.current = null;
+    if (usedTool === "lasso") setCircuitAnalysis(analyzeSelection());
     if (usedTool === "lasso" && tool !== "lasso" && sel.current.size > 0) { // Seitentaste: Auswahl sofort bearbeitbar (Griffe, Kopieren, Löschen)
       setTool("lasso"); flash("Auswahl mit der Stift-Seitentaste · Lasso ist jetzt aktiv");
     }
@@ -1881,9 +1961,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   return (
     <div className="notiz-workspace relative h-full flex-1 min-w-0 flex flex-col bg-slate-100 text-slate-800 select-none overscroll-none" data-theme={darkMode ? "dark" : "light"}>
-      {/* Kunstbanner liegt HINTER der Werkzeugleiste (spart die eigene Bannerzeile → mehr Platz für die Notiz) */}
+      {/* Einheitliche dunkle Ockerleiste; die Kunstcollage sitzt dauerhaft in der Bibliothek. */}
       <div className={(compact ? "xnts-topbar xnts-topbar--plain" : "xnts-topbar") + (focus ? " xnts-hidden" : "")}>
-      {!compact && <div className="xnts-topbar__art" aria-hidden="true"><img src={import.meta.env.BASE_URL + "xnts-art-collage.webp"} alt="" /></div>}
       {!compact && <div className="xnts-art-banner__lockup xnts-topbar__lockup" aria-hidden="true"><strong>XNTS</strong><span>NOTES · STUDY · ART</span></div>}
       <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-1.5 bg-white border-b border-slate-200 flex-wrap" data-collapsed={toolbarCollapsed}>
         <div className="notiz-toolbar__row notiz-toolbar__primary">
@@ -1903,6 +1982,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
             <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 3h6M10 3v6l-5.2 9.1A2 2 0 0 0 6.5 21h11a2 2 0 0 0 1.7-2.9L14 9V3"/><path d="M7.4 15h9.2"/></svg>
             {!toolbarCollapsed && <span className="notiz-toolbar__tool-label">Labor</span>}
           </button>
+          <button className={btn(functionDialog) + " notiz-toolbar__tool"} onClick={() => setFunctionDialog(true)} title="Funktion f(x) eingeben und interaktiv anzeigen" aria-label="Funktion hinzufügen">f(x)</button>
           {(tool === "pen" || tool === "highlighter") && (
             <>
               <select aria-label="Stifttyp" title="Strichverhalten" className="notiz-toolbar__penopt px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
@@ -1943,7 +2023,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
           {tool === "pen" && <button className={btn(false) + " notiz-toolbar__hint"} onClick={() => flash(penHint)} title={penHint} aria-label="Hinweis zu Linien und Formen">ⓘ</button>}
           {(tool === "lasso" || tool === "shape") && <button className={btn(angleSnap) + " notiz-toolbar__angle-snap"} aria-pressed={angleSnap} onClick={() => setAngleSnap(!angleSnap)} title="Winkel beim Ziehen, Drehen und Linienzeichnen auf 15°-Schritte einrasten. Ohne Raster ist jeder Winkel möglich; Umschalttaste rastet vorübergehend ein.">15°-Raster</button>}
           {tool === "lasso" && <button className={btn(false) + " notiz-toolbar__hint"} onClick={() => flash(lassoHint)} title={lassoHint} aria-label="Hinweis zum Lasso">ⓘ</button>}
-          {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Markierte Linien und Grundformen eines Schaltbilds begradigen">Schaltbild glätten</button>}
+          {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Auswahl als Schaltbild prüfen und klare Leitungen und Grundformen glätten">Schaltbild erkennen &amp; glätten</button>}
         </div>}
         <div className="notiz-toolbar__row notiz-toolbar__document">
           <Sep />
@@ -1975,16 +2055,16 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       {canEdit && !focus && (tool === "pen" || tool === "highlighter") && !toolbarCollapsed && <div className="notiz-pen-strip flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white px-3 py-1" role="group" aria-label="Meine Stiftprofile">
         <span className="shrink-0 text-xs font-semibold text-slate-500">Meine Stifte</span>
         {penProfiles.map((p) => <button key={p.id} type="button" aria-pressed={activePen.id === p.id} onClick={() => choosePen(p)}
-          className={`notiz-pen-preset inline-flex shrink-0 items-center gap-2 rounded-xl border px-3 py-1 text-left ${activePen.id === p.id ? "border-blue-400 bg-blue-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}>
-          <span className="h-3 w-3 rounded-full border border-slate-300" style={{ backgroundColor: p.color }} />
-          <span className="text-xs font-medium text-slate-700">{p.name}</span>
-          <span className="text-[10px] text-slate-500">{p.kind === "marker" ? "Marker" : p.kind === "fountain" ? "Füller" : p.kind === "pencil" ? "Bleistift" : "Kugel"} · {p.size.toFixed(1)}</span>
+          title={`${p.name} · ${p.size.toFixed(1)} px`} className={`notiz-pen-preset inline-flex shrink-0 items-center ${activePen.id === p.id ? "is-active" : ""}`}>
+          <PenGlyph kind={p.kind} color={p.color} className="notiz-pen-preset__glyph" />
+          <span className="notiz-pen-preset__name">{p.name}</span>
+          <span className="notiz-pen-preset__nib" style={{ backgroundColor: p.color }} />
         </button>)}
         <button className={btn(false) + " shrink-0"} onClick={addPenProfile}>＋ Stift hinzufügen</button>
       </div>}
 
       <div className="relative flex flex-1 min-h-0">
-        {labOpen && <LabBench onClose={() => setLabOpen(false)} onInsert={insertLabRecord} />}
+        {labOpen && <LabBench onClose={() => setLabOpen(false)} onInsert={insertLabRecord} noteCircuit={circuitAnalysis} />}
         {sidebar && !focus && (
           <aside className="notiz-page-sidebar w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2 space-y-1">
             {blocks.map((b, i) => (
@@ -2071,7 +2151,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
                 </div>
               ))}
             </div>
-            {textFields.current.map((tf0) => { const tf = liveText(tf0); return (
+            {textFields.current.map((tf0) => { const tf = liveText(tf0), expression = functionExpressionFromText(tf.text); return (
               <div key={tf.id} className="absolute" style={{ left: tf.x * zoom, top: ((topsRef.current[tf.blockId] ?? 0) + tf.y) * zoom, width: tf.width * zoom, pointerEvents: tool === "text" && !readOnly ? "auto" : "none" }}>
                 {tool === "text" && <div title="Verschieben" onPointerDown={(e) => startTextDrag(e, tf)} className="absolute -top-4 -left-1 w-6 h-4 rounded-t bg-blue-500/80 cursor-move" />}
                 <textarea id={"tf-" + tf.id} value={tf.text} rows={1} spellCheck={false} readOnly={readOnly || tool !== "text" || sel.current.has(tf.id)} tabIndex={tool === "text" ? 0 : -1} onPointerDown={(e) => e.stopPropagation()}
@@ -2080,6 +2160,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
                   onBlur={finishText}
                   className={`w-full bg-transparent outline-none resize-none overflow-hidden border border-dashed rounded-sm leading-snug block ${readOnly || focus ? "border-transparent" : "border-blue-300/70"}`}
                   style={{ color: displayInk(tf.color, paperAtY((topsRef.current[tf.blockId] ?? 0) + tf.y)), fontSize: tf.fontSize * zoom, height: textH(tf) * zoom }} />
+                {expression && <div className="absolute left-0" style={{ top: (textH(tf) + 8) * zoom, width: Math.min(460, Math.max(300, PAGE_W - tf.x - 18)) * zoom, pointerEvents: "auto" }}><FunctionPlot expression={expression} /></div>}
               </div>
             ); })}
             {pdfDeleteMode && blocks.map((b) => b.kind === "pdf" ? (
@@ -2121,9 +2202,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
               </select>
               <label className="notiz-check-row"><input type="checkbox" checked={smartShapesEnabled} onChange={(e) => setSmartShapesEnabled(e.target.checked)} /><span><strong>Smart Shapes</strong><small>Linien, Rechtecke, Dreiecke und Kreise beim Halten (0,5 s) glätten – Start, Ende und Winkel bleiben erhalten. Nur exakt fluchtende Linien (≤ 2,5°) werden automatisch verlängert; ein Hinweis zeigt das an.</small></span></label>
               <label className="notiz-check-row"><input type="checkbox" checked={autoStraighten} disabled={!smartShapesEnabled} onChange={(e) => setAutoStraighten(e.target.checked)} /><span><strong>Linien automatisch begradigen</strong><small>Gerade gezogene Linien und Leitungen mit Knicken werden beim Absetzen sofort begradigt – ohne Lasso und ohne Halten. Winkel, Start und Ende bleiben erhalten; kurze Striche und Handschrift bleiben unverändert. „Rückgängig“ stellt den Freihandstrich wieder her.</small></span></label>
-              <label className="notiz-check-row"><input type="checkbox" checked={circuitAssistEnabled} onChange={(e) => setCircuitAssistEnabled(e.target.checked)} /><span><strong>Schaltbild-Hilfe</strong><small>„Schaltbild glätten“ richtet fast waagerechte oder senkrechte Leitungen (≈ 10°) aus, begradigt Leitungen mit Knicken, zieht benachbarte Leitungen auf eine Flucht und dockt Enden an Leitungen, Rechtecke und Kreise an. Schräge und bereits eingestellte Linien behalten ihren Winkel.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={circuitAssistEnabled} onChange={(e) => setCircuitAssistEnabled(e.target.checked)} /><span><strong>Schaltbild-Hilfe</strong><small>Mit dem Lasso eine Skizze auswählen und „Schaltbild erkennen &amp; glätten“ wählen. Gerade Leitungen, Knoten und einfache Grundformen werden lokal ausgerichtet; Beschriftungen aus PDF-Bildern werden nicht gelesen.</small></span></label>
               <label className="notiz-check-row"><input type="checkbox" checked={angleSnap} onChange={(e) => setAngleSnap(e.target.checked)} /><span><strong>15°-Raster</strong><small>Nur wenn eingeschaltet (oder mit gedrückter Umschalttaste) rasten Linien, Endpunkte und Drehungen in 15°-Schritten ein.</small></span></label>
-              <p>Winkel ändern: Lasso wählen, Linie antippen und einen der violetten Endpunkte ziehen. Das Etikett zeigt den aktuellen Winkel; „Rückgängig“ nimmt die Änderung zurück. Wähle Linien mit dem Lasso. „Schaltbild glätten“ oder Doppelklicken richtet erkannte Leitungen und Grundformen aus. Bauteilnamen werden dabei nicht automatisch gelesen.</p>
+              <p>Winkel ändern: Lasso wählen, Linie antippen und einen der violetten Endpunkte ziehen. Für eine Skizze mehrere Striche mit dem Lasso umfahren. Gedruckte PDF-Schaltbilder und handschriftliche Bauteilwerte brauchen noch Bild- und Texterkennung.</p>
               <label htmlFor="pressure-sensitivity">Stiftdruckempfindlichkeit · {pressureSensitivity.toFixed(2).replace(".", ",")}</label>
               <input id="pressure-sensitivity" type="range" min="0.25" max="2" step="0.05" value={pressureSensitivity} onChange={(e) => setPressureSensitivity(Number(e.target.value))} aria-label="Stiftdruckempfindlichkeit" />
               <p>Wirkt auf unterstützte druckempfindliche Stifte. Maus und Finger verwenden eine gleichmäßige Stärke.</p>
@@ -2138,17 +2219,14 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
                 <option value="lasso">Lasso-Auswahl (wie OneNote)</option><option value="eraser">Radierer</option><option value="none">Keine Funktion</option>
               </select>
               <p>Die Rückseite des Stifts (Radierer-Ende, z. B. Surface Pen oder Slim Pen 2) radiert immer – unabhängig vom gewählten Werkzeug. Kugelschreiber schreibt gleichmäßig, Füller reagiert auf Druck und Strichrichtung, Bleistift ist körnig und wird mit Druck dunkler. Voraussetzung: Das Gerät meldet Stiftrückseite, Seitentaste und Druck an die App (Windows Ink).</p>
+              <label className="notiz-check-row"><input type="checkbox" checked={scribbleEraseEnabled} onChange={(e) => setScribbleEraseEnabled(e.target.checked)} /><span><strong>Kritzelradierer</strong><small>Standardmäßig an: Kritzele eine Zickzacklinie über einen Strich oder ein Textfeld, um es zu löschen. Hier abschalten, wenn du die Geste nicht möchtest.</small></span></label>
             <PenPreview kind={activePen.kind} size={size} color={color} smoothing={inkSmoothing} sensitivity={pressureSensitivity} />
               <details className="xnts-diag-details"><summary>Stift testen (Diagnose)</summary><PenDiagnostic /></details>
             </section>
             <section className="notiz-settings-section">
               <h3>Handballen &amp; Finger</h3>
-              <label htmlFor="handedness">Schreibhand</label>
-              <select id="handedness" value={handedness} onChange={(e) => setHandedness(e.target.value as Handedness)} className="notiz-settings-select">
-                <option value="right">Rechtshänder</option><option value="left">Linkshänder</option>
-              </select>
-              <p>Während du schreibst, werden Berührungen unterhalb und auf der Seite der Schreibhand sowie am Bildschirmrand dieser Seite als Handballen ignoriert. Scrollt oder zoomt der Ballen kurz bevor der Stift aufsetzt, wird das zurückgenommen. Finger zeichnen nie.</p>
-              <label className="notiz-check-row"><input type="checkbox" checked={oneFingerScroll} onChange={(e) => setOneFingerScroll(e.target.checked)} /><span><strong>Mit einem Finger scrollen</strong><small>Aus: Nur zwei Finger verschieben und zoomen. Das ist die sicherste Einstellung, wenn die aufgelegte Hand trotzdem noch scrollt.</small></span></label>
+              <p>Finger zeichnen nicht. Während der Stift aufliegt, werden Touchkontakte ignoriert; nach dem Abheben startet das Scrollen sofort. Große Touchflächen werden als Handballen verworfen.</p>
+              <label className="notiz-check-row"><input type="checkbox" checked={oneFingerScroll} onChange={(e) => setOneFingerScroll(e.target.checked)} /><span><strong>Mit einem Finger scrollen</strong><small>Aus: Mit zwei Fingern verschieben und zoomen.</small></span></label>
               <p>Zwei Finger: gleichzeitig verschieben und zoomen. Kleine Abstandsänderungen verschieben nur, damit die Ansicht beim Scrollen nicht ungewollt zoomt.</p>
             </section>
             <section className="notiz-settings-section">
@@ -2166,6 +2244,15 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
             </section>
           </div>
         </aside>
+      </div>}
+      {functionDialog && <div className="notiz-function-backdrop" role="presentation" onPointerDown={(e) => { if (e.target === e.currentTarget) setFunctionDialog(false); }}>
+        <form className="notiz-function-dialog" role="dialog" aria-modal="true" aria-labelledby="function-dialog-title" onSubmit={(e) => { e.preventDefault(); addFunctionField(); }} onPointerDown={(e) => e.stopPropagation()}>
+          <h2 id="function-dialog-title">Funktion darstellen</h2>
+          <label htmlFor="function-expression">Funktionsgleichung</label>
+          <input id="function-expression" autoFocus value={functionDraft} onChange={(e) => setFunctionDraft(e.target.value)} placeholder="z. B. 2(x - 3)^2 - 4" />
+          <p>Gib den Ausdruck rechts von f(x) = ein. Unterstützt werden Rechenzeichen, Klammern, Potenzen, x sowie sin, cos, tan, sqrt, abs, exp und log. Mit dem Graphen kannst du Werte ablesen und den Ausschnitt zoomen.</p>
+          <div className="notiz-function-dialog__actions"><button type="button" onClick={() => setFunctionDialog(false)}>Abbrechen</button><button type="submit">Graph einfügen</button></div>
+        </form>
       </div>}
       {showBar && (
         <div className="absolute left-1/2 -translate-x-1/2 bottom-6 z-30 flex gap-2 p-2 rounded-2xl bg-white/95 border border-slate-200 shadow-xl select-none"

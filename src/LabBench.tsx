@@ -7,6 +7,7 @@ import {
   type Coupling, type GenLoad, type GenSettings, type MeterReading, type PsuSettings, type Quantity, type ScopeResult, type ScopeSettings, type Signal,
 } from "./labSim";
 import { GenFront, MeterFront, PsuFront, Schematic, ScopeFront, genRangeOf, type MeterPos, type ScopeMenu, type SoftKey } from "./LabFronts";
+import type { CircuitAnalysis } from "./circuitRecognition";
 
 export type LabRecord = { title: string; lines: string[]; scope: { traces: { color: string; label: string; points: number[] }[]; caption: string } | null };
 
@@ -251,13 +252,26 @@ const measureText = (m: NonNullable<ScopeResult["traces"][number]>["measure"]) =
   m.rms !== null ? `Ueff = ${si(m.rms, "V", 3)}` : "Ueff = ?", m.clipped ? "übersteuert" : "", m.undersampled ? "Unterabtastung" : "",
 ].filter(Boolean).join(" · ") : "";
 
-export default function LabBench({ onClose, onInsert }: { onClose: () => void; onInsert: (r: LabRecord) => void }) {
+export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: () => void; onInsert: (r: LabRecord) => void; noteCircuit?: CircuitAnalysis | null }) {
   const [st, setSt] = useState<LabState>(loadState);
   const [wide, setWide] = useState(() => { try { return localStorage.getItem("xnts-lab-wide") === "true"; } catch { return false; } });
   const [tut, setTut] = useState<{ id: string; step: number } | null>(null);
   useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(st)); } catch { /* nur Sitzung */ } }, [st]);
   useEffect(() => { try { localStorage.setItem("xnts-lab-wide", String(wide)); } catch { /* nur Sitzung */ } }, [wide]);
   const set = (patch: Partial<LabState>) => setSt((s) => ({ ...s, ...patch }));
+  const useNoteCircuitAsRc = () => {
+    setSt((current) => ({
+      ...current,
+      devices: { ...current.devices, gen: true, scope: true },
+      gen: { ...current.gen, waveform: "square", freq: 1000, vpp: 4, offset: 0 },
+      load: "rc", rcR: 1000, rcC: 100e-9,
+      scope: { ...current.scope, sDiv: 500e-6, ch: [
+        { ...current.scope.ch[0], source: "gen.out" },
+        { ...current.scope.ch[1], source: "gen.c" },
+      ] },
+    }));
+    setTut(null);
+  };
   const setMeter = (k: MeterKey, patch: Partial<MeterState>) => setSt((s) => ({ ...s, meters: { ...s.meters, [k]: { ...s.meters[k], ...patch } } }));
   const setScope = (patch: Partial<ScopeSettings>) => setSt((s) => ({ ...s, scope: { ...s.scope, ...patch } }));
   const setCh = (i: number, patch: Partial<ScopeSettings["ch"][number]>) => setSt((s) => ({ ...s, scope: { ...s.scope, ch: s.scope.ch.map((c, k) => (k === i ? { ...c, ...patch } : c)) } }));
@@ -360,6 +374,18 @@ export default function LabBench({ onClose, onInsert }: { onClose: () => void; o
         <div><button className="xnts-lab-headbtn" aria-pressed={wide} onClick={() => setWide(!wide)}>{wide ? "Schmal" : "Werkbank groß"}</button>
           <button onClick={onClose} aria-label="Labor schließen" className="xnts-lab-close">×</button></div>
       </header>
+
+      {noteCircuit && <section className="xnts-lab-note-circuit" aria-label="Schaltung aus der Notiz">
+        <div className="xnts-lab-note-circuit__heading"><strong>Schaltung aus deiner Notiz</strong><span>Skizze erkannt</span></div>
+        <p>{noteCircuit.summary}</p>
+        <svg viewBox={`${noteCircuit.bounds.x - 8} ${noteCircuit.bounds.y - 8} ${noteCircuit.bounds.width + 16} ${noteCircuit.bounds.height + 16}`} role="img" aria-label="Vorschau der ausgewählten handgezeichneten Schaltung">
+          {noteCircuit.paths.map((path) => <polyline key={path.id} points={path.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={path.color.toLowerCase() === "#ffffff" || path.color.toLowerCase() === "white" ? "#253047" : path.color} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />)}
+        </svg>
+        {noteCircuit.supportsRc ? <>
+          <p className="xnts-lab-note-circuit__hint">Diese Auswahl sieht nach einem einfachen RC-Kreis aus. Ich übernehme die Skizze als RC-Tiefpass-Versuch mit Startwerten (1 kΩ, 100 nF). Beschriftungen und Bauteilwerte aus der Zeichnung werden noch nicht automatisch gelesen – bitte Werte unten prüfen.</p>
+          <button type="button" className="xnts-lab-note-circuit__use" onClick={useNoteCircuitAsRc}>Als RC-Versuch verwenden</button>
+        </> : <p className="xnts-lab-note-circuit__hint">Die Geometrie wird als Skizze angezeigt. Für diese Schaltung gibt es noch keine passende Simulation; Bauteilbeschriftungen werden nicht ausgelesen.</p>}
+      </section>}
 
       {tutorial && step && <div className="xnts-lab-tutorial" role="status" aria-live="polite">
         <div className="xnts-lab-tutorial__top"><strong>{tutorial.title}</strong><span>Schritt {tut!.step + 1} / {tutorial.steps.length}</span></div>

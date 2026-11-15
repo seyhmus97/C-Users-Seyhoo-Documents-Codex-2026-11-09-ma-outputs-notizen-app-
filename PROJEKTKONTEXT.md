@@ -27,6 +27,11 @@ XNTS steht für Xnotes. Die offizielle Web- und Installationsversion ist derzeit
 - Automatisches Andocken greift nur bei nahezu exakter Flucht. Schaltbild glätten richtet geometrische Leitungen aus, ohne Handschrift oder Bögen zu begradigen; es erkennt keine Bauteile semantisch.
 - Visueller Rundgang beim ersten Start; acht kurze Anleitungen können jederzeit über Einstellungen › Hilfe oder Bibliothek › ⋯ wieder geöffnet werden.
 - Virtuelles Labor mit simulierten Messgeräten, vier geführten Übungen und Messprotokoll-Export in die Notiz. Es steuert keine realen Geräte.
+- Kritzelradierer ist standardmäßig aktiv und kann in den Einstellungen abgeschaltet werden. Eine deutliche Zickzackbewegung über getroffene Striche oder Textfelder löscht diese in einem rückgängig machbaren Schritt.
+- Der Funktionsknopf `f(x)` und Textfelder mit `f(x) = ...` zeigen lokale interaktive Graphen mit Zoom und x-/Funktionswertanzeige. Handschrift und PDF-Formeln werden noch nicht automatisch erkannt.
+- Ausgewählte Vektorstriche werden im Labor als Skizzenvorschau angezeigt. Einfach wirkende RC-Schaltungen können in den bestehenden RC-Tiefpass übernommen werden; Bauteilwerte müssen manuell geprüft werden. Es gibt noch keinen allgemeinen Schaltungslöser und keine Erkennung von Bild-/PDF-Schaltplänen.
+- Finger-Pan startet nach etwa 3 px Bewegung; die frühere mehrsekündige Wartezone nach dem Schreiben wurde entfernt. Surface-Pen und Finger müssen gemeinsam auf echter Hardware geprüft werden.
+- Die Werkzeugleiste ist einfarbig dunkles Ockergelb ohne Verlauf; Stiftprofile nutzen kompakte SVG-Illustrationen. Die Seitenliste ist eine nummerierte Liste.
 - Responsive Oberfläche, Hell- und Dunkelmodus, PWA-Installation und Offline-Nutzung.
 
 ## Lerngruppen und Infrastruktur

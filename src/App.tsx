@@ -172,7 +172,7 @@ export default function App() {
     const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:") && k !== "app:preferences").map(async ([k, v]) => [
       k, v instanceof Blob ? { __ab: toB64(await v.arrayBuffer()), type: v.type } : v instanceof ArrayBuffer ? { __ab: toB64(v) } : v,
     ]));
-    const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
+    const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
     entries.push(["app:preferences", Object.fromEntries(preferenceKeys.map((k) => [k, localStorage.getItem(k)]))]);
     await saveFile(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }), `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`);
   };
@@ -185,7 +185,7 @@ export default function App() {
       const entries: [string, unknown][] = d.entries.map(([k, v]: [string, unknown]): [string, unknown] => [k, v && typeof v === "object" && "__ab" in v ? (() => { const o = v as { __ab: string; type?: string }, ab = fromB64(o.__ab); return o.type ? new Blob([ab], { type: o.type }) : ab; })() : v]);
       const preferences = entries.find(([k]) => k === "app:preferences")?.[1];
       if (preferences && typeof preferences === "object") {
-        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"]);
+        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"]);
         for (const [key, value] of Object.entries(preferences)) if (allowed.has(key)) {
           if (typeof value === "string") localStorage.setItem(key, value); else localStorage.removeItem(key);
         }

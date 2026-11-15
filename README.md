@@ -37,6 +37,16 @@ Notizen und importierte PDFs werden lokal im jeweiligen App-Speicher abgelegt. D
 
 PDF-Seiten bleiben im Dokumentfluss und werden im Dunkelmodus nicht invertiert. Zwischen ihnen kannst du Blanko-, Linien-, Karoraster- oder Punktrasterflächen einsetzen. Stiftprofile unterstützen Füller, Kugelschreiber, Bleistift und Textmarker. Die Schnellleiste bietet durchgezogene, gestrichelte, gepunktete Linien und Pfeile. Haltegesten glätten Linien und geometrische Grundformen; Start, Ende und Winkel der gezeichneten Linie bleiben dabei erhalten. Gerade Stiftlinien werden nur dann automatisch verlängert, wenn sie praktisch exakt fluchten (≤ 2,5° Abweichung, ≤ 4 px neben der Achse); ein Hinweis auf der Fläche zeigt das an und „Rückgängig“ nimmt es zurück. Andere Striche behalten ihren Winkel. „Schaltbild glätten“ richtet ausgewählte Leitungen und Grundformen aus, erkennt aber keine elektrischen Bauteile oder Beschriftungen semantisch.
 
+## Funktionen, Schaltbilder und Navigation
+
+- Über **f(x)** oder ein Textfeld mit `f(x) = ...` wird eine Funktion als interaktiver Graph ergänzt. Der Graph lässt sich vergrößern und zeigt beim Antippen den aktuellen x- und Funktionswert. Unterstützt werden unter anderem Grundrechenarten, Klammern, Potenzen, `x`, `pi`, `e`, `sin`, `cos`, `tan`, `sqrt`, `abs`, `exp`, `ln` und `log`. Das ist eine lokale Eingabehilfe; handschriftliche Formeln oder Formeln in PDFs werden noch nicht automatisch gelesen.
+- **Schaltbild erkennen & glätten** prüft ausgewählte Vektorstriche, fasst erkannte Leitungen und Grundformen zusammen und richtet klare Geometrie aus. Es liest keine Bauteilwerte oder gedruckten PDF-Bilder aus.
+- Wenn eine Auswahl wie ein einfacher RC-Kreis aussieht, erscheint sie nach der Erkennung im Labor als Vorschau. **Als RC-Versuch verwenden** richtet den vorhandenen RC-Tiefpass mit Startwerten ein. Die gezeichneten Werte werden nicht ausgelesen; R und C müssen vor dem Versuch geprüft werden. Andere Schaltungen werden derzeit nur als Skizze angezeigt und nicht allgemein simuliert.
+- **Kritzelradierer** ist standardmäßig aktiv. Eine deutliche Zickzackbewegung über gezeichnete Striche oder Textfelder löscht die getroffenen Elemente; Rückgängig stellt sie wieder her. Die Geste lässt sich in den Einstellungen abschalten.
+- Fingerbewegungen verschieben die Notiz ab einer sehr kleinen Bewegung von 3 px. Nach dem Abheben des Stifts wartet die Ein-Finger-Navigation nicht mehr auf eine mehrsekündige Handballen-Zone. Auf dem echten Surface muss das Verhalten noch mit Stift und Finger gemeinsam geprüft werden.
+
+Die Seitenliste bleibt eine einfache nummerierte Liste. Die Werkzeugleiste verwendet einen einfarbigen dunklen Ockerton ohne Farbverlauf und zeigt die Stiftprofile mit kompakten SVG-Stiftbildern.
+
 Im Dunkelmodus bleibt die Tinte über PDF-Seiten und dunkle Notizflächen lesbar; die App passt nur die handgezeichnete Tinte an den jeweiligen Papierhintergrund an. PDF- und Bildinhalte werden nicht gefiltert oder invertiert.
 
 ## Build und PWA-Icons
