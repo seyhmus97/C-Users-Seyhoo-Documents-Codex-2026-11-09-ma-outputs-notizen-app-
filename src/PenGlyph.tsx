@@ -1,66 +1,64 @@
 import { useId } from "react";
 import type { PenKind } from "./penTypes";
 
-const OUTLINE = "#191923";
+const INK = "#191923";
 const VIOLET = "#5738df";
 const GOLD = "#f2d548";
 
-/** Compact die-cut pen stickers inspired by the selected “Klassisch” reference. */
+/** The four compact, cutout “Klassisch” pen-head stickers from the XNTS reference. */
 export default function PenGlyph({ kind, color, className = "" }: { kind: PenKind; color: string; className?: string }) {
-  const shadowId = `xnts-pen-sticker-shadow-${useId().replace(/:/g, "")}`;
-  const silhouette = kind === "marker"
-    ? "M9 5 Q9 3 12 3 H24 Q27 3 27 5 V34 L18 46 L9 34 Z"
+  const shadowId = `xnts-pen-cutout-${useId().replace(/:/g, "")}`;
+  const outerShape = kind === "ballpoint"
+    ? "M10 5 H40 V26 H36 L32 44 L28 62 L27 75 Q32 78 31 85 Q30 92 25 92 Q20 92 19 85 Q18 78 23 75 L22 62 L18 44 L14 26 H10 Z"
     : kind === "fountain"
-      ? "M9 5 Q9 3 12 3 H24 Q27 3 27 5 V15 L23 26 L20 35 L18 45 L16 35 L13 26 L9 15 Z"
+      ? "M9 5 Q9 2 12 2 H38 Q41 2 41 5 V24 H38 V35 L34 50 L30 61 L27 77 L25 91 L23 77 L20 61 L16 50 L12 35 V24 H9 Z"
       : kind === "pencil"
-        ? "M11 5 Q11 3 13 3 H23 Q25 3 25 5 V31 L18 46 L11 31 Z"
-        : "M10 5 Q10 3 12 3 H24 Q26 3 26 5 V15 L22 30 L18 45 L14 30 L10 15 Z";
+        ? "M10 5 Q10 2 13 2 H37 Q40 2 40 5 V53 L25 91 L10 53 Z"
+        : "M6 5 Q6 2 10 2 H40 Q44 2 44 5 V27 L40 48 L35 62 L30 72 V84 L25 91 L18 84 V72 L13 62 L8 48 L6 27 Z";
 
-  return <svg viewBox="0 0 36 50" className={className} aria-hidden="true" focusable="false">
+  return <svg viewBox="0 0 50 96" className={className} aria-hidden="true" focusable="false">
     <defs>
-      <filter id={shadowId} x="-35%" y="-20%" width="170%" height="155%">
-        <feDropShadow dx="0" dy="1.2" stdDeviation="1.1" floodColor="#111827" floodOpacity=".28" />
+      <filter id={shadowId} x="-30%" y="-15%" width="160%" height="140%">
+        <feDropShadow dx="0" dy="1" stdDeviation="1" floodColor="#111827" floodOpacity=".25" />
       </filter>
     </defs>
     <g filter={`url(#${shadowId})`} strokeLinejoin="round" strokeLinecap="round">
-      {/* White kiss-cut edge, then the shared dark hand-drawn contour. */}
-      <path d={silhouette} fill="#fffdf8" stroke="#fffdf8" strokeWidth="6" />
-      <path d={silhouette} fill="#fffdf8" stroke={OUTLINE} strokeWidth="2.25" />
+      {/* White sticker edge, transparent outside it, and the original dark contour. */}
+      <path d={outerShape} fill="#fffdf8" stroke="#fffdf8" strokeWidth="7" />
+      <path d={outerShape} fill="#fffdf8" stroke={INK} strokeWidth="2.7" />
 
       {kind === "ballpoint" && <>
-        <path d="M11 5 H25 V15 H11 Z" fill={VIOLET} stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M11.5 7 H24.5" stroke="#9d8cff" strokeWidth="1" />
-        <path d="M12 15 H24 L21 28 H15 Z" fill="#fffdf8" stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M15 28 H21 L18 40 Z" fill={color} stroke={OUTLINE} strokeWidth="1.7" />
-        <path d="M16.5 39 L18 45 L19.5 39 Z" fill={OUTLINE} />
-        <path d="M14 31 H22" stroke="#d7d5e3" strokeWidth="1" />
+        <path d="M11 6 H39 V25 H11 Z" fill={VIOLET} stroke={INK} strokeWidth="2.3" />
+        <path d="M11 24 H39 V29 H11 Z" fill={GOLD} stroke={INK} strokeWidth="1.8" />
+        <path d="M15 29 H35 L31 45 L27 63 L26 77 H24 L23 63 L19 45 Z" fill="#fffdf8" stroke={INK} strokeWidth="2.3" />
+        <path d="M20 61 H30 L28 68 H22 Z" fill="#d8d9df" stroke={INK} strokeWidth="1.8" />
+        <circle cx="25" cy="84" r="4" fill={color} stroke={INK} strokeWidth="1.8" />
       </>}
 
       {kind === "fountain" && <>
-        <path d="M10 5 H26 V12 H10 Z" fill={VIOLET} stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M10 12 H26 V15 H10 Z" fill="#a795ff" stroke={OUTLINE} strokeWidth="1.4" />
-        <path d="M11 15 H25 L22.5 25 H13.5 Z" fill="#272633" stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M13.5 25 H22.5 L25 33 L18 44 L11 33 Z" fill={GOLD} stroke={OUTLINE} strokeWidth="1.8" />
-        <circle cx="18" cy="32" r="2.2" fill={OUTLINE} />
-        <path d="M16.5 38 L18 45 L19.5 38 Z" fill={color} stroke={OUTLINE} strokeWidth="1.3" />
+        <path d="M10 5 Q10 3 12 3 H38 Q40 3 40 5 V20 H10 Z" fill={VIOLET} stroke={INK} strokeWidth="2.3" />
+        <path d="M11 19 H39 V25 H11 Z" fill="#a795ff" stroke={INK} strokeWidth="1.8" />
+        <path d="M13 25 H37 V36 L34 48 H16 L13 36 Z" fill="#25242d" stroke={INK} strokeWidth="2.1" />
+        <path d="M16 47 H34 L31 58 L25 82 L19 58 Z" fill={GOLD} stroke={INK} strokeWidth="2.1" />
+        <circle cx="25" cy="59" r="3" fill={INK} />
+        <path d="M23 78 L25 88 L27 78 Z" fill={color} stroke={INK} strokeWidth="1.4" />
       </>}
 
       {kind === "pencil" && <>
-        <path d="M12 5 H24 V11 H12 Z" fill={VIOLET} stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M12 11 H24 V23 H12 Z" fill="#fffdf8" stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M12 21 L15 24 L18 21 L21 24 L24 21 V28 L21 31 L18 28 L15 31 L12 28 Z" fill={GOLD} stroke={OUTLINE} strokeWidth="1.5" />
-        <path d="M12 29 H24 L18 44 Z" fill="#d8d9df" stroke={OUTLINE} strokeWidth="1.7" />
-        <path d="M16.3 39.5 L18 45 L19.7 39.5 Z" fill={color} stroke={OUTLINE} strokeWidth="1" />
-        <path d="M13.5 13 V19" stroke="#d7d5e3" strokeWidth="1" />
+        <path d="M11 5 Q11 3 13 3 H37 Q39 3 39 5 V17 H11 Z" fill={VIOLET} stroke={INK} strokeWidth="2.2" />
+        <path d="M11 17 H39 V25 H11 Z" fill="#a795ff" stroke={INK} strokeWidth="1.8" />
+        <path d="M12 25 H38 V51 L34 56 L30 51 L26 56 L22 51 L18 56 L12 51 Z" fill="#fffdf8" stroke={INK} strokeWidth="2.1" />
+        <path d="M12 51 L17 56 L21 51 L25 56 L29 51 L33 56 L38 51 V62 H12 Z" fill={GOLD} stroke={INK} strokeWidth="1.8" />
+        <path d="M13 62 H37 L25 86 Z" fill="#d8d9df" stroke={INK} strokeWidth="2" />
+        <path d="M22.5 81 L25 90 L27.5 81 Z" fill={color} stroke={INK} strokeWidth="1.3" />
       </>}
 
       {kind === "marker" && <>
-        <path d="M10 5 H26 V12 H10 Z" fill="#252633" stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M10 12 H26 V15 H10 Z" fill={GOLD} stroke={OUTLINE} strokeWidth="1.5" />
-        <path d="M10 15 H26 V32 H10 Z" fill="#ffe97b" stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M13 18 V29" stroke="#fff8cc" strokeWidth="1.7" />
-        <path d="M10 32 H26 L18 43 Z" fill={color} stroke={OUTLINE} strokeWidth="1.8" />
-        <path d="M16.5 41 L18 46 L19.5 41 Z" fill={OUTLINE} />
+        <path d="M7 5 Q7 3 10 3 H40 Q43 3 43 5 V25 H7 Z" fill="#25242d" stroke={INK} strokeWidth="2.2" />
+        <path d="M8 23 H42 V29 H8 Z" fill={GOLD} stroke={INK} strokeWidth="1.8" />
+        <path d="M9 29 H41 L37 49 L32 63 L27 73 V82 L20 88 L17 81 V72 L13 63 L9 49 Z" fill="#ffe97b" stroke={INK} strokeWidth="2.2" />
+        <path d="M13 34 V56" stroke="#fff8cc" strokeWidth="2" />
+        <path d="M18 73 H32 V82 L25 89 L18 82 Z" fill={color} stroke={INK} strokeWidth="1.7" />
       </>}
     </g>
   </svg>;

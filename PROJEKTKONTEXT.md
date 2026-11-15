@@ -31,7 +31,7 @@ XNTS steht für Xnotes. Die offizielle Web- und Installationsversion ist derzeit
 - Der Funktionsknopf `f(x)` und Textfelder mit `f(x) = ...` zeigen lokale interaktive Graphen mit Zoom und x-/Funktionswertanzeige. Handschrift und PDF-Formeln werden noch nicht automatisch erkannt.
 - Ausgewählte Vektorstriche werden im Labor als Skizzenvorschau angezeigt. Einfach wirkende RC-Schaltungen können in den bestehenden RC-Tiefpass übernommen werden; Bauteilwerte müssen manuell geprüft werden. Es gibt noch keinen allgemeinen Schaltungslöser und keine Erkennung von Bild-/PDF-Schaltplänen.
 - Finger-Pan startet nach etwa 3 px Bewegung; die frühere mehrsekündige Wartezone nach dem Schreiben wurde entfernt. Surface-Pen und Finger müssen gemeinsam auf echter Hardware geprüft werden.
-- Die Werkzeugleiste ist einfarbig dunkles Ockergelb ohne Verlauf; Stiftprofile zeigen freigestellte SVG-Stickerzeichnungen im Stil der gewählten klassischen Vorlage. Die Seitenliste ist eine nummerierte Liste.
+- Die Werkzeugleiste ist einfarbig dunkles Ockergelb ohne Verlauf; die vier kompakten, freigestellten Stiftköpfe folgen der klassischen XNTS-Vorlage und zeigen die ausgewählte Strichfarbe an der Spitze. Die Seitenliste ist eine nummerierte Liste.
 - Responsive Oberfläche, Hell- und Dunkelmodus, PWA-Installation und Offline-Nutzung.
 
 ## Lerngruppen und Infrastruktur

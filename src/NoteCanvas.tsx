@@ -2056,7 +2056,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
         <span className="shrink-0 text-xs font-semibold text-slate-500">Meine Stifte</span>
         {penProfiles.map((p) => <button key={p.id} type="button" aria-pressed={activePen.id === p.id} onClick={() => choosePen(p)}
           title={`${p.name} · ${p.size.toFixed(1)} px`} className={`notiz-pen-preset inline-flex shrink-0 items-center ${activePen.id === p.id ? "is-active" : ""}`}>
-          <PenGlyph kind={p.kind} color={p.color} className="notiz-pen-preset__glyph" />
+          <PenGlyph kind={p.kind} color={p.id === activePen.id ? color : p.color} className="notiz-pen-preset__glyph" />
           <span className="notiz-pen-preset__name">{p.name}</span>
           <span className="notiz-pen-preset__nib" style={{ backgroundColor: p.color }} />
         </button>)}
