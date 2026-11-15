@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "XNTS",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "identifier": "de.notizraum.app",
   "build": {
     "beforeDevCommand": "pnpm dev -- --host 127.0.0.1",
@@ -37,6 +37,6 @@
     ],
     "category": "Productivity",
     "shortDescription": "Xnotes, PDFs und kunstinspirierte Schreibflächen",
-    "longDescription": "XNTS — Xnotes verbindet PDF-Unterlagen, eigene Schreibflächen, Skizzen und Lerngruppen. Deine Daten bleiben lokal auf dem Gerät."
+    "longDescription": "XNTS — Xnotes verbindet PDF-Unterlagen, eigene Schreibflächen, Skizzen und virtuelle Laborgeräte. Deine Daten bleiben lokal auf dem Gerät."
   }
 }

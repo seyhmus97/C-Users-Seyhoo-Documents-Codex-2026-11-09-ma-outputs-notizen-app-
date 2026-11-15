@@ -1,7 +1,7 @@
 // App.tsx – Bibliothek mit beliebig tiefen Ordnern; jede Notiz ist eine eigene unendliche Leinwand
 import { useEffect, useRef, useState } from "react";
 import { useRegisterSW } from "virtual:pwa-register/react";
-import NoteCanvas, { kvAll, kvDel, kvGet, kvReplaceAll, kvSet, rasterKey } from "./NoteCanvas";
+import NoteCanvas, { flushNote, kvAll, kvDel, kvGet, kvReplaceAll, kvSet, rasterKey } from "./NoteCanvas";
 import { saveFile } from "./saveFile";
 import StudySpace from "./StudySpace";
 import Tutorial, { openTutorial } from "./Tutorial";
@@ -168,32 +168,44 @@ export default function App() {
   };
 
   const backup = async () => {
-    // Rasterbilder (pgimg:) sind abgeleitet und werden nicht gesichert; PDF-Originale können Blob oder ArrayBuffer sein
-    const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:") && k !== "app:preferences").map(async ([k, v]) => [
-      k, v instanceof Blob ? { __ab: toB64(await v.arrayBuffer()), type: v.type } : v instanceof ArrayBuffer ? { __ab: toB64(v) } : v,
-    ]));
-    const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
-    entries.push(["app:preferences", Object.fromEntries(preferenceKeys.map((k) => [k, localStorage.getItem(k)]))]);
-    await saveFile(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }), `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`);
+    if (!await flushNote()) {
+      alert("Die offene Notiz konnte nicht gespeichert werden. Das Backup wurde nicht erstellt, damit keine letzten Striche fehlen.");
+      return;
+    }
+    try {
+      // Rasterbilder (pgimg:) sind abgeleitet und werden nicht gesichert; PDF-Originale können Blob oder ArrayBuffer sein
+      const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:") && k !== "app:preferences").map(async ([k, v]) => [
+        k, v instanceof Blob ? { __ab: toB64(await v.arrayBuffer()), type: v.type } : v instanceof ArrayBuffer ? { __ab: toB64(v) } : v,
+      ] as [string, unknown]));
+      const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
+      entries.push(["app:preferences", Object.fromEntries(preferenceKeys.map((k) => [k, localStorage.getItem(k)]))]);
+      await saveFile(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }), `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`);
+    } catch { alert("Das Backup konnte nicht erstellt werden. Prüfe den Gerätespeicher und versuche es erneut."); }
   };
   const restore = async (f: File) => {
     try {
       const d = JSON.parse(await f.text());
       if (d?.app !== "notizen" || !Array.isArray(d.entries) || !d.entries.every((e: unknown) => Array.isArray(e) && typeof e[0] === "string")) throw new Error();
-      if (!d.entries.some((e: [string]) => e[0] === "tree")) throw new Error();
+      const treeEntry = d.entries.find((e: [string]) => e[0] === "tree") as [string, { nodes?: unknown }] | undefined;
+      if (!treeEntry || !Array.isArray(treeEntry[1]?.nodes)) throw new Error();
       if (!confirm("Alle Notizen auf diesem Gerät werden durch das Backup ersetzt. Fortfahren?")) return;
       const entries: [string, unknown][] = d.entries.map(([k, v]: [string, unknown]): [string, unknown] => [k, v && typeof v === "object" && "__ab" in v ? (() => { const o = v as { __ab: string; type?: string }, ab = fromB64(o.__ab); return o.type ? new Blob([ab], { type: o.type }) : ab; })() : v]);
+      (window as unknown as { restoring: boolean }).restoring = true; ready.current = false;
+      await kvReplaceAll(entries.filter(([k]) => k !== "app:preferences"));
       const preferences = entries.find(([k]) => k === "app:preferences")?.[1];
       if (preferences && typeof preferences === "object") {
         const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"]);
         for (const [key, value] of Object.entries(preferences)) if (allowed.has(key)) {
-          if (typeof value === "string") localStorage.setItem(key, value); else localStorage.removeItem(key);
+          try { if (typeof value === "string") localStorage.setItem(key, value); else localStorage.removeItem(key); }
+          catch { /* Notizen wurden bereits atomar wiederhergestellt; eine lokale UI-Einstellung darf den Erfolg nicht als Backup-Fehler melden. */ }
         }
       }
-      (window as unknown as { restoring: boolean }).restoring = true; ready.current = false;
-      await kvReplaceAll(entries.filter(([k]) => k !== "app:preferences"));
       location.reload();
-    } catch { alert("Diese Datei ist kein gültiges Notizen-Backup."); }
+    } catch (err) {
+      (window as unknown as { restoring: boolean }).restoring = false; ready.current = true; // App bleibt nutzbar, die alten Notizen sind unverändert
+      const storageError = err instanceof DOMException || (err instanceof Error && /IndexedDB|Speicher|Transaktion/i.test(err.message));
+      alert(storageError ? "Das Backup konnte nicht eingespielt werden (Speicher voll oder nicht lesbar). Deine bisherigen Notizen sind unverändert." : "Diese Datei ist kein gültiges Notizen-Backup.");
+    }
   };
 
   const Btn = ({ on, children }: { on: () => void; children: React.ReactNode }) => (
@@ -303,7 +315,7 @@ export default function App() {
         {GROUPS_ENABLED && studySpace ? (
           <StudySpace onBack={() => setStudySpace(false)} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
         ) : active && byId(active) ? (
-          <NoteCanvas key={active} noteId={active} title={pathOf(active)} onLibrary={() => setLib(!lib)} onFocusChange={onNoteFocus} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
+          <NoteCanvas key={active} noteId={active} title={pathOf(active)} libraryOpen={lib} onLibrary={setLib} onFocusChange={onNoteFocus} darkMode={darkMode} theme={theme} onThemeChange={setTheme} onBackup={backup} onRestore={() => restoreInput.current?.click()} />
         ) : (
           <div className="m-auto text-center text-slate-500 space-y-3">
             <p>Wähle ein Thema oder lege eine Notiz an.</p>

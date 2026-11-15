@@ -1189,32 +1189,67 @@ select {
   background: rgb(87 56 223 / 75%);
 }
 
-/* ───────── A4-Seitengrenzen ───────── */
+/* ───────── A4-Seitengrenzen: weiche Seitenkante mit kleinem Seitenschild ───────── */
 .xnts-a4-break {
   position: absolute;
   left: 0;
   z-index: 1;
   width: 794px;
   height: 0;
-  border-top: 2px dashed rgb(14 165 233 / 85%);
   pointer-events: none;
+}
+
+/* sanfter Schatten wie bei zwei aneinanderstoßenden Blättern */
+.xnts-a4-break::before {
+  content: "";
+  position: absolute;
+  inset: calc(-9px * var(--a4-s, 1)) 0 auto 0;
+  height: calc(18px * var(--a4-s, 1));
+  background: linear-gradient(to bottom, rgb(87 56 223 / 0%) 0%, rgb(87 56 223 / 7%) 42%, rgb(87 56 223 / 13%) 50%, rgb(87 56 223 / 7%) 58%, rgb(87 56 223 / 0%) 100%);
+}
+
+/* feine Linie, die zu den Rändern hin ausläuft */
+.xnts-a4-break::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(var(--a4-line, 1.5px) / -2);
+  height: var(--a4-line, 1.5px);
+  background: linear-gradient(90deg, rgb(87 56 223 / 0%), rgb(87 56 223 / 55%) 10%, rgb(87 56 223 / 55%) 90%, rgb(87 56 223 / 0%));
 }
 
 .xnts-a4-break span {
   position: absolute;
-  top: 3px;
-  padding: 0 .4em;
-  border-radius: 3px;
-  background: rgb(255 255 255 / 80%);
-  color: #0369a1;
+  top: 0;
+  right: 14px;
+  transform: translateY(-50%) scale(var(--a4-s, 1));
+  transform-origin: right center;
+  padding: .15em .75em;
+  border: 1px solid rgb(87 56 223 / 35%);
+  border-radius: 999px;
+  background: #fffdf4;
+  color: #5738df;
+  font-size: 11px;
   font-weight: 700;
-  line-height: 1.5;
+  letter-spacing: .02em;
+  line-height: 1.4;
   white-space: nowrap;
+  box-shadow: 0 1px 3px rgb(25 22 32 / 12%);
+}
+
+.notiz-workspace[data-theme="dark"] .xnts-a4-break::before {
+  background: linear-gradient(to bottom, rgb(167 139 250 / 0%) 0%, rgb(167 139 250 / 10%) 42%, rgb(167 139 250 / 18%) 50%, rgb(167 139 250 / 10%) 58%, rgb(167 139 250 / 0%) 100%);
+}
+
+.notiz-workspace[data-theme="dark"] .xnts-a4-break::after {
+  background: linear-gradient(90deg, rgb(167 139 250 / 0%), rgb(167 139 250 / 65%) 10%, rgb(167 139 250 / 65%) 90%, rgb(167 139 250 / 0%));
 }
 
 .notiz-workspace[data-theme="dark"] .xnts-a4-break span {
-  background: rgb(17 24 39 / 85%);
-  color: #7dd3fc;
+  border-color: rgb(167 139 250 / 45%);
+  background: #1f1b34;
+  color: #c4b5fd;
 }
 
 /* ───────── PDF-Seiten löschen (nur im Löschmodus) ───────── */
@@ -1650,6 +1685,38 @@ select {
 .notiz-pen-preset__name { max-width: 76px; overflow: hidden; color: #30250f; font-size: 8px; line-height: 1.05; text-overflow: ellipsis; white-space: nowrap; }
 .notiz-pen-preset__nib { width: 9px; height: 2px; margin-top: 2px; border-radius: 2px; }
 
+/* Funktions- und Ansichtsgruppen öffnen sich als klare Zusatzzeile unter der Toolbar. */
+.notiz-workspace .notiz-toolbar[data-menu-open="true"] {
+  flex-wrap: wrap !important;
+  overflow: visible !important;
+}
+.notiz-toolbar__menu-trigger { display: inline-flex; flex: 0 0 auto; align-items: center; }
+.notiz-toolbar__menu-button { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; }
+.notiz-toolbar__panel {
+  display: flex;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid rgb(59 48 32 / 35%);
+  border-radius: 8px;
+  background: #fff8dc;
+  color: #191620;
+  box-shadow: 0 5px 16px rgb(25 22 32 / 12%);
+}
+.notiz-toolbar__panel-group { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.notiz-toolbar__panel-label { margin-right: 3px; color: #3b3020; font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.notiz-toolbar__panel select { min-height: 32px; }
+.notiz-toolbar__panel-file { display: inline-flex; min-height: 32px; align-items: center; padding: 4px 10px; border: 1px solid rgb(25 22 32 / 20%); border-radius: 7px; background: rgb(255 253 244 / 82%); color: #30250f; font-size: 13px; }
+.notiz-toolbar__zoom-group input[type="range"] { width: clamp(90px, 20vw, 210px); }
+@media (max-width: 1279px) {
+  .notiz-workspace .notiz-toolbar[data-menu-open="true"] { flex-direction: column; flex-wrap: nowrap !important; align-items: stretch; gap: 0; }
+  .notiz-workspace .notiz-toolbar[data-menu-open="true"] .notiz-toolbar__row { display: flex !important; flex: 0 0 42px; width: 100%; min-width: 0; overflow-x: auto; overflow-y: hidden; }
+  .notiz-workspace .notiz-toolbar[data-menu-open="true"] .notiz-toolbar__panel { flex: 0 0 auto; }
+}
+
 .xnts-function-plot {
   position: relative;
   z-index: 18;
@@ -1704,3 +1771,14 @@ select {
 .notiz-function-dialog__actions { display: flex; justify-content: flex-end; gap: 7px; }
 .notiz-function-dialog__actions button { min-height: 36px; padding: 0 12px; border: 1px solid #5c4c17; border-radius: 6px; background: #705d1d; color: #fff9e6; font-size: 12px; font-weight: 700; }
 .notiz-function-dialog__actions button:first-child { background: #fff; color: #30270f; }
+.xnts-function-plot__controls button.is-on { background: #5738df; border-color: #5738df; color: #fff; }
+.xnts-function-plot__area { fill: rgb(87 56 223 / 24%); stroke: none; }
+.xnts-function-plot__area--neg { fill: rgb(234 130 30 / 30%); }
+.xnts-function-plot__bound { stroke: #5738df; stroke-width: 1.6; }
+.xnts-function-plot__svg text.xnts-function-plot__boundlabel { fill: #5738df; font-weight: 700; }
+.xnts-function-plot__antiderivative { fill: none; stroke: #c9952b; stroke-width: 2; stroke-dasharray: 6 4; stroke-linecap: round; }
+.xnts-function-plot__integral { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 9px 8px; border-top: 1px solid #d8d3c5; font-size: 11px; color: #332a15; }
+.xnts-function-plot__integral label { display: inline-flex; align-items: center; gap: 4px; }
+.xnts-function-plot__integral input[type="text"], .xnts-function-plot__integral input:not([type]) { width: 58px; padding: 2px 5px; border: 1px solid #c8c3b8; border-radius: 5px; background: #fff; color: #30270f; font: inherit; }
+.xnts-function-plot__integral input[type="number"] { width: 68px; padding: 2px 5px; border: 1px solid #c8c3b8; border-radius: 5px; background: #fff; color: #30270f; font: inherit; }
+.xnts-function-plot__result { flex: 1 1 100%; margin: 0; font-size: 12px; }

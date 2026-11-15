@@ -4,7 +4,7 @@
 import { PenDiagnostic, PenPreview } from "./PenExtras";
 import { openTutorial } from "./Tutorial";
 import { GROUPS_ENABLED } from "./features";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import type { RasterIn, RasterOut } from "./pdfRaster.worker";
 import { saveFile } from "./saveFile";
@@ -13,6 +13,7 @@ import FunctionPlot from "./FunctionPlot";
 import PenGlyph from "./PenGlyph";
 import { functionExpressionFromText, parseMathExpression } from "./mathExpression";
 import { analyzeCircuitStrokes, type CircuitAnalysis } from "./circuitRecognition";
+import { junctionPoints, recognizeSymbols, type SymbolInput } from "./circuitSymbols";
 import type { PenKind } from "./penTypes";
 import { extendCollinearLine, lineAngleDegrees, snapRadians, snapToAngle, straightLineSpan } from "./lineGeometry";
 import { adjustPressure, fountainTaper, inkWidth, pencilLook, recognizePolyline, smoothInk, stabilize, trimHoldTail, type PolylineOptions } from "./inkEngine";
@@ -77,9 +78,22 @@ const db = () =>
   (_db ??= new Promise((res, rej) => {
     const r = indexedDB.open("notes", 1);
     r.onupgradeneeded = () => r.result.createObjectStore("kv");
-    r.onsuccess = () => res(r.result);
-    r.onerror = () => rej(r.error);
+    r.onsuccess = () => {
+      const d = r.result;
+      d.onversionchange = () => { d.close(); _db = null; };
+      d.onclose = () => { _db = null; };
+      res(d);
+    };
+    r.onerror = () => { _db = null; rej(r.error); };       // nächster Zugriff versucht es erneut
+    r.onblocked = () => { _db = null; rej(new Error("IndexedDB blockiert")); };
   }));
+/** Wartet auf das Ende einer Transaktion – auch Abbrüche (z. B. QuotaExceededError bei vollem Speicher) werden zum Fehler. */
+const txDone = (t: IDBTransaction) => new Promise<void>((res, rej) => {
+  t.oncomplete = () => res();
+  t.onerror = () => rej(t.error ?? new Error("IndexedDB-Fehler"));
+  t.onabort = () => rej(t.error ?? new Error("IndexedDB-Transaktion abgebrochen"));
+});
+const isQuotaError = (err: unknown) => err instanceof DOMException && (err.name === "QuotaExceededError" || err.code === 22);
 export const kvGet = async <T,>(k: string) => {
   const d = await db();
   return new Promise<T | undefined>((res, rej) => {
@@ -90,22 +104,16 @@ export const kvGet = async <T,>(k: string) => {
 };
 export const kvSet = async (k: string, v: unknown) => {
   const d = await db();
-  return new Promise<void>((res, rej) => {
-    const t = d.transaction("kv", "readwrite");
-    t.objectStore("kv").put(v, k);
-    t.oncomplete = () => res();
-    t.onerror = () => rej(t.error);
-  });
+  const t = d.transaction("kv", "readwrite"), done = txDone(t);
+  t.objectStore("kv").put(v, k);
+  return done;
 };
 
 export const kvDel = async (k: string) => {
   const d = await db();
-  return new Promise<void>((res, rej) => {
-    const t = d.transaction("kv", "readwrite");
-    t.objectStore("kv").delete(k);
-    t.oncomplete = () => res();
-    t.onerror = () => rej(t.error);
-  });
+  const t = d.transaction("kv", "readwrite"), done = txDone(t);
+  t.objectStore("kv").delete(k);
+  return done;
 };
 export const kvAll = async () => {
   const d = await db();
@@ -118,14 +126,16 @@ export const kvAll = async () => {
 };
 export const kvReplaceAll = async (entries: [string, unknown][]) => {
   const d = await db();
-  return new Promise<void>((res, rej) => {
-    const t = d.transaction("kv", "readwrite"), s = t.objectStore("kv");
-    s.clear();
-    entries.forEach(([k, v]) => s.put(v, k));
-    t.oncomplete = () => res();
-    t.onerror = () => rej(t.error);
-  });
+  const t = d.transaction("kv", "readwrite"), done = txDone(t), s = t.objectStore("kv");
+  try { s.clear(); entries.forEach(([k, v]) => s.put(v, k)); }
+  catch (err) { try { t.abort(); } catch { /* Transaktion war schon beendet */ } throw err; } // alte Daten bleiben unangetastet
+  return done;
 };
+
+/** Die gerade geöffnete Notiz: sofort speichern (z. B. vor einem Backup), ohne die 0,6 s Pause abzuwarten. */
+let flushActive: (() => Promise<boolean>) | null = null;
+let quotaWarned = false;
+export const flushNote = async () => flushActive ? flushActive() : true;
 
 /* ───────── Geometrie ───────── */
 // Formen sind normale Striche → Radieren, Lasso, Undo und Export funktionieren automatisch
@@ -423,11 +433,14 @@ const rasterizeInWorker = (buf: ArrayBuffer, onPage: (pageNum: number, numPages:
     try { w = new Worker(new URL("./pdfRaster.worker.ts", import.meta.url), { type: "module" }); }
     catch { resolve(false); return; }
     let chain: Promise<void> = Promise.resolve(); // Ablage in Reihenfolge
-    let ok = true;
-    const finish = () => { chain.then(() => { w.terminate(); resolve(ok); }); };
+    let ok = true, wd: ReturnType<typeof setTimeout>;
+    const finish = () => { clearTimeout(wd); chain.then(() => { w.terminate(); resolve(ok); }); };
+    const kick = () => { clearTimeout(wd); wd = setTimeout(() => { ok = false; finish(); }, 90_000); }; // Worker meldet sich 90 s nicht → abbrechen, Seiten werden live gezeichnet
+    kick();
     w.onmessage = (e: MessageEvent<RasterOut | undefined>) => {
       const m = e.data;
       if (!m || typeof m !== "object") return; // pdf.js im Worker sendet eigene Nachrichten: ignorieren
+      kick();
       if (m.type === "page") chain = chain.then(() => onPage(m.pageNum, m.numPages, m.blob)).catch(() => { ok = false; });
       else if (m.type === "error") { ok = false; if (m.pageNum === undefined) finish(); }
       else if (m.type === "done") finish();
@@ -595,7 +608,8 @@ function MouseScrollbar({ getEl, contentKey }: { getEl: () => HTMLDivElement | n
   return <div className="xnts-scrollbar" aria-hidden="true"><div className="xnts-scrollbar__thumb" style={{ top: m.top, height: m.size }} onPointerDown={startDrag} /></div>;
 }
 
-export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, onThemeChange, onBackup, onRestore, compact, readOnly, onFocusChange }: { noteId: string; title?: string; onLibrary?: () => void; darkMode: boolean; theme: ThemePreference; onThemeChange: (theme: ThemePreference) => void; onBackup: () => void; onRestore: () => void; /** Lernraum: ohne Kunstbanner, damit die Notizfläche mehr Platz bekommt */ compact?: boolean; /** Nur ansehen (z. B. Gruppenmitglied ohne Schreibrecht): scrollen, zoomen, Seiten wechseln – aber nichts verändern */ readOnly?: boolean; /** meldet den Fokusmodus nach außen, damit Bibliothek bzw. Gruppenleisten mit ausgeblendet werden */ onFocusChange?: (on: boolean) => void }) {
+export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = false, darkMode, theme, onThemeChange, onBackup, onRestore, compact, readOnly, onFocusChange }: { noteId: string; title?: string; onLibrary?: (show: boolean) => void; libraryOpen?: boolean; darkMode: boolean; theme: ThemePreference; onThemeChange: (theme: ThemePreference) => void; onBackup: () => void; onRestore: () => void; /** Lernraum: ohne Kunstbanner, damit die Notizfläche mehr Platz bekommt */ compact?: boolean; /** Nur ansehen (z. B. Gruppenmitglied ohne Schreibrecht): scrollen, zoomen, Seiten wechseln – aber nichts verändern */ readOnly?: boolean; /** meldet den Fokusmodus nach außen, damit Bibliothek bzw. Gruppenleisten mit ausgeblendet werden */ onFocusChange?: (on: boolean) => void }) {
+  const toolbarId = useId();
   const [blocks, setBlocks] = useState<Block[]>([{ id: uid(), kind: "blank", height: 1600, gap: 0 }]);
   const [tool, setTool] = useState<Tool>("pen");
   const [eraseMode, setEraseMode] = useState<"pixel" | "stroke">("pixel");
@@ -638,6 +652,24 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const [circuitAnalysis, setCircuitAnalysis] = useState<CircuitAnalysis | null>(null);
   const [functionDialog, setFunctionDialog] = useState(false);
   const [functionDraft, setFunctionDraft] = useState("x^2");
+  const [functionAnchor, setFunctionAnchor] = useState<{ x: number; y: number } | null>(null);
+  const [functionMenuOpen, setFunctionMenuOpen] = useState(false);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const functionMenuTriggerRef = useRef<HTMLDivElement>(null);
+  const viewMenuTriggerRef = useRef<HTMLDivElement>(null);
+  const functionMenuPanelRef = useRef<HTMLDivElement>(null);
+  const viewMenuPanelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!functionMenuOpen && !viewMenuOpen) return;
+    const closeOutside = (e: PointerEvent) => {
+      const target = e.target;
+      const inFunction = functionMenuOpen && (functionMenuTriggerRef.current?.contains(target as Node) || functionMenuPanelRef.current?.contains(target as Node));
+      const inView = viewMenuOpen && (viewMenuTriggerRef.current?.contains(target as Node) || viewMenuPanelRef.current?.contains(target as Node));
+      if (!inFunction && !inView) { setFunctionMenuOpen(false); setViewMenuOpen(false); }
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => document.removeEventListener("pointerdown", closeOutside);
+  }, [functionMenuOpen, viewMenuOpen]);
   const collapseKey = compact ? "xnts-study-toolbar-collapsed" : "notizraum-toolbar-collapsed";
   const [toolbarCollapsed, setToolbarCollapsed] = useState(() => {
     try {
@@ -700,6 +732,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   const anchor = useRef<{ dx: number; dy: number; cx: number; cy: number } | null>(null);
   const loaded = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const loadWarn = useRef(""); // Hinweis vom Laden (z. B. unlesbare PDF) bleibt sichtbar statt sofort von „Gespeichert“ überschrieben zu werden
   const smartHoldTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const rawBeforeSmartSnap = useRef<Stroke | null>(null);
   const gestureOn = useRef(false);                 // Stift/Maus berührt gerade die Fläche
@@ -751,12 +784,26 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     catch (error) { flash(error instanceof Error ? error.message : "Diese Funktion kann ich noch nicht lesen."); return; }
     const sc = scRef.current;
     if (!sc) return;
-    const r = sc.getBoundingClientRect(), d = toDoc(r.left + r.width / 2, r.top + r.height / 2), block = blockAt(d.y), top = topsRef.current[block.id] ?? 0;
-    const field: TextField = { id: uid(), blockId: block.id, text: `f(x) = ${expression}`, x: Math.max(24, Math.min(PAGE_W - 384, d.x - 180)), y: Math.max(24, d.y - top - 30), width: 360, height: 34, fontSize: 20, color, role: "function", functionExpression: expression };
+    const r = sc.getBoundingClientRect(), view = toDoc(r.left + r.width / 2, r.top + r.height / 2);
+    const d = functionAnchor ?? { x: view.x - 180, y: view.y - 30 };
+    const block = blockAt(d.y), top = topsRef.current[block.id] ?? 0;
+    const field: TextField = { id: uid(), blockId: block.id, text: `f(x) = ${expression}`, x: Math.max(24, Math.min(PAGE_W - 384, d.x)), y: Math.max(24, d.y - top), width: 360, height: 34, fontSize: 20, color, role: "function", functionExpression: expression };
     const beforeFunction = snap();
     textFields.current = [...textFields.current, field];
     pushHist(beforeFunction); bump(); schedule(); markDirty();
-    setFunctionDialog(false); setTool("text"); flash("Funktion und interaktiver Graph eingefügt");
+    setFunctionDialog(false); setFunctionAnchor(null); setTool("text"); flash("Funktion und interaktiver Graph eingefügt");
+  };
+  const openFunctionForSelection = () => {
+    const selected = strokes.current.filter((s) => sel.current.has(s.id) && s.tool === "pen");
+    if (selected.length) {
+      let x0 = Infinity, y1 = -Infinity;
+      for (const s of selected) {
+        const top = topsRef.current[s.blockId] ?? 0;
+        for (const p of s.pts) { x0 = Math.min(x0, p.x); y1 = Math.max(y1, p.y + top); }
+      }
+      setFunctionAnchor(Number.isFinite(x0) && Number.isFinite(y1) ? { x: x0, y: y1 + 20 } : null);
+    } else setFunctionAnchor(null);
+    setFunctionDialog(true); setFunctionMenuOpen(false);
   };
   const analyzeSelection = () => analyzeCircuitStrokes(strokes.current.filter((s) => sel.current.has(s.id) && s.tool === "pen").map((s) => {
     const top = topsRef.current[s.blockId] ?? 0;
@@ -764,10 +811,40 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   }));
   const perfectSelected = () => {
     const beforeSelection = snap(); let changed = 0;
+    const selected = strokes.current.filter((s) => sel.current.has(s.id) && s.tool === "pen");
+    const selectedInput: SymbolInput[] = selected.map((s) => {
+      const top = topsRef.current[s.blockId] ?? 0;
+      return { id: s.id, pts: s.pts.map((p) => ({ x: p.x, y: p.y + top })) };
+    });
+    const symbols = circuitAssistEnabled ? recognizeSymbols(selectedInput) : null;
+    const foundCount = symbols ? Object.values(symbols.found).reduce((sum, n) => sum + n, 0) : 0;
+    const symbolSources = new Map(selected.map((s) => [s.id, s]));
+    const removed = foundCount ? symbols!.remove : new Set<string>();
+    const generated: Stroke[] = [], leadUpdates = new Map<string, Stroke>();
+    // Bauteile werden auf dem Gerät geometrisch erkannt und neu gezeichnet. Jedes
+    // Ersatzteil übernimmt Farbe und Stiftart seiner handgezeichneten Vorlage.
+    if (foundCount && symbols) {
+      for (const lead of symbols.leads) {
+        const source = symbolSources.get(lead.id);
+        if (!source || removed.has(lead.id)) continue;
+        const top = topsRef.current[source.blockId] ?? 0, pts = source.pts.map((p) => ({ ...p }));
+        const index = lead.end === 0 ? 0 : pts.length - 1;
+        pts[index] = { ...pts[index], x: lead.to.x, y: lead.to.y - top };
+        leadUpdates.set(lead.id, { ...source, pts, raw: true, auto: undefined });
+        changed++;
+      }
+      for (const replacement of symbols.add) {
+        const source = symbolSources.get(replacement.from);
+        if (!source) continue;
+        const top = topsRef.current[source.blockId] ?? 0;
+        generated.push({ ...source, id: uid(), pts: replacement.pts.map((p) => ({ x: p.x, y: p.y - top, p: 0.5 })), raw: true, auto: undefined, lineStyle: "solid" });
+        changed++;
+      }
+    }
     // 1) Jeden markierten Strich einzeln begradigen: Linie, Leitung mit Knicken, Rechteck, Dreieck, Kreis
-    const cleaned = new Map<string, Stroke>(), items: TidyItem[] = [];
+    const cleaned = new Map<string, Stroke>(leadUpdates), items: TidyItem[] = [];
     for (const s of strokes.current) {
-      if (!sel.current.has(s.id) || s.tool !== "pen") continue;
+      if (!sel.current.has(s.id) || s.tool !== "pen" || removed.has(s.id)) continue;
       const top = topsRef.current[s.blockId] ?? 0, abs = (st: Stroke) => st.pts.map((p) => ({ x: p.x, y: p.y + top }));
       if (isCleanLine(s)) { items.push({ id: s.id, kind: "fixed", pts: abs(s) }); continue; } // bewusst eingestellte Winkel bleiben erhalten
       if (s.raw) { // bereits geglättete Formen: nicht erneut umformen, nur aneinander ausrichten
@@ -796,12 +873,29 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
         cleaned.set(s.id, { ...base, pts: pts.map((p, i) => ({ x: p.x, y: p.y - top, p: base.pts[i].p })), raw: true }); changed++;
       }
     }
+    // T-Verbindungen werden als gefüllte Lötpunkte ergänzt. Nur lange, nahezu
+    // gerade Striche zählen als Leitungen; kurze Handschrift bleibt unangetastet.
+    if (circuitAssistEnabled && selectedInput.length > 1) {
+      const wirePaths = selectedInput.filter((s) => !removed.has(s.id) && s.pts.length >= 2).flatMap((s) => {
+        const a = s.pts[0], z = s.pts[s.pts.length - 1], direct = Math.hypot(z.x - a.x, z.y - a.y);
+        if (direct < 40) return [];
+        const deviation = Math.max(...s.pts.map((p) => Math.abs((p.x - a.x) * (z.y - a.y) - (p.y - a.y) * (z.x - a.x)) / direct));
+        return deviation <= Math.max(5, direct * 0.12) ? [[a, z]] : [];
+      });
+      const dotColor = selected[0]?.color ?? color, dotSource = selected[0], junctions = junctionPoints(wirePaths);
+      if (dotSource) for (const p of junctions) generated.push({
+        ...dotSource, id: uid(), color: dotColor, size: Math.max(5, dotSource.size * 1.8),
+        pts: [{ x: p.x, y: p.y - (topsRef.current[dotSource.blockId] ?? 0), p: 0.5 }], raw: true, auto: undefined, lineStyle: "solid",
+      });
+      changed += junctions.length;
+    }
     if (changed) {
-      strokes.current = strokes.current.map((s) => cleaned.get(s.id) ?? s);
-      pushHist(beforeSelection); schedule();
-      const skipped = [...sel.current].filter((id) => strokes.current.some((s) => s.id === id && !s.raw)).length;
+      strokes.current = strokes.current.flatMap((s) => removed.has(s.id) ? [] : [cleaned.get(s.id) ?? s]).concat(generated);
+      sel.current = new Set([...sel.current].filter((id) => !removed.has(id)).concat(generated.map((s) => s.id)));
+      pushHist(beforeSelection); schedule(); markDirty();
       const analysis = analyzeSelection(); setCircuitAnalysis(analysis);
-      flash(`Schaltbild geprüft: ${analysis?.summary ?? `${cleaned.size} Striche`} · ${cleaned.size} geglättet${skipped ? ` · ${skipped} unverändert` : ""} · Rückgängig mit Strg+Z`);
+      const recognized = foundCount ? ` · ${foundCount} Bauteile neu gezeichnet` : "";
+      flash(`Schaltbild geprüft: ${analysis?.summary ?? `${cleaned.size} Striche`}${recognized} · Rückgängig mit Strg+Z`);
       setSaved("Schaltbild und Grundformen geglättet");
     } else {
       const analysis = analyzeSelection(); setCircuitAnalysis(analysis);
@@ -892,34 +986,60 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   /* ───── Speichern / Laden ───── */
   const save = useCallback(async () => {
-    try { if ((window as unknown as { restoring?: boolean }).restoring) return; await kvSet("note:" + noteId, { blocks: blocksRef.current, strokes: strokes.current, texts: textFields.current, tpl: tplRef.current }); setSaved("Gespeichert"); }
-    catch { setSaved("Speichern fehlgeschlagen"); }
+    try { if ((window as unknown as { restoring?: boolean }).restoring) return true; await kvSet("note:" + noteId, { blocks: blocksRef.current, strokes: strokes.current, texts: textFields.current, tpl: tplRef.current }); setSaved(loadWarn.current || "Gespeichert"); return true; }
+    catch (err) {
+      if (isQuotaError(err)) {
+        setSaved("Speicher voll – NICHT gespeichert!");
+        if (!quotaWarned) { quotaWarned = true; alert("Der Gerätespeicher ist voll. Diese Notiz konnte nicht gespeichert werden.\n\nBitte erst Platz schaffen (zum Beispiel ein Backup speichern und Dateien löschen)."); }
+      } else setSaved("Speichern fehlgeschlagen");
+      return false;
+    }
   }, [noteId]);
   const markDirty = useCallback(() => { setSaved("Speichert …"); clearTimeout(timer.current); timer.current = setTimeout(save, 600); }, [save]);
   useEffect(() => { if (loaded.current) markDirty(); }, [blocks, tpl, markDirty]);
   useEffect(() => {
+    let loadNote = "";
     (async () => {
       navigator.storage?.persist?.(); // verhindert, dass iPadOS/Browser die Daten selbständig löscht
-      const st = await kvGet<{ blocks: Block[]; strokes: Stroke[]; texts?: TextField[]; tpl?: Tpl }>("note:" + noteId);
-      if (st?.blocks?.length) {
-        for (const id of new Set(st.blocks.map((b) => b.docId).filter(Boolean) as string[])) {
-          const stored = await kvGet<ArrayBuffer | Blob>("pdf:" + id);
-          const bytes = stored instanceof Blob ? await stored.arrayBuffer() : stored?.slice(0);
-          if (bytes) docs.current.set(id, await (await loadPdfJs()).getDocument({ data: bytes }).promise);
+      try {
+        const st = await kvGet<{ blocks: Block[]; strokes: Stroke[]; texts?: TextField[]; tpl?: Tpl }>("note:" + noteId);
+        if (st?.blocks?.length) {
+          let unreadable = 0;
+          for (const id of new Set(st.blocks.map((b) => b.docId).filter(Boolean) as string[])) {
+            try { // eine unlesbare PDF darf die Notiz nicht blockieren: Striche und andere PDFs bleiben erhalten
+              const stored = await kvGet<ArrayBuffer | Blob>("pdf:" + id);
+              const bytes = stored instanceof Blob ? await stored.arrayBuffer() : stored?.slice(0);
+              if (!bytes) throw new Error("PDF fehlt");
+              docs.current.set(id, await (await loadPdfJs()).getDocument({ data: bytes }).promise);
+            } catch { unreadable++; }
+          }
+          if (unreadable) loadNote = unreadable === 1 ? "1 PDF konnte nicht gelesen werden – Notiz ohne diese PDF geladen" : `${unreadable} PDFs konnten nicht gelesen werden – Notiz ohne sie geladen`;
+          strokes.current = st.strokes; textFields.current = st.texts ?? []; setBlocks(st.blocks); if (st.tpl) setTplState(st.tpl);
         }
-        strokes.current = st.strokes; textFields.current = st.texts ?? []; setBlocks(st.blocks); if (st.tpl) setTplState(st.tpl);
+        await clipWrite; // laufende Schreibvorgänge zuerst abwarten
+        if (clipSize() === 0) { // nur nach einem Neustart aus der DB laden; im Speicher ist sonst alles aktueller
+          const c = await kvGet<typeof sharedClip>("clip");
+          if (c && Array.isArray(c.strokes) && Array.isArray(c.texts)) { sharedClip.noteId = c.noteId ?? ""; sharedClip.strokes = c.strokes; sharedClip.texts = c.texts; }
+        }
+        setClipCount(clipSize());
+        loaded.current = true; setReady((n) => n + 1); loadWarn.current = loadNote; setSaved(loadNote || "Gespeichert");
+      } catch {
+        // Lesen nicht möglich: loaded bleibt false, damit nichts Leeres über die gespeicherte Notiz geschrieben wird
+        setSaved("Notiz konnte nicht geladen werden – bitte App neu starten");
       }
-      await clipWrite; // laufende Schreibvorgänge zuerst abwarten
-      if (clipSize() === 0) { // nur nach einem Neustart aus der DB laden; im Speicher ist sonst alles aktueller
-        const c = await kvGet<typeof sharedClip>("clip");
-        if (c && Array.isArray(c.strokes) && Array.isArray(c.texts)) { sharedClip.noteId = c.noteId ?? ""; sharedClip.strokes = c.strokes; sharedClip.texts = c.texts; }
-      }
-      setClipCount(clipSize());
-      loaded.current = true; setReady((n) => n + 1); setSaved("Gespeichert");
     })();
-    const flush = () => { if (document.visibilityState === "hidden") save(); };
+    const flush = () => { if (document.visibilityState === "hidden") { clearTimeout(timer.current); if (loaded.current) save(); } };
+    const flushNow = () => { clearTimeout(timer.current); if (loaded.current) save(); };
+    const myFlush = async () => { clearTimeout(timer.current); return loaded.current ? save() : true; };
+    flushActive = myFlush;
     document.addEventListener("visibilitychange", flush);
-    return () => { document.removeEventListener("visibilitychange", flush); clearTimeout(timer.current); if (loaded.current) save(); };
+    window.addEventListener("pagehide", flushNow);    // Fenster schließen (Windows/Tauri), Tab schließen
+    window.addEventListener("beforeunload", flushNow);
+    return () => {
+      document.removeEventListener("visibilitychange", flush); window.removeEventListener("pagehide", flushNow); window.removeEventListener("beforeunload", flushNow);
+      if (flushActive === myFlush) flushActive = null;
+      clearTimeout(timer.current); if (loaded.current) save();
+    };
   }, [save, noteId]);
 
   /* ───── Verlauf (Undo/Redo über Snapshots; Striche sind unveränderlich) ───── */
@@ -1750,10 +1870,22 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
 
   /* ───── PDF-Import (Datei wird in IndexedDB abgelegt) ───── */
   const importPdf = async (file: File) => {
-    const buf = await file.arrayBuffer(), docId = uid();
-    await kvSet("pdf:" + docId, new Blob([buf], { type: "application/pdf" })); // Original als Blob offline sichern
-    const pdfjs = await loadPdfJs();
-    const doc = await pdfjs.getDocument({ data: buf.slice(0) }).promise;       // Vektor-Dokument: scharfes Hochzoomen, Export
+    const docId = uid();
+    setSaved("PDF wird geprüft …");
+    let doc: PDFDocumentProxy;
+    try {
+      const pdfjs = await loadPdfJs();
+      doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise; // zuerst prüfen: kaputte Dateien landen nicht in der Datenbank
+      if (!doc.numPages) throw new Error("leer");
+      await kvSet("pdf:" + docId, new Blob([file], { type: "application/pdf" })); // Original als Blob offline sichern (ohne weitere Kopie im Speicher)
+    } catch (err) {
+      try { await kvDel("pdf:" + docId); } catch { /* war nie gespeichert */ }
+      const name = err instanceof Error ? err.name : "";
+      const msg = name === "PasswordException" ? "Diese PDF ist passwortgeschützt und kann nicht importiert werden."
+        : isQuotaError(err) ? "Der Gerätespeicher ist voll – die PDF konnte nicht importiert werden."
+        : "Diese Datei ist keine lesbare PDF und wurde nicht importiert.";
+      setSaved("PDF nicht importiert"); alert(msg); return;
+    }
     docs.current.set(docId, doc);
     const nb: Block[] = [];
     for (let i = 1; i <= doc.numPages; i++) {
@@ -1765,7 +1897,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     pushHist(s0);
     // Hintergrund: Rasterbilder im Web Worker erzeugen, in IndexedDB ablegen und den fertigen Seiten melden
     setSaved("PDF wird aufbereitet …");
-    const ok = await rasterizeInWorker(buf.slice(0), async (n, total, blob) => {
+    const ok = await rasterizeInWorker(await file.arrayBuffer(), async (n, total, blob) => {
       const key = rasterKey(docId, n);
       await kvSet(key, blob);
       window.dispatchEvent(new CustomEvent("pdfraster", { detail: key }));
@@ -1777,6 +1909,10 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
   /* ───── PDF-Export: Leinwand in A4-Kacheln (794×1123 px, 2× Auflösung) ───── */
   const exportPdf = async () => {
     setSaved("Exportiere …");
+    try { await exportPdfInner(); }
+    catch (err) { setSaved(isQuotaError(err) ? "Export fehlgeschlagen: Speicher voll" : "Export fehlgeschlagen – bitte erneut versuchen"); }
+  };
+  const exportPdfInner = async () => {
     const { jsPDF } = await import("jspdf");
     const printableInk = (ink: string) => {
       if (!/^#[0-9a-f]{6}$/i.test(ink)) return ink;
@@ -1784,14 +1920,20 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.94 ? "#111827" : ink;
     };
     const S = 2, TH = 1123, bs = blocksRef.current, bmp = new Map<string, HTMLCanvasElement>();
-    for (const b of bs) {
-      const doc = b.kind === "pdf" ? docs.current.get(b.docId!) : undefined;
-      if (!doc) continue;
-      const page = await doc.getPage(b.pageNum!), base = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: (PAGE_W / base.width) * S });
-      const c = document.createElement("canvas"); c.width = vp.width; c.height = vp.height;
-      await page.render({ canvas: c, canvasContext: c.getContext("2d")!, viewport: vp } as Parameters<typeof page.render>[0]).promise;
-      bmp.set(b.id, c);
-    }
+    // PDF-Seiten werden erst für die Kachel gerendert, die sie braucht, und danach wieder freigegeben (spart Speicher bei langen PDFs)
+    const ensureBitmaps = async (y0: number) => {
+      const needed = bs.filter((b) => b.kind === "pdf" && !(topsRef.current[b.id] + b.height + b.gap < y0 || topsRef.current[b.id] > y0 + TH));
+      for (const [id, c] of bmp) if (!needed.some((b) => b.id === id)) { c.width = 0; c.height = 0; bmp.delete(id); }
+      for (const b of needed) {
+        if (bmp.has(b.id)) continue;
+        const doc = docs.current.get(b.docId!);
+        if (!doc) continue;
+        const page = await doc.getPage(b.pageNum!), base = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: (PAGE_W / base.width) * S });
+        const c = document.createElement("canvas"); c.width = vp.width; c.height = vp.height;
+        await page.render({ canvas: c, canvasContext: c.getContext("2d")!, viewport: vp } as Parameters<typeof page.render>[0]).promise;
+        bmp.set(b.id, c);
+      }
+    };
     let end = TH;
     for (const b of bs) if (b.kind === "pdf") end = Math.max(end, topsRef.current[b.id] + b.height);
     for (const s of strokes.current) end = Math.max(end, (topsRef.current[s.blockId] ?? 0) + bbox(s).y1 + 20);
@@ -1815,6 +1957,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     const pdf = new jsPDF({ unit: "px", format: [PAGE_W, TH], hotfixes: ["px_scaling"] }), pages = Math.ceil(end / TH);
     for (let i = 0; i < pages; i++) {
       const y0 = i * TH, cv = document.createElement("canvas");
+      await ensureBitmaps(y0);
       cv.width = PAGE_W * S; cv.height = TH * S;
       const ctx = cv.getContext("2d")!;
       ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
@@ -1828,7 +1971,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
           if (b.gap > 0) drawTpl(ctx, t + b.height, b.gap);
         } else drawTpl(ctx, t, b.height);
       }
-      strokes.current.forEach((s) => paint(ctx, s, 0, 0, printableInk(s.color)));
+      strokes.current.forEach((s) => {
+        const st = topsRef.current[s.blockId] ?? 0, bb = bbox(s);
+        if (st + bb.y1 < y0 - 40 || st + bb.y0 > y0 + TH + 40) return; // liegt nicht auf dieser Seite
+        paint(ctx, s, 0, 0, printableInk(s.color));
+      });
       textFields.current.forEach((t) => {
         const lh = t.fontSize * 1.375;
         let y = (topsRef.current[t.blockId] ?? 0) + t.y + 2;
@@ -1843,15 +1990,20 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
         }
       });
       pdf.addImage(cv.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, PAGE_W, TH);
+      cv.width = 0; cv.height = 0; // Kachel sofort freigeben
       if (i < pages - 1) pdf.addPage([PAGE_W, TH]);
     }
+    for (const c of bmp.values()) { c.width = 0; c.height = 0; }
     await saveFile(pdf.output("blob"), (title?.split(" › ").pop() || "Notiz") + ".pdf");
     setSaved("Exportiert");
   };
 
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !(e.target as HTMLElement)?.closest?.("textarea, input, select")) { setFocus(false); return; }
+      if (e.key === "Escape") {
+        if (functionMenuOpen || viewMenuOpen) { setFunctionMenuOpen(false); setViewMenuOpen(false); return; }
+        if (!(e.target as HTMLElement)?.closest?.("textarea, input, select")) { setFocus(false); return; }
+      }
       if (!(e.ctrlKey || e.metaKey)) return;
       if ((e.target as HTMLElement)?.closest?.("textarea, input, select")) return; // in Textfeldern gilt das native Undo
       const key = e.key.toLowerCase();
@@ -1937,7 +2089,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
     : {};
   const btn = (on: boolean) => `px-2.5 py-1.5 rounded-lg text-sm transition select-none ${on ? "bg-slate-900 text-white" : "hover:bg-slate-200 text-slate-700"}`;
   const palette = [...COLORS, ...customColors.filter((c) => !COLORS.includes(c))];
-  const tools: [Tool, string][] = [["pen", "✒ Stift"], ["highlighter", "▰ Marker"], ["eraser", "Radierer"], ["lasso", "Lasso"], ["shape", "Form"], ["text", "Text"]];
+  const tools: [Tool, string][] = [["pen", "✒ Stift"], ["highlighter", "▰ Marker"], ["eraser", "Radierer"], ["lasso", "Lasso"]];
+  const functionActive = tool === "shape" || tool === "text" || labOpen || functionDialog;
   const toolIcon = (kind: Tool) => {
     const paths: Record<Tool, React.ReactNode> = {
       pen: <><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/><path d="m14.5 7.5 3 3"/></>,
@@ -1964,25 +2117,16 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
       {/* Einheitliche dunkle Ockerleiste; die Kunstcollage sitzt dauerhaft in der Bibliothek. */}
       <div className={(compact ? "xnts-topbar xnts-topbar--plain" : "xnts-topbar") + (focus ? " xnts-hidden" : "")}>
       {!compact && <div className="xnts-art-banner__lockup xnts-topbar__lockup" aria-hidden="true"><strong>XNTS</strong><span>NOTES · STUDY · ART</span></div>}
-      <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-1.5 bg-white border-b border-slate-200 flex-wrap" data-collapsed={toolbarCollapsed}>
+      <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-1.5 bg-white border-b border-slate-200 flex-wrap" data-collapsed={toolbarCollapsed} data-menu-open={functionMenuOpen || viewMenuOpen}>
         <div className="notiz-toolbar__row notiz-toolbar__primary">
-          {onLibrary && <button className={btn(false)} onClick={onLibrary} aria-label="Bibliothek öffnen">Bibliothek</button>}
-          <button className={btn(sidebar)} onClick={() => setSidebar(!sidebar)} aria-pressed={sidebar}>Seiten</button>
-          <button className={btn(toolbarCollapsed) + " notiz-toolbar__collapse"} onClick={() => setToolbarCollapsed(!toolbarCollapsed)} aria-pressed={toolbarCollapsed} title={toolbarCollapsed ? "Werkzeugleiste ausklappen (alle Zeilen zeigen)" : "Werkzeugleiste auf eine Zeile verkleinern – mehr Platz für die Notiz"}>
-            {toolbarCollapsed ? "Leiste +" : "Leiste −"}
-          </button>
-          <button className={btn(false) + " notiz-toolbar__focus inline-flex items-center gap-1.5"} onClick={() => setFocus(true)} title="Fokus: alle Leisten ausblenden – die ganze Fläche gehört der Notiz (Esc beendet)" aria-label="Fokusmodus">{focusIcon}<span className="notiz-toolbar__tool-label">Fokus</span></button>
+          <div ref={viewMenuTriggerRef} className="notiz-toolbar__menu-trigger">
+            <button className={btn(viewMenuOpen) + " notiz-toolbar__menu-button"} onClick={() => { setViewMenuOpen((v) => !v); setFunctionMenuOpen(false); }} aria-haspopup="true" aria-expanded={viewMenuOpen} aria-controls={`${toolbarId}-view`}>
+              Ansicht <span aria-hidden="true">⌄</span>
+            </button>
+          </div>
           {readOnly && <span className="xnts-chip" title="Du kannst diese Notiz ansehen, scrollen und zoomen. Zum Mitschreiben „Meine privat“ wählen oder einen Admin um das Schreibrecht bitten.">👁 Nur ansehen</span>}
           {canEdit && <>
-          <button className={btn(false)} onClick={undo} title="Rückgängig (Strg+Z)" aria-label="Rückgängig">↶</button>
-          <button className={btn(false)} onClick={redo} title="Wiederholen (Strg+Y)" aria-label="Wiederholen">↷</button>
-          <Sep />
           {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => pickTool(t)}>{toolIcon(t)}{!toolbarCollapsed && <span className="notiz-toolbar__tool-label">{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
-          <button title="Labor: Geräte wählen, messen und virtuelle Versuche (Simulation)" aria-label="Labor" aria-pressed={labOpen} className={btn(labOpen) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => setLabOpen(!labOpen)}>
-            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 3h6M10 3v6l-5.2 9.1A2 2 0 0 0 6.5 21h11a2 2 0 0 0 1.7-2.9L14 9V3"/><path d="M7.4 15h9.2"/></svg>
-            {!toolbarCollapsed && <span className="notiz-toolbar__tool-label">Labor</span>}
-          </button>
-          <button className={btn(functionDialog) + " notiz-toolbar__tool"} onClick={() => setFunctionDialog(true)} title="Funktion f(x) eingeben und interaktiv anzeigen" aria-label="Funktion hinzufügen">f(x)</button>
           {(tool === "pen" || tool === "highlighter") && (
             <>
               <select aria-label="Stifttyp" title="Strichverhalten" className="notiz-toolbar__penopt px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
@@ -2001,13 +2145,63 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
               <option value="stroke">Ganzer Strich</option>
             </select>
           )}
-          {tool === "shape" && (
-            <select className="px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
-              <option value="rect">Rechteck</option><option value="triangle">Dreieck</option><option value="ellipse">Kreis</option><option value="line">Gerade Linie</option><option value="arrow">Pfeil</option>
-            </select>
-          )}
           </>}
+          <div ref={functionMenuTriggerRef} className="notiz-toolbar__menu-trigger">
+            <button className={btn(functionMenuOpen || functionActive) + " notiz-toolbar__menu-button"} onClick={() => { setFunctionMenuOpen((v) => !v); setViewMenuOpen(false); }} aria-haspopup="true" aria-expanded={functionMenuOpen} aria-controls={`${toolbarId}-function`} aria-pressed={functionActive}>
+              Funktion <span aria-hidden="true">⌄</span>
+            </button>
+          </div>
         </div>
+        {viewMenuOpen && <div id={`${toolbarId}-view`} ref={viewMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Ansicht einstellen">
+          <div className="notiz-toolbar__panel-group">
+            <span className="notiz-toolbar__panel-label">Bereiche</span>
+            {onLibrary && <button className={btn(libraryOpen)} aria-pressed={libraryOpen} onClick={() => onLibrary(!libraryOpen)}>{libraryOpen ? "Bibliothek ausblenden" : "Bibliothek anzeigen"}</button>}
+            <button className={btn(sidebar)} aria-pressed={sidebar} onClick={() => setSidebar((v) => !v)}>{sidebar ? "Seitenliste ausblenden" : "Seitenliste anzeigen"}</button>
+            <button className={btn(toolbarCollapsed)} aria-pressed={toolbarCollapsed} onClick={() => setToolbarCollapsed((v) => !v)}>{toolbarCollapsed ? "Leiste erweitern" : "Leiste verkleinern"}</button>
+            <button className={btn(false) + " inline-flex items-center gap-1.5"} onClick={() => { setViewMenuOpen(false); setFocus(true); }} title="Alle Leisten ausblenden – Esc beendet den Fokusmodus">{focusIcon} Fokusmodus</button>
+          </div>
+          {canEdit && <div className="notiz-toolbar__panel-group">
+            <span className="notiz-toolbar__panel-label">Verlauf</span>
+            <button className={btn(false)} onClick={undo} title="Rückgängig (Strg+Z)" aria-label="Rückgängig">↶ Rückgängig</button>
+            <button className={btn(false)} onClick={redo} title="Wiederholen (Strg+Y)" aria-label="Wiederholen">↷ Wiederholen</button>
+          </div>}
+          <div className="notiz-toolbar__panel-group notiz-toolbar__zoom-group">
+            <span className="notiz-toolbar__panel-label">Zoom</span>
+            <button className={btn(false)} onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
+            <button className={btn(false)} onClick={() => setZoom(1)} title="Auf 100 Prozent setzen (Strg+0)">{Math.round(zoom * 100)}%</button>
+            <button className={btn(false)} onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
+            <input type="range" min={MIN_Z} max={MAX_Z} step={0.05} value={zoom} onChange={(e) => setZoom(+e.target.value)} aria-label="Zoomstufe" />
+            <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
+          </div>
+        </div>}
+        {functionMenuOpen && <div id={`${toolbarId}-function`} ref={functionMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Funktionen">
+          {canEdit && <>
+            <div className="notiz-toolbar__panel-group">
+              <span className="notiz-toolbar__panel-label">Werkzeuge</span>
+              <button className={btn(tool === "shape")} aria-pressed={tool === "shape"} onClick={() => setTool("shape")}>{toolIcon("shape")} Form</button>
+              <select aria-label="Form auswählen" title="Zu zeichnende Form" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
+                <option value="rect">Rechteck</option><option value="triangle">Dreieck</option><option value="ellipse">Kreis</option><option value="line">Gerade Linie</option><option value="arrow">Pfeil</option>
+              </select>
+              <button className={btn(tool === "text")} aria-pressed={tool === "text"} onClick={() => { setTool("text"); setFunctionMenuOpen(false); }}>{toolIcon("text")} Text</button>
+              <button className={btn(labOpen)} aria-pressed={labOpen} onClick={() => { setLabOpen((v) => !v); setFunctionMenuOpen(false); }} title="Geräte wählen und virtuelle Versuche durchführen">⚗ Labor</button>
+              <button className={btn(functionDialog)} onClick={openFunctionForSelection} title="Funktion f(x) eingeben und interaktiv anzeigen">f(x)</button>
+            </div>
+            <div className="notiz-toolbar__panel-group">
+              <span className="notiz-toolbar__panel-label">Seite</span>
+              <select value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
+                <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
+              </select>
+              <label className="notiz-toolbar__panel-file cursor-pointer">
+                PDF importieren
+                <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
+              </label>
+            </div>
+          </>}
+          <div className="notiz-toolbar__panel-group">
+            <span className="notiz-toolbar__panel-label">PDF</span>
+            <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
+          </div>
+        </div>}
         {canEdit && <div className="notiz-toolbar__row notiz-toolbar__ink">
           {(tool === "pen" || tool === "shape") && <div className="notiz-toolbar__lines flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5" aria-label="Linienstil">
             {LINE_STYLES.map((s) => <button key={s.id} title={s.title} aria-label={s.title} onClick={() => setLineStyle(s.id)} className={`rounded px-1.5 py-1 text-xs font-mono ${lineStyle === s.id ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}>{s.label}</button>)}
@@ -2026,25 +2220,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
           {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Auswahl als Schaltbild prüfen und klare Leitungen und Grundformen glätten">Schaltbild erkennen &amp; glätten</button>}
         </div>}
         <div className="notiz-toolbar__row notiz-toolbar__document">
-          <Sep />
-          <button className={btn(false)} onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
-          <button className={btn(false)} onClick={() => setZoom(1)} title="Strg+0">{Math.round(zoom * 100)} %</button>
-          <button className={btn(false)} onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
-          <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
-          {canEdit && <Sep />}
           {canEdit && <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>}
           {canEdit && hasPdf && <button className={btn(pdfDeleteMode) + " notiz-toolbar__pdf-delete"} aria-pressed={pdfDeleteMode} onClick={togglePdfDeleteMode}
             title={pdfDeleteMode ? "Löschmodus beenden – PDF-Seiten können dann nicht mehr gelöscht werden" : "Löschmodus einschalten: an jeder PDF-Seite erscheint ein Löschknopf"}>
             {pdfDeleteMode ? "🗑 Löschen AN – beenden" : "🗑 PDF-Seiten löschen"}
           </button>}
-          {canEdit && <select className="px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
-            <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
-          </select>}
-          {canEdit && <label className={btn(false) + " notiz-toolbar__import cursor-pointer"}>
-            PDF importieren
-            <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
-          </label>}
-          <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
           <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
           {title && <span className="notiz-toolbar__title text-sm font-medium truncate max-w-[18rem] ml-auto">{title}</span>}
           <span className="notiz-toolbar__saved text-xs text-slate-500">{saved}</span>
@@ -2123,7 +2303,15 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
               }).map((s) => s.id));
               bump();
             }
-            if (sel.current.size > 0) perfectSelected(); else setSaved("Kein handgezeichnetes Schaltbild in der Nähe erkannt");
+            if (sel.current.size > 0) {
+              const analysis = analyzeSelection(), input = strokes.current.filter((s) => sel.current.has(s.id) && s.tool === "pen").map((s) => {
+                const top = topsRef.current[s.blockId] ?? 0;
+                return { id: s.id, pts: s.pts.map((p) => ({ x: p.x, y: p.y + top })) };
+              });
+              const symbols = circuitAssistEnabled ? recognizeSymbols(input) : null;
+              const hasSymbols = !!symbols && Object.values(symbols.found).some((n) => n > 0);
+              if (analysis?.supportsRc || hasSymbols) perfectSelected(); else openFunctionForSelection();
+            } else setSaved("Kein Inhalt in der Nähe erkannt");
           }}>
           <canvas ref={cvRef} className="sticky top-0 left-0 z-10 pointer-events-none block" />
           <div className="xnts-canvas-notice" role="status" aria-live="polite">{notice && <span>{notice}</span>}</div>
@@ -2146,8 +2334,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
                 </div>
               ))}
               {pageMarkers && pageBreaks.map((y) => (
-                <div key={"a4-" + y} className="xnts-a4-break" aria-hidden="true" style={{ top: y, borderTopWidth: Math.max(1.5, 2.5 / zoom) }}>
-                  <span style={{ fontSize: Math.max(9, 11 / zoom), right: 6 / zoom }}>A4 · Seite {Math.round(y / A4_H) + 1}</span>
+                <div key={"a4-" + y} className="xnts-a4-break" aria-hidden="true" style={{ top: y, "--a4-line": `${Math.max(1, 1.5 / zoom)}px`, "--a4-s": `${1 / Math.min(1, zoom)}` } as React.CSSProperties}>
+                  <span>Seite {Math.round(y / A4_H) + 1}</span>
                 </div>
               ))}
             </div>
@@ -2193,7 +2381,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
               <select id="settings-template" disabled={readOnly} value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} className="notiz-settings-select">
                 <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
               </select><p>Gilt für eingefügte Schreibflächen zwischen PDF-Seiten. Das Raster bleibt an der Seite verankert.</p>
-              <label className="notiz-check-row"><input type="checkbox" checked={pageMarkers} onChange={(e) => setPageMarkers(e.target.checked)} /><span><strong>A4-Seitengrenzen anzeigen</strong><small>Wird eine Schreibfläche höher als ein A4-Blatt, zeigt eine gestrichelte Linie alle 1123 px die Grenze – genau dort beginnt beim PDF-Export die nächste Seite. Über PDF-Seiten wird nichts eingezeichnet.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={pageMarkers} onChange={(e) => setPageMarkers(e.target.checked)} /><span><strong>A4-Seitengrenzen anzeigen</strong><small>Ein sanfter Schimmer und eine fein auslaufende Linie markieren alle 1123 px den Beginn der nächsten PDF-Seite. Über PDF-Seiten wird nichts eingezeichnet.</small></span></label>
             </section>
             <section className="notiz-settings-section">
               <h3>Linien &amp; Formen</h3><label htmlFor="settings-line-style">Linienstil</label>
@@ -2250,7 +2438,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, darkMode, theme, 
           <h2 id="function-dialog-title">Funktion darstellen</h2>
           <label htmlFor="function-expression">Funktionsgleichung</label>
           <input id="function-expression" autoFocus value={functionDraft} onChange={(e) => setFunctionDraft(e.target.value)} placeholder="z. B. 2(x - 3)^2 - 4" />
-          <p>Gib den Ausdruck rechts von f(x) = ein. Unterstützt werden Rechenzeichen, Klammern, Potenzen, x sowie sin, cos, tan, sqrt, abs, exp und log. Mit dem Graphen kannst du Werte ablesen und den Ausschnitt zoomen.</p>
+          <p>{functionAnchor ? "Handschrift wird lokal nicht automatisch gelesen. Tippe die Formel hier kurz ab; der interaktive Graph erscheint direkt darunter." : "Gib den Ausdruck rechts von f(x) = ein."} Unterstützt werden unter anderem x², √x, |x|, sin x, xsin(x), Rechenzeichen und Klammern. Im Graphen kannst du Werte ablesen, zoomen und ein Integral untersuchen.</p>
           <div className="notiz-function-dialog__actions"><button type="button" onClick={() => setFunctionDialog(false)}>Abbrechen</button><button type="submit">Graph einfügen</button></div>
         </form>
       </div>}

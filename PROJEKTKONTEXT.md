@@ -24,14 +24,14 @@ XNTS steht für Xnotes. Die offizielle Web- und Installationsversion ist derzeit
 - PDFs importieren, markieren und mit eigenen Papierflächen ergänzen. Blanko-, Linien-, Karoraster- und Punktraster-Vorlagen bleiben im Dokumentfluss.
 - Stiftwerkzeuge: Füller, Kugelschreiber, Bleistift, Textmarker, Lasso, Radierer, Formen und Text; anpassbare Farben, Stärken und Profile.
 - Freie Linienwinkel: im Lasso eine Linie antippen und einen Endpunkt ziehen. Das optionale 15°-Raster greift nur bei Aktivierung oder gedrückter Umschalttaste.
-- Automatisches Andocken greift nur bei nahezu exakter Flucht. Schaltbild glätten richtet geometrische Leitungen aus, ohne Handschrift oder Bögen zu begradigen; es erkennt keine Bauteile semantisch.
+- Schaltbilder lassen sich nach einer Lasso-Auswahl oder per Doppelklick prüfen. Die lokale Erkennung richtet Leitungen aus, ergänzt Lötpunkte und zeichnet Dioden, Operationsverstärker (Ausrichtung und Vorzeichen), Kondensatoren, Batterien und Widerstände neu. Bauteilwerte und PDF-Bilder werden nicht gelesen.
 - Visueller Rundgang beim ersten Start; acht kurze Anleitungen können jederzeit über Einstellungen › Hilfe oder Bibliothek › ⋯ wieder geöffnet werden.
 - Virtuelles Labor mit simulierten Messgeräten, vier geführten Übungen und Messprotokoll-Export in die Notiz. Es steuert keine realen Geräte.
 - Kritzelradierer ist standardmäßig aktiv und kann in den Einstellungen abgeschaltet werden. Eine deutliche Zickzackbewegung über getroffene Striche oder Textfelder löscht diese in einem rückgängig machbaren Schritt.
-- Der Funktionsknopf `f(x)` und Textfelder mit `f(x) = ...` zeigen lokale interaktive Graphen mit Zoom und x-/Funktionswertanzeige. Handschrift und PDF-Formeln werden noch nicht automatisch erkannt.
+- Der Funktionsknopf `f(x)` und Textfelder mit `f(x) = ...` zeigen lokale interaktive Graphen. Eine markierte Handschrift kann nach kurzer manueller Formeleingabe einen Graphen darunter erhalten; automatische Handschrift- oder PDF-Texterkennung ist nicht enthalten. Unterstützt werden u. a. `x²`, `√x`, `|x|`, `sin x` und `xsin(x)`. Die Integralansicht ermöglicht zieh- oder eingebbare Grenzen, Flächenfärbung, numerische Ergebnisse und optional eine numerische Stammfunktion. Graphen erscheinen noch nicht im PDF-Export.
 - Ausgewählte Vektorstriche werden im Labor als Skizzenvorschau angezeigt. Einfach wirkende RC-Schaltungen können in den bestehenden RC-Tiefpass übernommen werden; Bauteilwerte müssen manuell geprüft werden. Es gibt noch keinen allgemeinen Schaltungslöser und keine Erkennung von Bild-/PDF-Schaltplänen.
 - Finger-Pan startet nach etwa 3 px Bewegung; die frühere mehrsekündige Wartezone nach dem Schreiben wurde entfernt. Surface-Pen und Finger müssen gemeinsam auf echter Hardware geprüft werden.
-- Die Werkzeugleiste verwendet den einfarbigen Goldton `#C8952C` ohne Verlauf; die vier kompakten, freigestellten Stiftköpfe folgen der klassischen XNTS-Vorlage und zeigen die ausgewählte Strichfarbe an der Spitze. Die Seitenliste ist eine nummerierte Liste.
+- **Ansicht** bündelt Bibliothek, Seitenliste, Fokus, Zoom, Leistenmodus und Rückgängig/Wiederholen. **Funktion** bündelt Form, Text, Labor, f(x), Papierlayout sowie PDF-Import und -Export. Die Werkzeugleiste verwendet den einfarbigen Goldton `#C8952C` ohne Verlauf; A4-Grenzen erscheinen als sanfter Schimmer mit feiner auslaufender Linie. Die vier kompakten, freigestellten Stiftköpfe folgen der klassischen XNTS-Vorlage und zeigen die ausgewählte Strichfarbe an der Spitze. Die Seitenliste ist eine nummerierte Liste.
 - Responsive Oberfläche, Hell- und Dunkelmodus, PWA-Installation und Offline-Nutzung.
 
 ## Lerngruppen und Infrastruktur
@@ -59,6 +59,7 @@ pnpm run native:sync:android:solo
 
 ## Tests und bekannte Grenzen
 
-- `pnpm test` führt die Node-Tests für Stiftprofile, Druck, Glättung, Linien-/Kurvenerkennung und Schaltbild-Geometrie aus.
+- `pnpm test` führt 59 Node-Tests für Stiftprofile, Druck, Glättung, Leitungsgeometrie, Schaltsymbole, Formelschreibweisen und numerische Integrale aus.
+- TypeScript-Prüfung sowie Produktions-Builds der Solo- und Gruppen-Edition waren erfolgreich. Ein interaktiver Browserlauf konnte in dieser Umgebung nicht geöffnet werden; die Funktionen im Browser und die Eingabe mit Surface Pen bleiben am echten Gerät zu prüfen.
 - Die Stift-Diagnose zeigt Zeigergerät und Druck lokal an; Werte werden nicht gesendet. Tasten und Druck auf echter Surface-Pen-Hardware müssen noch am Gerät geprüft werden.
 - Für Android ist die APK installierbar, aber nicht signiert als Play-Store-Release. Für iOS fehlen weiterhin Mac-Build und Apple-Signierung.

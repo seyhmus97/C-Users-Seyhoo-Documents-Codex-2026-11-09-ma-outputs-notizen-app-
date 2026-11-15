@@ -133,9 +133,9 @@ jobs:
           name: XNTS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
           files: release-assets/*
           body: |
-            XNTS 1.0.13 — persönliche Notizen, PDFs und virtuelle Laborgeräte.
+            XNTS 1.0.14 — persönliche Notizen, PDFs und virtuelle Laborgeräte.
 
-            Neu: Die Werkzeugleiste nutzt den gewünschten Goldton #C8952C ohne Verlauf. Die vier Stiftköpfe folgen der klassischen XNTS-Vorlage; die Spitze zeigt jeweils die ausgewählte Strichfarbe. Enthält außerdem Kritzelradierer, schnellere Finger-Navigation, interaktive Graphen für eingegebene Funktionen und eine Vorschau handgezeichneter Schaltungen im Labor. Einfache RC-Skizzen lassen sich als Startpunkt für den vorhandenen RC-Versuch verwenden; Bauteilwerte bitte prüfen.
+            Neu: Ansicht und Funktion bündeln die passenden Werkzeuge. Speichern, Backup, PDF-Import und -Export wurden robuster. A4-Grenzen sind sanft markiert. Handgezeichnete Dioden, Operationsverstärker, Kondensatoren, Batterien und Widerstände lassen sich geometrisch erkennen und glätten. Funktionsgraphen unterstützen Integralflächen und eine numerische Stammfunktion. Die öffentliche Solo-Version enthält keine Gruppenarbeit.
 
             Notizen und PDFs bleiben lokal auf deinem Gerät. Die Webversion und Installationsdateien stehen auf der XNTS-Website bereit.
           generate_release_notes: false
