@@ -566,7 +566,7 @@ select {
 }
 
 .notiz-toolbar {
-  background-color: var(--xnts-ochre-soft) !important;
+  background-color: #c8952c !important;
   border-bottom: 2px solid var(--xnts-ink) !important;
   color: var(--xnts-ink);
 }
@@ -1601,11 +1601,11 @@ select {
 
 /* Solid dark-gold toolbar: no banner image or color gradient behind the controls. */
 .xnts-topbar:not(.xnts-topbar--plain) {
-  background: #705d1d !important;
+  background: #c8952c !important;
   background-image: none !important;
   border-bottom-color: rgb(25 22 32 / 40%);
 }
-.xnts-topbar--plain { background: #705d1d !important; background-image: none !important; }
+.xnts-topbar--plain { background: #c8952c !important; background-image: none !important; }
 .xnts-topbar__art { display: none !important; }
 .notiz-workspace[data-theme] .xnts-topbar:not(.xnts-topbar--plain) > .notiz-toolbar {
   background: transparent !important;
@@ -1613,15 +1613,15 @@ select {
 }
 .notiz-workspace[data-theme] .xnts-topbar--plain > .notiz-toolbar { background: transparent !important; background-image: none !important; }
 .notiz-workspace .notiz-toolbar { background-image: none !important; }
-.xnts-topbar:not(.xnts-topbar--plain) .xnts-topbar__lockup { color: #fff7d8; }
-.xnts-topbar:not(.xnts-topbar--plain) .xnts-topbar__lockup span { color: #efe0a8; }
+.xnts-topbar:not(.xnts-topbar--plain) .xnts-topbar__lockup { color: #191620; }
+.xnts-topbar:not(.xnts-topbar--plain) .xnts-topbar__lockup span { color: #3b3020; }
 .notiz-pen-strip {
   min-height: 47px;
-  background: #705d1d !important;
+  background: #c8952c !important;
   border-bottom-color: rgb(25 22 32 / 35%) !important;
-  color: #fff7dc;
+  color: #30250f;
 }
-.notiz-pen-strip > span:first-child { color: #f5e8bd !important; }
+.notiz-pen-strip > span:first-child { color: #3b3020 !important; }
 .notiz-pen-preset {
   position: relative;
   flex-direction: column;
@@ -1647,7 +1647,7 @@ select {
   background: #f4da75;
 }
 .notiz-pen-preset__glyph { width: 18px; height: 34px; overflow: visible; }
-.notiz-pen-preset__name { max-width: 76px; overflow: hidden; color: #f6ebca; font-size: 8px; line-height: 1.05; text-overflow: ellipsis; white-space: nowrap; }
+.notiz-pen-preset__name { max-width: 76px; overflow: hidden; color: #30250f; font-size: 8px; line-height: 1.05; text-overflow: ellipsis; white-space: nowrap; }
 .notiz-pen-preset__nib { width: 9px; height: 2px; margin-top: 2px; border-radius: 2px; }
 
 .xnts-function-plot {

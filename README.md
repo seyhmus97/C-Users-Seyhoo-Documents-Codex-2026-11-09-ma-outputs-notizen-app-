@@ -45,7 +45,7 @@ PDF-Seiten bleiben im Dokumentfluss und werden im Dunkelmodus nicht invertiert. 
 - **Kritzelradierer** ist standardmäßig aktiv. Eine deutliche Zickzackbewegung über gezeichnete Striche oder Textfelder löscht die getroffenen Elemente; Rückgängig stellt sie wieder her. Die Geste lässt sich in den Einstellungen abschalten.
 - Fingerbewegungen verschieben die Notiz ab einer sehr kleinen Bewegung von 3 px. Nach dem Abheben des Stifts wartet die Ein-Finger-Navigation nicht mehr auf eine mehrsekündige Handballen-Zone. Auf dem echten Surface muss das Verhalten noch mit Stift und Finger gemeinsam geprüft werden.
 
-Die Seitenliste bleibt eine einfache nummerierte Liste. Die Werkzeugleiste verwendet einen einfarbigen dunklen Ockerton ohne Farbverlauf. Die vier kompakten, freigestellten Stiftköpfe folgen der klassischen XNTS-Vorlage; die Spitze jedes Stifts zeigt seine ausgewählte Strichfarbe.
+Die Seitenliste bleibt eine einfache nummerierte Liste. Die Werkzeugleiste verwendet den einfarbigen Goldton `#C8952C` ohne Farbverlauf. Die vier kompakten, freigestellten Stiftköpfe folgen der klassischen XNTS-Vorlage; die Spitze jedes Stifts zeigt seine ausgewählte Strichfarbe.
 
 Im Dunkelmodus bleibt die Tinte über PDF-Seiten und dunkle Notizflächen lesbar; die App passt nur die handgezeichnete Tinte an den jeweiligen Papierhintergrund an. PDF- und Bildinhalte werden nicht gefiltert oder invertiert.
 
