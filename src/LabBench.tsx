@@ -258,6 +258,37 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
   const [tut, setTut] = useState<{ id: string; step: number } | null>(null);
   useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(st)); } catch { /* nur Sitzung */ } }, [st]);
   useEffect(() => { try { localStorage.setItem("xnts-lab-wide", String(wide)); } catch { /* nur Sitzung */ } }, [wide]);
+  // Anordnung der Geräte auf der Werkbank (eigener Speicher, der Versuchsaufbau bleibt unverändert):
+  // ausblenden = Gerät bleibt eingeschaltet und angeschlossen, verschieben und skalieren pro Gerät
+  type Layout = Partial<Record<DeviceKey, { hidden?: boolean; x?: number; y?: number; k?: number }>>;
+  const [layout, setLayout] = useState<Layout>(() => { try { const v = JSON.parse(localStorage.getItem("xnts-lab-layout") ?? "{}"); return v && typeof v === "object" ? v as Layout : {}; } catch { return {}; } });
+  useEffect(() => { try { localStorage.setItem("xnts-lab-layout", JSON.stringify(layout)); } catch { /* nur Sitzung */ } }, [layout]);
+  const lay = (k: DeviceKey) => ({ hidden: false, x: 0, y: 0, k: 1, ...(layout[k] ?? {}) });
+  const setLay = (k: DeviceKey, p: { hidden?: boolean; x?: number; y?: number; k?: number }) => setLayout((l) => ({ ...l, [k]: { ...(l[k] ?? {}), ...p } }));
+  const shown = (k: DeviceKey) => st.devices[k] && !lay(k).hidden;
+  const dragDevice = (k: DeviceKey, mode: "move" | "size") => (e: React.PointerEvent) => {
+    if (e.button > 0) return;
+    e.preventDefault(); e.stopPropagation();
+    const sx = e.clientX, sy = e.clientY, l0 = lay(k), id = e.pointerId;
+    const panel = (e.currentTarget as HTMLElement).closest(".xnts-lab-panel");
+    // Ein Gerät darf nicht so weit verschoben werden, dass seine Bedienelemente unerreichbar werden.
+    const maxX = Math.max(64, Math.min(220, (panel?.clientWidth ?? 640) * 0.35));
+    const maxY = Math.max(80, Math.min(220, (panel?.clientHeight ?? 720) * 0.3));
+    const mv = (ev: PointerEvent) => { if (ev.pointerId !== id) return; const dx = ev.clientX - sx, dy = ev.clientY - sy;
+      setLay(k, mode === "move" ? { x: Math.round(Math.max(-maxX, Math.min(maxX, l0.x + dx))), y: Math.round(Math.max(-maxY, Math.min(maxY, l0.y + dy))) } : { k: Math.max(0.5, Math.min(2, +(l0.k + (dx + dy) / 600).toFixed(2))) }); };
+    const up = (ev: PointerEvent) => { if (ev.pointerId !== id) return; window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up); };
+    window.addEventListener("pointermove", mv); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
+  };
+  const cardStyle = (k: DeviceKey): React.CSSProperties => { const l = lay(k); return { transform: l.x || l.y ? `translate(${l.x}px, ${l.y}px)` : undefined, zoom: l.k !== 1 ? l.k : undefined, position: "relative", zIndex: l.x || l.y ? 3 : undefined }; };
+  const cardBar = (k: DeviceKey) => { const l = lay(k); return <div className="xnts-lab-cardbar">
+    <span className="xnts-lab-cardbar__grip" onPointerDown={dragDevice(k, "move")} title="Ziehen zum Verschieben" aria-label={`${DEVICE_LABEL[k]} verschieben`}>⠿ {DEVICE_LABEL[k]}</span>
+    <button type="button" onClick={() => setLay(k, { k: Math.max(0.5, +(l.k - 0.1).toFixed(2)) })} aria-label="Kleiner" title="Kleiner">−</button>
+    <button type="button" onClick={() => setLay(k, { k: 1, x: 0, y: 0 })} title="Größe und Position zurücksetzen">{Math.round(l.k * 100)} %</button>
+    <button type="button" onClick={() => setLay(k, { k: Math.min(2, +(l.k + 0.1).toFixed(2)) })} aria-label="Größer" title="Größer">＋</button>
+    <button type="button" onClick={() => setLay(k, { hidden: true })} title="Ausblenden – das Gerät bleibt eingeschaltet und angeschlossen" aria-label={`${DEVICE_LABEL[k]} ausblenden`}>–</button>
+    <button type="button" onClick={() => { set({ devices: { ...st.devices, [k]: false } }); setLay(k, { hidden: false }); }} title="Vom Labortisch nehmen (ausschalten)" aria-label={`${DEVICE_LABEL[k]} entfernen`}>✕</button>
+    <span className="xnts-lab-cardbar__size" onPointerDown={dragDevice(k, "size")} title="Ziehen: größer/kleiner" aria-hidden="true" />
+  </div>; };
   const set = (patch: Partial<LabState>) => setSt((s) => ({ ...s, ...patch }));
   const useNoteCircuitAsRc = () => {
     setSt((current) => ({
@@ -408,7 +439,9 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
           <div><button className="xnts-lab-next" onClick={() => startTutorial(t)}>▶ Schritt für Schritt</button><button onClick={() => { setSt(t.finish()); }}>Fertig aufbauen</button></div>
         </div>)}</div>
         <h3>Geräte frei wählen</h3>
-        <div className="xnts-lab-chips">{(Object.keys(DEVICE_LABEL) as DeviceKey[]).map((k) => <button key={k} aria-pressed={on[k]} onClick={() => set({ devices: { ...on, [k]: !on[k] } })}>{DEVICE_LABEL[k]}</button>)}</div>
+        <div className="xnts-lab-chips">{(Object.keys(DEVICE_LABEL) as DeviceKey[]).map((k) => { const bg = on[k] && lay(k).hidden;
+          return <button key={k} aria-pressed={on[k] && !bg} className={bg ? "is-background" : ""} title={bg ? "Läuft im Hintergrund – antippen zeigt das Gerät wieder" : on[k] ? "Antippen blendet das Gerät aus; es bleibt eingeschaltet und angeschlossen" : "Auf den Labortisch legen"}
+            onClick={() => { if (!on[k]) { set({ devices: { ...on, [k]: true } }); setLay(k, { hidden: false }); } else setLay(k, { hidden: !bg }); }}>{DEVICE_LABEL[k]}{bg ? " · im Hintergrund" : ""}</button>; })}</div>
         {noDevice && <p className="xnts-lab-hint">Wähle eine Übung oder ein oder mehrere Geräte.</p>}
       </section>}
 
@@ -425,7 +458,7 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
       </section>}
 
       <div className="xnts-lab-bench">
-        {on.psu && <section className="xnts-lab-section xnts-lab-device">
+        {shown("psu") && <section className="xnts-lab-section xnts-lab-device" style={cardStyle("psu")}>{cardBar("psu")}
           <PsuFront s={st.psu} r={sim.psu} hl={hl} set={(p) => setSt((s) => ({ ...s, psu: { ...s.psu, ...p } }))} />
           <ul className="xnts-lab-warn">
             {sim.psu.regulation === "CC" && <li>Strombegrenzung aktiv (C.C.): Die Spannung bricht auf I·R = {si(sim.psu.u, "V", 3)} ein</li>}
@@ -442,7 +475,7 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
           </div></details>
         </section>}
 
-        {on.gen && <section className="xnts-lab-section xnts-lab-device">
+        {shown("gen") && <section className="xnts-lab-section xnts-lab-device" style={cardStyle("gen")}>{cardBar("gen")}
           <GenFront model={st.gen.model} wave={st.gen.waveform} freq={st.gen.freq} range={st.genRange} vpp={st.gen.vpp} offset={st.gen.offset} symmetry={st.gen.symmetry} atten={st.atten}
             counter={st.gen.waveform === "dc" ? "----" : si(sim.gen.limits.freq, "Hz", 4)} hl={hl}
             set={(p) => setSt((s) => ({ ...s, atten: p.atten ?? s.atten, genRange: p.range ?? s.genRange, gen: { ...s.gen, ...(p.waveform ? { waveform: p.waveform } : {}), ...(p.freq !== undefined ? { freq: p.freq } : {}), ...(p.vpp !== undefined ? { vpp: p.vpp } : {}), ...(p.offset !== undefined ? { offset: p.offset } : {}), ...(p.symmetry !== undefined ? { symmetry: p.symmetry } : {}) } }))} />
@@ -458,7 +491,7 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
           </div></details>
         </section>}
 
-        {on.scope && <section className="xnts-lab-section xnts-lab-device xnts-lab-device--scope">
+        {shown("scope") && <section className="xnts-lab-section xnts-lab-device xnts-lab-device--scope" style={cardStyle("scope")}>{cardBar("scope")}
           <ScopeFront st={st.scope} res={sim.scope} menu={st.scopeMenu} softkeys={softkeys} measureSlots={measureSlots} colors={CH_COLORS} hl={hl}
             set={setScope} setCh={setCh} onMenu={(m) => set({ scopeMenu: m })} onAutoset={() => set({ scope: autoset(st.scope, sim.voltageSources) })}
             onDefault={() => set({ scope: { ...defaultScope(), model: st.scope.model, ch: defaultScope().ch.map((c, i) => ({ ...c, source: st.scope.ch[i].source })) }, scopeMenu: null })}
@@ -472,12 +505,12 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
           </div></details>
         </section>}
 
-        {(["u1241", "pt3340"] as MeterKey[]).filter((k) => on[k]).map((k) => {
+        {(["u1241", "pt3340"] as MeterKey[]).filter((k) => shown(k)).map((k) => {
           const m = st.meters[k], o = sim.meters[k], fn = o?.fn ?? null;
           const usable = fn ? sim.points.filter((p) => p.kind === meterNeeds(fn)) : [];
           const canAc = k === "u1241" && ["V", "mA", "A"].includes(m.pos);
           const subset = fn ? rangeSubset(k, m, fn) : [];
-          return <section key={k} className="xnts-lab-section xnts-lab-device xnts-lab-device--meter">
+          return <section key={k} className="xnts-lab-section xnts-lab-device xnts-lab-device--meter" style={cardStyle(k)}>{cardBar(k)}
             <MeterFront spec={METER_SPEC[k]} positions={POSITIONS[k]} pos={m.pos} reading={o?.reading ?? null} jack={m.jack} jacks={JACKS[k]} ac={!!fn && (fn === "VAC" || fn === "AAC")} hz={fn === "HZ"}
               rangeAuto={o?.auto ?? true} canAc={canAc} hl={hl} prefix={k} body={k === "u1241" ? "#3f4650" : "#35506b"}
               onPos={(p) => setMeter(k, { pos: p, range: "auto", hz: false })}

@@ -10,7 +10,15 @@ import { GROUPS_ENABLED } from "./features";
 const toB64 = (b: ArrayBuffer) => { let s = ""; const u = new Uint8Array(b); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
 const fromB64 = (t: string) => Uint8Array.from(atob(t), (c) => c.charCodeAt(0)).buffer;
 
-type N = { id: string; parentId: string | null; type: "folder" | "note"; name: string; open?: boolean; color?: string; icon?: string };
+type N = { id: string; parentId: string | null; type: "folder" | "note"; name: string; open?: boolean; color?: string; icon?: string; opened?: number };
+type LibView = "tree" | "list" | "grid" | "recent";
+const LIB_VIEWS: { id: LibView; label: string; hint: string }[] = [
+  { id: "tree", label: "Ordner", hint: "Aufklappbarer Baum, z. B. Jahr › Fach › Thema" },
+  { id: "list", label: "Liste", hint: "Alle Notizen kompakt mit Pfad" },
+  { id: "grid", label: "Raster", hint: "Notizen als Kacheln" },
+  { id: "recent", label: "Zuletzt", hint: "Zuletzt geöffnete Notizen zuerst" },
+];
+const readLibView = (): LibView => { try { const v = localStorage.getItem("xnts-library-view"); return LIB_VIEWS.some((x) => x.id === v) ? (v as LibView) : "tree"; } catch { return "tree"; } };
 type Theme = "system" | "light" | "dark";
 type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: "accepted" | "dismissed" }> };
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -32,6 +40,14 @@ export default function App() {
   const [lib, setLib] = useState(() => window.matchMedia("(min-width: 1280px)").matches);
   const [libWidth, setLibWidth] = useState(readLibWidth);
   const [libDragging, setLibDragging] = useState(false);
+  const [libView, setLibView] = useState<LibView>(readLibView);
+  useEffect(() => { try { localStorage.setItem("xnts-library-view", libView); } catch { /* Ansicht gilt dann nur für diese Sitzung */ } }, [libView]);
+  // Die Fokusleiste der Notiz kann die Bibliothek in einer bestimmten Ansicht öffnen
+  useEffect(() => {
+    const h = (e: Event) => { const v = (e as CustomEvent<LibView>).detail; if (LIB_VIEWS.some((x) => x.id === v)) setLibView(v); setLib(true); };
+    window.addEventListener("xnts-open-library", h);
+    return () => window.removeEventListener("xnts-open-library", h);
+  }, []);
   // Fokusmodus der Notiz: Bibliothek mit ausblenden und beim Beenden wieder so herstellen, wie sie war
   const libBeforeFocus = useRef<boolean | null>(null);
   const libRef = useRef(lib); libRef.current = lib;
@@ -162,7 +178,7 @@ export default function App() {
   const open = (n: N) => {
     if (n.type === "folder") patch(n.id, { open: !n.open });
     else {
-      setActive(n.id);
+      setActive(n.id); patch(n.id, { opened: Date.now() });
       if (window.matchMedia("(max-width: 1279px)").matches) setLib(false);
     }
   };
@@ -177,7 +193,7 @@ export default function App() {
       const entries = await Promise.all((await kvAll()).filter(([k]) => !k.startsWith("pgimg:") && k !== "app:preferences").map(async ([k, v]) => [
         k, v instanceof Blob ? { __ab: toB64(await v.arrayBuffer()), type: v.type } : v instanceof ArrayBuffer ? { __ab: toB64(v) } : v,
       ] as [string, unknown]));
-      const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
+      const preferenceKeys = ["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-library-view", "xnts-lab-layout", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"];
       entries.push(["app:preferences", Object.fromEntries(preferenceKeys.map((k) => [k, localStorage.getItem(k)]))]);
       await saveFile(new Blob([JSON.stringify({ app: "notizen", version: 1, entries })], { type: "application/json" }), `notizen-backup-${new Date().toISOString().slice(0, 10)}.json`);
     } catch { alert("Das Backup konnte nicht erstellt werden. Prüfe den Gerätespeicher und versuche es erneut."); }
@@ -194,7 +210,7 @@ export default function App() {
       await kvReplaceAll(entries.filter(([k]) => k !== "app:preferences"));
       const preferences = entries.find(([k]) => k === "app:preferences")?.[1];
       if (preferences && typeof preferences === "object") {
-        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"]);
+        const allowed = new Set(["notizraum-theme", "notizraum-pen-profiles", "notizraum-custom-colors", "notizraum-pressure-sensitivity", "notizraum-smart-shapes", "notizraum-circuit-assist", "notizraum-toolbar-collapsed", "notizraum-angle-snap", "notizraum-ink-smoothing", "notizraum-pen-barrel", "notizraum-auto-straighten", "notizraum-scribble-erase", "xnts-study-panel", "xnts-tutorial-seen", "xnts-library-width", "xnts-library-view", "xnts-lab-layout", "xnts-handedness", "xnts-one-finger-scroll", "xnts-page-markers", "xnts-study-toolbar-collapsed", "xnts-study-chat"]);
         for (const [key, value] of Object.entries(preferences)) if (allowed.has(key)) {
           try { if (typeof value === "string") localStorage.setItem(key, value); else localStorage.removeItem(key); }
           catch { /* Notizen wurden bereits atomar wiederhergestellt; eine lokale UI-Einstellung darf den Erfolg nicht als Backup-Fehler melden. */ }
@@ -255,6 +271,27 @@ export default function App() {
     );
   };
 
+  const ago = (t?: number) => { if (!t) return "noch nicht geöffnet"; const m = Math.round((Date.now() - t) / 60000); return m < 1 ? "gerade eben" : m < 60 ? `vor ${m} min` : m < 1440 ? `vor ${Math.round(m / 60)} h` : `vor ${Math.round(m / 1440)} Tagen`; };
+  const folderColor = (n: N) => { let p = n.parentId ? byId(n.parentId) : undefined; while (p && !p.color) p = p.parentId ? byId(p.parentId) : undefined; return p?.color ?? FOLDER_COLORS[0]; };
+  // Ansichten Liste, Raster und Zuletzt zeigen nur Notizen; der Ordnerbaum bleibt die Grundlage
+  const libFlat = (): React.ReactNode => {
+    const notes = nodes.filter((n) => n.type === "note");
+    if (!notes.length) return <div className="notiz-library-empty notiz-library-empty--search"><strong>Noch keine Notizen</strong><p>Lege mit „＋ Notiz“ die erste an.</p></div>;
+    if (libView === "recent") {
+      const seen = notes.filter((n) => n.opened).sort((a, b) => (b.opened ?? 0) - (a.opened ?? 0)).slice(0, 20);
+      if (!seen.length) return <div className="notiz-library-empty notiz-library-empty--search"><strong>Noch nichts geöffnet</strong><p>Hier erscheinen die zuletzt geöffneten Notizen.</p></div>;
+      return seen.map((n) => <div key={n.id} className="notiz-library-recent">{row(n, 0, true)}<small>{ago(n.opened)}</small></div>);
+    }
+    const sorted = [...notes].sort((a, b) => pathOf(a.id).localeCompare(pathOf(b.id), "de"));
+    if (libView === "list") return sorted.map((n) => row(n, 0, true));
+    return <div className="notiz-library-grid">{sorted.map((n) => (
+      <button key={n.id} type="button" className={"notiz-library-card" + (active === n.id ? " is-active" : "")} onClick={() => { reveal(n.id); open(n); }} title={pathOf(n.id)}>
+        <span className="notiz-library-card__paper" style={{ borderTopColor: folderColor(n) }} aria-hidden="true"><i /><i /><i /></span>
+        <strong>{n.name}</strong>
+        <small>{pathOf(n.id).split(" › ").slice(0, -1).join(" › ") || "Oberste Ebene"}</small>
+      </button>))}</div>;
+  };
+
   // Im Lernraum gehört die Breite der Gruppennotiz: die persönliche Bibliothek bleibt dort ausgeblendet
   const showLib = lib && !(GROUPS_ENABLED && studySpace);
   const hits = q.trim() ? nodes.filter((n) => n.name.toLowerCase().includes(q.trim().toLowerCase())) : null;
@@ -280,6 +317,9 @@ export default function App() {
               <button className="notiz-library-add notiz-library-add--primary" onClick={() => add(null, "note")}>＋ <span>Notiz</span></button>
               <button className="notiz-library-add" onClick={() => add(null, "folder")}>＋ <span>Ordner</span></button>
             </div>
+            <div className="notiz-library-views" role="group" aria-label="Ansicht der Bibliothek">
+              {LIB_VIEWS.map((v) => <button key={v.id} type="button" title={v.hint} aria-pressed={libView === v.id} className={libView === v.id ? "is-active" : ""} onClick={() => setLibView(v.id)}>{v.label}</button>)}
+            </div>
             {GROUPS_ENABLED && <button onClick={() => setStudySpace(true)} className="notiz-library-groups"><span>👥 Lerngruppen &amp; Chat</span><small>Prototyp</small><b aria-hidden="true">›</b></button>}
             <div className="notiz-library-more-wrap">
               <button className="notiz-library-more" aria-haspopup="menu" aria-expanded={libraryMenu} onClick={() => setLibraryMenu((v) => !v)}>⋯ <span>Mehr</span></button>
@@ -301,7 +341,7 @@ export default function App() {
           </div>
           <nav className="flex-1 overflow-auto p-2 space-y-0.5">
             {hits ? (hits.length ? hits.map((n) => row(n, 0, true)) : <div className="notiz-library-empty notiz-library-empty--search"><span aria-hidden="true">⌕</span><strong>Keine Treffer</strong><p>Versuche einen anderen Suchbegriff.</p><button onClick={() => setQ("")}>Suche leeren</button></div>)
-              : nodes.length ? nodes.filter((n) => !n.parentId).map((n) => row(n, 0))
+              : nodes.length ? (libView === "tree" ? nodes.filter((n) => !n.parentId).map((n) => row(n, 0)) : libFlat())
               : <div className="notiz-library-empty"><div className="notiz-library-empty-art" aria-hidden="true"><span>✳</span><i>✎</i></div><strong>Dein Notizraum beginnt hier</strong><p>Erstelle eine Notiz für deine Ideen oder einen Ordner, um Themen zu sammeln.</p><button className="notiz-library-empty-primary" onClick={() => add(null, "note")}>＋ Erste Notiz</button><button onClick={() => add(null, "folder")}>Ordner anlegen</button></div>}
           </nav>
           <div className="xnts-sidebar-art" aria-hidden="true">

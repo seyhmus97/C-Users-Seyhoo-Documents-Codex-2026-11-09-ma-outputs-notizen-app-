@@ -2,6 +2,13 @@
 
 XNTS steht für Xnotes. Die offizielle Web- und Installationsversion ist derzeit die Solo-Edition: persönliche Notizen, PDF-Bearbeitung und ein virtuelles Labor. Lerngruppen und Gruppenchat sind in dieser öffentlichen Ausgabe und auf der Website nicht freigeschaltet.
 
+## Arbeitsweise bei Änderungen (verbindlich)
+
+- Jede Änderung an Bedienung, Gestaltung oder Funktionen wird zuerst als **interaktive Vorlage** (anklickbarer Entwurf) erstellt und mit dem Projektinhaber abgestimmt.
+- Erst nach ausdrücklicher Erlaubnis wird die Änderung in der App umgesetzt. Kommentare zur Vorlage werden in der Vorlage selbst eingearbeitet.
+- Aktuelle Vorlage der Werkzeugleiste: Artefakt „XNTS Werkzeugleiste – Vorlage“ (Zeichenflächen: normale Leiste, Fokusmodus, Zuordnung).
+- Ausnahme: reine Fehlerbehebungen ohne sichtbare Bedienänderung (z. B. Darstellungsfehler) dürfen direkt erfolgen und werden danach gemeldet.
+
 ## Veröffentlichung
 
 - Produktseite und Web-App: https://seyhmus97.github.io/C-Users-Seyhoo-Documents-Codex-2026-11-09-ma-outputs-notizen-app-/
@@ -59,7 +66,7 @@ pnpm run native:sync:android:solo
 
 ## Tests und bekannte Grenzen
 
-- `pnpm test` führt 59 Node-Tests für Stiftprofile, Druck, Glättung, Leitungsgeometrie, Schaltsymbole, Formelschreibweisen und numerische Integrale aus.
+- `pnpm test` führt 63 Node-Tests für Stiftprofile, Kritzelradierer, Druck, Glättung, Leitungsgeometrie, Schaltsymbole, Formelschreibweisen und numerische Integrale aus.
 - TypeScript-Prüfung sowie Produktions-Builds der Solo- und Gruppen-Edition waren erfolgreich. Ein interaktiver Browserlauf konnte in dieser Umgebung nicht geöffnet werden; die Funktionen im Browser und die Eingabe mit Surface Pen bleiben am echten Gerät zu prüfen.
 - Die Stift-Diagnose zeigt Zeigergerät und Druck lokal an; Werte werden nicht gesendet. Tasten und Druck auf echter Surface-Pen-Hardware müssen noch am Gerät geprüft werden.
 - Für Android ist die APK installierbar, aber nicht signiert als Play-Store-Release. Für iOS fehlen weiterhin Mac-Build und Apple-Signierung.

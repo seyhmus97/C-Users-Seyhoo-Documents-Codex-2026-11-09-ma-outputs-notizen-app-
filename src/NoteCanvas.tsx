@@ -10,6 +10,7 @@ import type { RasterIn, RasterOut } from "./pdfRaster.worker";
 import { saveFile } from "./saveFile";
 import LabBench, { type LabRecord } from "./LabBench";
 import FunctionPlot from "./FunctionPlot";
+import MultiFunctionPlot, { curvesFromText, type CurveFlags } from "./MultiFunctionPlot";
 import PenGlyph from "./PenGlyph";
 import { functionExpressionFromText, parseMathExpression } from "./mathExpression";
 import { analyzeCircuitStrokes, type CircuitAnalysis } from "./circuitRecognition";
@@ -18,6 +19,7 @@ import type { PenKind } from "./penTypes";
 import { extendCollinearLine, lineAngleDegrees, snapRadians, snapToAngle, straightLineSpan } from "./lineGeometry";
 import { adjustPressure, fountainTaper, inkWidth, pencilLook, recognizePolyline, smoothInk, stabilize, trimHoldTail, type PolylineOptions } from "./inkEngine";
 import { straightenWire, tidyCircuit, type TidyItem } from "./circuitTidy";
+import { scribbleCovers, scribbleCoversRect, scribbleInfo, shouldAttemptScribbleErase } from "./scribble";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 let pdfjsPromise: Promise<PdfJsModule> | undefined;
@@ -31,18 +33,18 @@ const loadPdfJs = (): Promise<PdfJsModule> => {
 
 /* ───────── Typen & Konstanten ───────── */
 const PAGE_W = 794, MIN_GAP = 16, SPACE_STEP = 200, TAIL_GROW = 1200, MIN_Z = 0.4, MAX_Z = 4;
-type Tool = "pen" | "highlighter" | "eraser" | "lasso" | "shape" | "text";
-type Shape = "rect" | "ellipse" | "triangle" | "line" | "arrow";
+type Tool = "pen" | "highlighter" | "eraser" | "lasso" | "shape" | "line" | "text";
+type Shape = "rect" | "square" | "ellipse" | "circle" | "triangle" | "diamond" | "pentagon" | "star" | "axes" | "line" | "arrow";
 type Tpl = "blank" | "lined" | "grid" | "dots";
 type LineStyle = "solid" | "dashed" | "dotted" | "arrow" | "dashedArrow" | "dottedArrow";
 type ThemePreference = "system" | "light" | "dark";
 type Pt = { x: number; y: number; p: number };
 // y ist RELATIV zum Block → Notizen wandern mit, wenn davor Platz eingefügt wird
-type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color: string; size: number; pts: Pt[]; raw?: boolean; penKind?: PenKind; lineStyle?: LineStyle; auto?: boolean }; // raw: Formen (Ecken) nicht glätten · auto: von der Automatik/„Halten“ begradigt, Winkel NICHT von Hand eingestellt → die Schaltbildhilfe darf ihn ausrichten
+type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color: string; size: number; pts: Pt[]; raw?: boolean; penKind?: PenKind; lineStyle?: LineStyle; auto?: boolean; fill?: boolean }; // raw: Formen (Ecken) nicht glätten · auto: von der Automatik/„Halten“ begradigt, Winkel NICHT von Hand eingestellt → die Schaltbildhilfe darf ihn ausrichten
 type PenProfile = { id: string; name: string; kind: PenKind; color: string; size: number };
 type Block = { id: string; kind: "pdf" | "blank"; height: number; gap: number; docId?: string; pageNum?: number };
 // Textfeld: y ist (wie bei Strichen) RELATIV zur Oberkante des Blocks → wandert beim Platz-Einfügen mit
-interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; role?: "function"; functionExpression?: string }
+interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; role?: "function"; functionExpression?: string; functionCurves?: CurveFlags[] }
 type Snap = { strokes: Stroke[]; blocks: Block[]; texts: TextField[] };
 type XF = { px: number; py: number; s: number; rot: number }; // Live-Transformation: Pivot, Skalierung, Winkel
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -142,6 +144,20 @@ export const flushNote = async () => flushActive ? flushActive() : true;
 const shapePts = (kind: Shape, a: { x: number; y: number }, b: { x: number; y: number }): Pt[] => {
   const P = (x: number, y: number): Pt => ({ x, y, p: 0.5 });
   if (kind === "line") return [P(a.x, a.y), P(b.x, b.y)];
+  if (kind === "square" || kind === "circle") { // gleich lange Seiten: Größe = längere Zugrichtung
+    const side = Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+    b = { x: a.x + Math.sign(b.x - a.x || 1) * side, y: a.y + Math.sign(b.y - a.y || 1) * side };
+    kind = kind === "square" ? "rect" : "ellipse";
+  }
+  if (kind === "diamond") { const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2; return [P(cx, a.y), P(b.x, cy), P(cx, b.y), P(a.x, cy), P(cx, a.y)]; }
+  if (kind === "pentagon" || kind === "star") {
+    const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2, rx = Math.abs(b.x - a.x) / 2, ry = Math.abs(b.y - a.y) / 2, n = kind === "star" ? 10 : 5;
+    return Array.from({ length: n + 1 }, (_, i) => { const t = -Math.PI / 2 + (i / n) * 2 * Math.PI, k = kind === "star" && i % 2 ? 0.45 : 1; return P(cx + rx * k * Math.cos(t), cy + ry * k * Math.sin(t)); });
+  }
+  if (kind === "axes") { // Koordinatenachsen mit Pfeilspitzen, als ein zusammenhängender Strich
+    const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x), y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y), h = Math.min(10, (x1 - x0) / 6, (y1 - y0) / 6);
+    return [P(x0 - h * 0.6, y0 + h), P(x0, y0), P(x0 + h * 0.6, y0 + h), P(x0, y0), P(x0, y1), P(x1, y1), P(x1 - h, y1 - h * 0.6), P(x1, y1), P(x1 - h, y1 + h * 0.6)];
+  }
   if (kind === "rect") return [P(a.x, a.y), P(b.x, a.y), P(b.x, b.y), P(a.x, b.y), P(a.x, a.y)];
   if (kind === "triangle") return [P((a.x + b.x) / 2, a.y), P(b.x, b.y), P(a.x, b.y), P((a.x + b.x) / 2, a.y)];
   if (kind === "ellipse") {
@@ -299,62 +315,6 @@ const bbox = (s: Stroke) => {
   }
   return c;
 };
-const isScribbleGesture = (pts: Pt[]) => {
-  if (pts.length < 14) return false;
-  const x0 = Math.min(...pts.map((p) => p.x)), x1 = Math.max(...pts.map((p) => p.x));
-  const y0 = Math.min(...pts.map((p) => p.y)), y1 = Math.max(...pts.map((p) => p.y));
-  const diagonal = Math.hypot(x1 - x0, y1 - y0);
-  if (diagonal < 22) return false;
-  let length = 0, sharpTurns = 0, previousSign = 0, alternating = 0;
-  for (let i = 1; i < pts.length; i++) length += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-  for (let i = 2; i < pts.length; i++) {
-    const a = { x: pts[i - 1].x - pts[i - 2].x, y: pts[i - 1].y - pts[i - 2].y };
-    const b = { x: pts[i].x - pts[i - 1].x, y: pts[i].y - pts[i - 1].y };
-    const al = Math.hypot(a.x, a.y), bl = Math.hypot(b.x, b.y);
-    if (al < 1.8 || bl < 1.8) continue;
-    const dot = (a.x * b.x + a.y * b.y) / (al * bl);
-    const cross = a.x * b.y - a.y * b.x;
-    if (dot < .2) {
-      sharpTurns++;
-      const sign = Math.sign(cross);
-      if (sign && previousSign && sign !== previousSign) alternating++;
-      if (sign) previousSign = sign;
-    }
-  }
-  return length / diagonal > 3.8 && sharpTurns >= 7 && alternating >= 3;
-};
-const pointSegmentDistance = (p: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) => {
-  const dx = b.x - a.x, dy = b.y - a.y, den = dx * dx + dy * dy;
-  const t = den ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / den)) : 0;
-  return Math.hypot(p.x - a.x - t * dx, p.y - a.y - t * dy);
-};
-const pathTouchesPath = (a: { x: number; y: number }[], b: { x: number; y: number }[], radius: number) => {
-  const sample = (pts: { x: number; y: number }[]) => {
-    if (pts.length <= 180) return pts;
-    const step = Math.ceil(pts.length / 180);
-    return pts.filter((_, i) => i % step === 0).concat(pts[pts.length - 1]);
-  };
-  const aa = sample(a), bb = sample(b), near = (p: { x: number; y: number }, path: { x: number; y: number }[]) => {
-    for (let i = 1; i < path.length; i++) if (pointSegmentDistance(p, path[i - 1], path[i]) <= radius) return true;
-    return false;
-  };
-  const cross = (p: { x: number; y: number }, q: { x: number; y: number }, r: { x: number; y: number }) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
-  for (let i = 1; i < aa.length; i++) for (let j = 1; j < bb.length; j++) {
-    const a0 = aa[i - 1], a1 = aa[i], b0 = bb[j - 1], b1 = bb[j];
-    const boxesMeet = Math.max(Math.min(a0.x, a1.x), Math.min(b0.x, b1.x)) <= Math.min(Math.max(a0.x, a1.x), Math.max(b0.x, b1.x)) + radius
-      && Math.max(Math.min(a0.y, a1.y), Math.min(b0.y, b1.y)) <= Math.min(Math.max(a0.y, a1.y), Math.max(b0.y, b1.y)) + radius;
-    if (boxesMeet && cross(a0, a1, b0) * cross(a0, a1, b1) <= 0 && cross(b0, b1, a0) * cross(b0, b1, a1) <= 0) return true;
-  }
-  return aa.some((p) => near(p, bb)) || bb.some((p) => near(p, aa));
-};
-const scratchTouchesRect = (scratch: { x: number; y: number }[], rect: { x0: number; x1: number; y0: number; y1: number }, radius: number) => {
-  if (scratch.some((p) => p.x >= rect.x0 && p.x <= rect.x1 && p.y >= rect.y0 && p.y <= rect.y1)) return true;
-  return pathTouchesPath(scratch, [
-    { x: rect.x0, y: rect.y0 }, { x: rect.x1, y: rect.y0 }, { x: rect.x1, y: rect.y1 },
-    { x: rect.x0, y: rect.y1 }, { x: rect.x0, y: rect.y0 },
-  ], radius);
-};
-
 /* ───────── Radierer-Geometrie: exakt die Kurve, die paint() zeichnet ───────── */
 // Scratch-Register: curveAt() schreibt hierhin, es entsteht kein Objekt pro Abtastpunkt
 let cvX = 0, cvY = 0, cvP = 0;
@@ -414,11 +374,11 @@ const cutStroke = (s: Stroke, top: number, cx: number, cy: number, r: number, st
     for (let j = i === 1 ? 0 : 1; j <= k; j++) {
       curveAt(P, n, raw, i, j / k);
       const dx = cvX - cx, dy = cvY - ly, rr = r + halfW(s, cvP);
-      if (dx * dx + dy * dy < rr * rr) { if (run.length > 1) out.push({ ...s, id: uid(), pts: run }); run = []; }
+      if (dx * dx + dy * dy < rr * rr) { if (run.length > 1) out.push({ ...s, fill: undefined, id: uid(), pts: run }); run = []; }
       else run.push({ x: cvX, y: cvY, p: cvP });
     }
   }
-  if (run.length > 1) out.push({ ...s, id: uid(), pts: run });
+  if (run.length > 1) out.push({ ...s, fill: undefined, id: uid(), pts: run });
 };
 
 /* ───────── PDF-Rasterbilder (Web Worker) ───────── */
@@ -651,7 +611,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const [scribbleEraseEnabled, setScribbleEraseEnabled] = useState(() => { try { return localStorage.getItem("notizraum-scribble-erase") !== "false"; } catch { return true; } });
   const [circuitAnalysis, setCircuitAnalysis] = useState<CircuitAnalysis | null>(null);
   const [functionDialog, setFunctionDialog] = useState(false);
-  const [functionDraft, setFunctionDraft] = useState("x^2");
+  const [functionRows, setFunctionRows] = useState<{ expr: string; d: boolean; i: boolean }[]>([{ expr: "x^2", d: false, i: false }]);
   const [functionAnchor, setFunctionAnchor] = useState<{ x: number; y: number } | null>(null);
   const [functionMenuOpen, setFunctionMenuOpen] = useState(false);
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
@@ -740,10 +700,31 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const eraserHover = useRef(false);               // Radierkreis zeigen, auch wenn das Stift-Werkzeug gewählt ist
   const eraseLast = useRef<{ x: number; y: number } | null>(null);  // letzte Radierposition (schnelle Bewegungen lückenlos radieren)
   const holdAnchor = useRef<{ x: number; y: number } | null>(null); // Bildschirmposition, an der der Stift gerade ruht
-  const snapInfo = useRef<{ line: boolean; x: number; y: number } | null>(null); // Form wurde durch Halten geglättet
+  const snapInfo = useRef<{ line: boolean; x: number; y: number; base?: Pt[]; cx?: number; cy?: number; d0?: number; scale?: number } | null>(null); // Form wurde durch Halten geglättet; base/cx/cy/d0: Größe per Stiftabstand zur Formmitte
   const endDrag = useRef<{ id: string; which: 0 | 1; orig: Stroke; fixed: { x: number; y: number }; snapped: boolean } | null>(null);
   const [angleSnap, setAngleSnap] = useState(() => { try { return localStorage.getItem("notizraum-angle-snap") === "true"; } catch { return false; } });
   const angleSnapRef = useRef(angleSnap); angleSnapRef.current = angleSnap;
+  /* ───── Werkzeugleiste (Vorlage „XNTS Werkzeugleiste“): Kontextleiste, Farbplätze, eigene Werte für Radierer und Linie ───── */
+  const readJson = <T,>(key: string, ok: (v: unknown) => boolean, fallback: T): T => { try { const v: unknown = JSON.parse(localStorage.getItem(key) ?? "null"); return ok(v) ? (v as T) : fallback; } catch { return fallback; } };
+  const isHexList = (n: number) => (v: unknown) => Array.isArray(v) && v.length === n && v.every((c) => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c));
+  const isNum = (lo: number, hi: number) => (v: unknown) => typeof v === "number" && v >= lo && v <= hi;
+  const [ctxOpen, setCtxOpen] = useState(true); // aktives Werkzeug nochmals antippen blendet die Kontextleiste aus/ein
+  const [colorSlots, setColorSlots] = useState<string[]>(() => readJson("xnts-color-slots", isHexList(4), ["#1f2937", "#2563eb", "#dc2626", "#16a34a"]));
+  const [activeSlot, setActiveSlot] = useState(() => readJson("xnts-color-slot", isNum(0, 3), 0));
+  const [focusSlots, setFocusSlots] = useState<string[]>(() => readJson("xnts-focus-color-slots", isHexList(3), ["#1f2937", "#2563eb", "#dc2626"]));
+  const [eraserSize, setEraserSize] = useState(() => readJson("xnts-eraser-size", isNum(0.5, 12), 2.5));
+  const [lineColor, setLineColor] = useState(() => readJson("xnts-line-color", (v) => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v), "#dc2626"));
+  const [lineSize, setLineSize] = useState(() => readJson("xnts-line-size", isNum(0.5, 12), 2.5));
+  const [lineToolStyle, setLineToolStyle] = useState<LineStyle>(() => readJson("xnts-line-style", (v) => LINE_STYLES.some((l) => l.id === v), "arrow" as LineStyle));
+  const [shapeFill, setShapeFill] = useState(() => readJson("xnts-shape-fill", (v) => typeof v === "boolean", false));
+  const [colorMenu, setColorMenu] = useState<string | null>(null); // offenes Farbfenster: "slot0".."slot3", "line", "focus0".."focus2"
+  const [focusMenu, setFocusMenu] = useState<"lib" | "pen" | "line" | null>(null);
+  useEffect(() => { try {
+    localStorage.setItem("xnts-color-slots", JSON.stringify(colorSlots)); localStorage.setItem("xnts-color-slot", JSON.stringify(activeSlot));
+    localStorage.setItem("xnts-focus-color-slots", JSON.stringify(focusSlots)); localStorage.setItem("xnts-eraser-size", JSON.stringify(eraserSize));
+    localStorage.setItem("xnts-line-color", JSON.stringify(lineColor)); localStorage.setItem("xnts-line-size", JSON.stringify(lineSize));
+    localStorage.setItem("xnts-line-style", JSON.stringify(lineToolStyle)); localStorage.setItem("xnts-shape-fill", JSON.stringify(shapeFill));
+  } catch { /* Einstellungen gelten dann nur für diese Sitzung */ } }, [colorSlots, activeSlot, focusSlots, eraserSize, lineColor, lineSize, lineToolStyle, shapeFill]);
   const [notice, setNotice] = useState("");
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const flash = (text: string) => { setNotice(text); clearTimeout(noticeTimer.current); noticeTimer.current = setTimeout(() => setNotice(""), 3800); };
@@ -773,21 +754,22 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     const p: PenProfile = { id: uid(), name, kind: activePen.kind === "marker" ? "ballpoint" : activePen.kind, color: nextColor, size };
     updatePenProfiles([...penProfiles, p]); setActivePenId(p.id); setColor(p.color); setTool("pen");
   };
-  const addCustomColor = (value: string) => {
-    const normalized = value.toLowerCase();
-    setColor(normalized); changePen({ color: normalized });
-    setCustomColors((old) => old.includes(normalized) ? old : [...old, normalized].slice(-12));
-  };
+  const FUNCTION_NAMES = "fghpqruvw";
   const addFunctionField = () => {
-    const expression = functionDraft.trim();
-    try { parseMathExpression(expression); }
-    catch (error) { flash(error instanceof Error ? error.message : "Diese Funktion kann ich noch nicht lesen."); return; }
+    const rows = functionRows.map((r) => ({ ...r, expr: r.expr.trim() })).filter((r) => r.expr);
+    if (!rows.length) { flash("Bitte mindestens eine Funktion eingeben."); return; }
+    for (const [k, r] of rows.entries()) {
+      try { parseMathExpression(r.expr); }
+      catch (error) { flash(`${FUNCTION_NAMES[k]}(x): ` + (error instanceof Error ? error.message : "Diese Funktion kann ich noch nicht lesen.")); return; }
+    }
+    const expression = rows[0].expr;
     const sc = scRef.current;
     if (!sc) return;
     const r = sc.getBoundingClientRect(), view = toDoc(r.left + r.width / 2, r.top + r.height / 2);
     const d = functionAnchor ?? { x: view.x - 180, y: view.y - 30 };
     const block = blockAt(d.y), top = topsRef.current[block.id] ?? 0;
-    const field: TextField = { id: uid(), blockId: block.id, text: `f(x) = ${expression}`, x: Math.max(24, Math.min(PAGE_W - 384, d.x)), y: Math.max(24, d.y - top), width: 360, height: 34, fontSize: 20, color, role: "function", functionExpression: expression };
+    const text = rows.map((r, k) => `${FUNCTION_NAMES[k]}(x) = ${r.expr}`).join("\n");
+    const field: TextField = { id: uid(), blockId: block.id, text, x: Math.max(24, Math.min(PAGE_W - 384, d.x)), y: Math.max(24, d.y - top), width: 360, height: 34 * rows.length, fontSize: 20, color, role: "function", functionExpression: expression, functionCurves: rows.map((r) => ({ d: r.d, i: r.i })) };
     const beforeFunction = snap();
     textFields.current = [...textFields.current, field];
     pushHist(beforeFunction); bump(); schedule(); markDirty();
@@ -919,8 +901,16 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       if (!clean) return;
       const isLine = clean.pts.length === 2 || (hasArrow(clean.lineStyle) && clean.pts.length === 5);
       rawBeforeSmartSnap.current = current; cur.current = isLine ? { ...clean, auto: true } : clean;
-      snapInfo.current = { line: isLine, x: holdAnchor.current?.x ?? 0, y: holdAnchor.current?.y ?? 0 };
-      flash(isLine ? "Linie geglättet · Stift weiterziehen ändert Winkel und Länge" : "Form geglättet · weiterzeichnen hebt die Glättung auf");
+      const anchor = holdAnchor.current ?? { x: 0, y: 0 };
+      if (isLine) snapInfo.current = { line: true, x: anchor.x, y: anchor.y };
+      else { // Form: Größe folgt danach dem Abstand des Stifts zur Formmitte
+        let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+        for (const q of clean.pts) { bx0 = Math.min(bx0, q.x); bx1 = Math.max(bx1, q.x); by0 = Math.min(by0, q.y); by1 = Math.max(by1, q.y); }
+        const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2, pen = toDoc(anchor.x, anchor.y), top = topsRef.current[clean.blockId] ?? 0;
+        const d0 = Math.max(Math.hypot(pen.x - cx, pen.y - top - cy), 8 / zoomRef.current);
+        snapInfo.current = { line: false, x: anchor.x, y: anchor.y, base: clean.pts, cx, cy, d0, scale: 1 };
+      }
+      flash(isLine ? "Linie geglättet · Stift weiterziehen ändert Winkel und Länge" : "Form geglättet · Stift zur Mitte oder nach außen bewegen ändert die Größe");
       schedule();
     }, HOLD_MS);
   };
@@ -1104,6 +1094,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
         ctx.lineTo(P[n - 1].x + ox, top + P[n - 1].y);
       }
     };
+    if (s.fill && s.raw && n > 2) { // gefüllte Form: zarte Fläche in der Stiftfarbe unter dem Umriss
+      ctx.save(); ctx.setLineDash([]); ctx.globalAlpha *= 0.22; ctx.beginPath(); ctx.moveTo(P[0].x + ox, top + P[0].y);
+      for (let i = 1; i < n; i++) ctx.lineTo(P[i].x + ox, top + P[i].y);
+      ctx.closePath(); ctx.fill(); ctx.restore();
+    }
     if (kind === "pencil" && !hl) {
       // Bleistift: ein einziger Pfad mit Körnung. Früher wurde jedes Segment einzeln halbtransparent gezeichnet –
       // die überlappenden runden Enden ergaben die dunkle „Perlenkette“ entlang des Strichs.
@@ -1116,7 +1111,23 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     } else if (n === 1) {
       ctx.beginPath(); ctx.arc(P[0].x + ox, top + P[0].y, (hl ? s.size * 2.5 : widthAt(0, 0, 0)) / 2, 0, 7); ctx.fill();
     } else if (hl) { // Textmarker: ein einziger Pfad, Kurve durch die Mittelpunkte (Kontrollpunkt = Messpunkt)
-      centerline(); ctx.stroke();
+      // Beim Aufsetzen und Abheben zittert der Stift oft ein paar Pixel zurück. Bei der breiten Markerlinie erzeugte
+      // diese Richtungsumkehr mit runder Verbindung eine sichtbare Halbkugel am Anfang. Deshalb die Punkte in einer
+      // kleinen Ruhezone um Start und Ende überspringen: Der Strich beginnt flach und in der echten Zugrichtung.
+      const dz0 = s.size * 2.5, sdx = P[n - 1].x - P[0].x, sdy = P[n - 1].y - P[0].y;
+      if (shaped || (n < 6 && sdx * sdx + sdy * sdy < dz0 * dz0)) { centerline(); ctx.stroke(); }
+      else {
+        const dz = s.size * 2.5, dz2 = dz * dz;
+        const far = (i: number, j: number) => { const dx = P[i].x - P[j].x, dy = P[i].y - P[j].y; return dx * dx + dy * dy >= dz2; };
+        let a = 1; while (a < n - 1 && !far(a, 0)) a++;
+        let b = n - 2; while (b >= a && !far(b, n - 1)) b--;
+        ctx.beginPath(); ctx.moveTo(P[0].x + ox, top + P[0].y);
+        for (let i = a; i <= b; i++) {
+          const nx = i < b ? P[i + 1].x : P[n - 1].x, ny = i < b ? P[i + 1].y : P[n - 1].y;
+          ctx.quadraticCurveTo(P[i].x + ox, top + P[i].y, (P[i].x + nx) / 2 + ox, top + (P[i].y + ny) / 2);
+        }
+        ctx.lineTo(P[n - 1].x + ox, top + P[n - 1].y); ctx.stroke();
+      }
     } else if (dash.length) { // gestrichelt/gepunktet: ein Pfad mit gleichmäßiger Breite, damit das Muster ruhig bleibt
       ctx.lineWidth = inkWidth(kind, s.size, 0.5, 0, 0, true);
       centerline(); ctx.stroke();
@@ -1167,7 +1178,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     }
     flush();
   };
-  const eraseR = () => 6 + size * 3;
+  const eraseR = () => 6 + eraserSize * 3; // eigene Radierergröße, unabhängig von der Stiftbreite
   const draw = useCallback(() => {
     const cv = cvRef.current, sc = scRef.current;
     if (!cv || !sc) return;
@@ -1314,9 +1325,13 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
 
   const buildShape = (d: { x: number; y: number }, snapAngle = false) => {
     const a = shapeA.current!, b = blockAt(a.y), top = topsRef.current[b.id];
-    if (snapAngle && (shapeKind === "line" || shapeKind === "arrow")) d = snapToAngle(a, d, 15);
-    const kind = shapeKind === "line" && hasArrow(lineStyle) ? "arrow" : shapeKind;
-    cur.current = { id: cur.current?.id ?? uid(), blockId: b.id, tool: activePen.kind === "marker" ? "highlighter" : "pen", color, size, penKind: activePen.kind, lineStyle, pts: shapePts(kind, a, d).map((p) => ({ ...p, y: p.y - top })), raw: true };
+    // Werkzeug „Linie/Pfeil“: eigene Art, Breite und Farbe – unabhängig vom Stift
+    const lineTool = gTool.current === "line";
+    const base: Shape = lineTool ? "line" : shapeKind, style = lineTool ? lineToolStyle : lineStyle;
+    if (snapAngle && (base === "line" || base === "arrow")) d = snapToAngle(a, d, 15);
+    const kind = base === "line" && hasArrow(style) ? "arrow" : base;
+    const fill = !lineTool && shapeFill && kind !== "line" && kind !== "arrow" && kind !== "axes";
+    cur.current = { id: cur.current?.id ?? uid(), blockId: b.id, tool: !lineTool && activePen.kind === "marker" ? "highlighter" : "pen", color: lineTool ? lineColor : color, size: lineTool ? lineSize : size, penKind: lineTool ? "ballpoint" : activePen.kind, lineStyle: style, pts: shapePts(kind, a, d).map((p) => ({ ...p, y: p.y - top })), raw: true, ...(fill ? { fill: true } : {}) };
     growTail(d.y);
   };
 
@@ -1542,7 +1557,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       textBefore.current = snap(); creating.current = true; focusId.current = id;
       textFields.current = [...textFields.current, { id, blockId: b.id, text: "", x: d.x, y: d.y - topsRef.current[b.id], width: Math.max(80, Math.min(260, PAGE_W - d.x - 8)), height: 28, fontSize: Math.round(10 + size * 3), color }];
       bump();
-    } else if (useTool === "shape") { shapeA.current = d; buildShape(d); }
+    } else if (useTool === "shape" || useTool === "line") { shapeA.current = d; buildShape(d); }
     else if (useTool === "eraser") { erase(d); eraseLast.current = d; }
     else {
       const bb = selBox();
@@ -1598,9 +1613,16 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             }
             continue;
           }
-          if (far <= 14) continue; // Form bleibt stehen, solange der Stift nur zittert
-          if (rawBeforeSmartSnap.current) cur.current = rawBeforeSmartSnap.current; // bewusst weitergezeichnet: Glättung aufheben
-          rawBeforeSmartSnap.current = null; snapInfo.current = null;
+          // Form: solange der Stift unten bleibt, skaliert sie um ihre Mitte – näher zur Mitte = kleiner, weiter weg = größer
+          if (far > HOLD_RADIUS && si.base && si.d0 && si.cx !== undefined && si.cy !== undefined) {
+            const c = cur.current, top = topsRef.current[c.blockId] ?? 0;
+            const k = clamp(Math.hypot(d.x - si.cx, d.y - top - si.cy) / si.d0, 0.15, 8);
+            si.scale = k;
+            const scaled = si.base.map((q) => ({ ...q, x: si.cx! + (q.x - si.cx!) * k, y: si.cy! + (q.y - si.cy!) * k }));
+            cur.current = { ...c, pts: scaled };
+            growTail(top + Math.max(...scaled.map((q) => q.y)));
+          }
+          continue;
         }
         const pts = cur.current.pts, last = pts[pts.length - 1], ly = d.y - topsRef.current[cur.current.blockId], md = MIN_DIST / zoomRef.current;
         // Stabilisierung: der Punkt folgt dem Stift leicht verzögert und nimmt Zittern heraus
@@ -1648,6 +1670,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     if (e.pointerType === "pen") penActive.current = false;
     if (cur.current) {
       let stroke = cur.current;
+      const rawPts = stroke.pts, snappedRaw = snapInfo.current && !snapInfo.current.line ? rawBeforeSmartSnap.current?.pts ?? null : null;
       if (!stroke.raw && !snapInfo.current && stroke.pts.length > 1) {
         // Die Stabilisierung hinkt dem Stift minimal hinterher: beim Absetzen den echten Endpunkt ergänzen …
         const d = toDoc(e.clientX, e.clientY), last = stroke.pts[stroke.pts.length - 1], ly = d.y - (topsRef.current[stroke.blockId] ?? 0);
@@ -1660,27 +1683,31 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       const finalStroke = !stroke.raw && hasArrow(stroke.lineStyle) && stroke.pts.length > 1
         ? { ...stroke, pts: shapePts("arrow", stroke.pts[0], stroke.pts[stroke.pts.length - 1]), raw: true }
         : stroke;
-      if (scribbleEraseEnabled && usedTool === "pen" && (finalStroke.tool === "pen" || finalStroke.tool === "highlighter") && isScribbleGesture(finalStroke.pts)) {
+      // Kritzelradierer: Erkennung auf den ungeglätteten Punkten (Glätten rundet Zickzack-Ecken ab); bei durch Halten
+      // geglätteter Form zählt der ursprüngliche Freihandstrich. Trifft das Kritzel nichts, bleibt es ein normaler Strich.
+      const scribblePts = (snappedRaw ?? rawPts) as Pt[];
+      const scribble = shouldAttemptScribbleErase(scribbleEraseEnabled, usedTool, finalStroke.tool) ? scribbleInfo(scribblePts, 1 / zoomRef.current) : null;
+      if (scribble) {
         const top = topsRef.current[finalStroke.blockId] ?? 0;
-        const scratch = finalStroke.pts.map((p) => ({ x: p.x, y: p.y + top }));
-        const scratchBounds = scratch.reduce((b, p) => ({ x0: Math.min(b.x0, p.x), x1: Math.max(b.x1, p.x), y0: Math.min(b.y0, p.y), y1: Math.max(b.y1, p.y) }), { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity });
+        const scratch = scribblePts.map((p) => ({ x: p.x, y: p.y + top }));
+        const absInfo = { ...scribble, bounds: { x0: scribble.bounds.x0, x1: scribble.bounds.x1, y0: scribble.bounds.y0 + top, y1: scribble.bounds.y1 + top } };
         const tolerance = Math.max(4, 9 / zoomRef.current);
         const hitStrokes = new Set(strokes.current.filter((target) => {
           if (target.id === finalStroke.id || (target.tool !== "pen" && target.tool !== "highlighter")) return false;
-          const targetTop = topsRef.current[target.blockId] ?? 0, box = bbox(target);
-          if (targetTop + box.y1 < scratchBounds.y0 - tolerance || targetTop + box.y0 > scratchBounds.y1 + tolerance || box.x1 < scratchBounds.x0 - tolerance || box.x0 > scratchBounds.x1 + tolerance) return false;
-          return pathTouchesPath(scratch, target.pts.map((p) => ({ x: p.x, y: p.y + targetTop })), tolerance + target.size / 2);
+          const targetTop = topsRef.current[target.blockId] ?? 0, box = bbox(target), B = absInfo.bounds;
+          if (targetTop + box.y1 < B.y0 - tolerance || targetTop + box.y0 > B.y1 + tolerance || box.x1 < B.x0 - tolerance || box.x0 > B.x1 + tolerance) return false;
+          return scribbleCovers(scratch, absInfo, target.pts.map((p) => ({ x: p.x, y: p.y + targetTop })), tolerance + target.size / 2);
         }).map((target) => target.id));
-        const hitTexts = new Set(textFields.current.filter((target) => scratchTouchesRect(scratch, textRect(target), tolerance)).map((target) => target.id));
+        const hitTexts = new Set(textFields.current.filter((target) => scribbleCoversRect(absInfo, textRect(target))).map((target) => target.id));
         if (hitStrokes.size || hitTexts.size) {
           strokes.current = strokes.current.filter((target) => !hitStrokes.has(target.id));
           textFields.current = textFields.current.filter((target) => !hitTexts.has(target.id));
           sel.current = new Set([...sel.current].filter((id) => !hitStrokes.has(id) && !hitTexts.has(id)));
           pushHist(before.current);
-          flash(`${hitStrokes.size + hitTexts.size} ${hitStrokes.size + hitTexts.size === 1 ? "Element gelöscht" : "Elemente gelöscht"} · Rückgängig mit Strg+Z`);
-        } else flash("Kritzelradierer · kein Inhalt getroffen");
-        cur.current = null; snapInfo.current = null; rawBeforeSmartSnap.current = null;
-        bump(); schedule(); return;
+          flash(`Durchgekritzelt: ${hitStrokes.size + hitTexts.size} ${hitStrokes.size + hitTexts.size === 1 ? "Element gelöscht" : "Elemente gelöscht"} · Rückgängig mit Strg+Z`);
+          cur.current = null; snapInfo.current = null; rawBeforeSmartSnap.current = null;
+          bump(); schedule(); return;
+        }
       }
       // Automatisch begradigen: nur eindeutig gerade, ausreichend lange Striche (Handschrift bleibt unberührt).
       // Start, Ende und Winkel bleiben wie gezeichnet. Der Freihandstrich wird als eigener Undo-Schritt abgelegt.
@@ -2089,8 +2116,14 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     : {};
   const btn = (on: boolean) => `px-2.5 py-1.5 rounded-lg text-sm transition select-none ${on ? "bg-slate-900 text-white" : "hover:bg-slate-200 text-slate-700"}`;
   const palette = [...COLORS, ...customColors.filter((c) => !COLORS.includes(c))];
-  const tools: [Tool, string][] = [["pen", "✒ Stift"], ["highlighter", "▰ Marker"], ["eraser", "Radierer"], ["lasso", "Lasso"]];
-  const functionActive = tool === "shape" || tool === "text" || labOpen || functionDialog;
+  // Obere Leiste zeigt nur, WAS gewählt ist; die Optionen stehen in der Kontextleiste darunter (Vorlage „XNTS Werkzeugleiste“)
+  type TopTool = Tool | "lab" | "func";
+  const TOP_TOOLS: { id: TopTool; label: string }[] = [
+    { id: "pen", label: "Stift" }, { id: "eraser", label: "Radierer" }, { id: "lasso", label: "Lasso" }, { id: "shape", label: "Form" },
+    { id: "line", label: "Linie/Pfeil" }, { id: "text", label: "Text" }, { id: "lab", label: "Labor" }, { id: "func", label: "Funktion f(x)" },
+  ];
+  const topActive = (id: TopTool) => id === "pen" ? tool === "pen" || tool === "highlighter" : id === "lab" ? labOpen : id === "func" ? functionDialog : tool === id;
+  const functionActive = false;
   const toolIcon = (kind: Tool) => {
     const paths: Record<Tool, React.ReactNode> = {
       pen: <><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/><path d="m14.5 7.5 3 3"/></>,
@@ -2099,10 +2132,140 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       lasso: <><path d="M9 17c-4 0-6-2-6-5 0-4 4-7 9-7s9 2 9 6-4 7-9 7"/><path d="M9 17c0 2-1 4-3 4-1 0-2-1-2-2s1-2 2-2h3Z"/></>,
       shape: <><rect x="4" y="4" width="8" height="8" rx="1"/><circle cx="17" cy="17" r="4"/><path d="m15 5 5 5"/></>,
       text: <><path d="M4 6V4h16v2M12 4v16M8 20h8"/></>,
+      line: <><path d="M4 20 19 5"/><path d="M12 5h7v7"/></>,
     };
     return <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[kind]}</svg>;
   };
-  const Sep = () => <span className="w-px h-6 bg-slate-200" />;
+  const topIcon = (id: TopTool) => id === "lab"
+    ? <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 3h6M10 3v6l-5.2 9.1A2 2 0 0 0 6.5 21h11a2 2 0 0 0 1.7-2.9L14 9V3M7.4 15h9.2"/></svg>
+    : id === "func" ? <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 20h16M4 20V4M6 17c3-9 5-9 7-4s4 4 6-6"/></svg>
+    : toolIcon(id);
+  const pickTop = (id: TopTool) => {
+    setColorMenu(null);
+    if (id === "lab") { setLabOpen((v) => !v); return; }
+    if (id === "func") { openFunctionForSelection(); return; }
+    if (topActive(id)) { setCtxOpen((v) => !v); return; } // gewähltes Werkzeug erneut antippen = Kontextleiste ein/aus
+    setCtxOpen(true); pickTool(id);
+  };
+  const SHAPES: { id: Shape; label: string; d: string }[] = [
+    { id: "rect", label: "Rechteck", d: "M3 6h18v12H3z" }, { id: "square", label: "Quadrat", d: "M5 5h14v14H5z" },
+    { id: "circle", label: "Kreis", d: "M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0" }, { id: "ellipse", label: "Ellipse", d: "M2 12a10 6 0 1 0 20 0a10 6 0 1 0-20 0" },
+    { id: "triangle", label: "Dreieck", d: "M12 3l9 17H3z" }, { id: "diamond", label: "Raute", d: "M12 2l9 10-9 10-9-10z" },
+    { id: "pentagon", label: "Fünfeck", d: "M12 2l9.5 7-3.6 11H6.1L2.5 9z" }, { id: "star", label: "Stern", d: "M12 2l2.9 6.6 7.1.6-5.4 4.7 1.6 7L12 17.3 5.8 20.9l1.6-7L2 9.2l7.1-.6z" },
+    { id: "axes", label: "Achsen", d: "M4 20h17M4 20V3M18 17l3 3-3 3M1 6l3-3 3 3" },
+  ];
+  const sizeDot = (v: number, on: boolean, label: string, pick: () => void, hollow = false) => (
+    <button key={label} type="button" className="xnts-ctx__size" aria-pressed={on} title={label} aria-label={label} onClick={pick}>
+      <span style={{ width: Math.min(22, 3 + v * 2.4), height: Math.min(22, 3 + v * 2.4), background: hollow ? "#fff" : "currentColor", border: hollow ? "2px solid currentColor" : 0 }} />
+    </button>
+  );
+  const lineIcon = (id: LineStyle, ink = "currentColor") => {
+    const dash = id.startsWith("dashed") ? "6 5" : id.startsWith("dotted") ? "0.1 6" : undefined, arrow = id === "arrow" || id.endsWith("Arrow");
+    return <svg aria-hidden="true" width="40" height="18" viewBox="0 0 44 20"><line x1="3" y1="10" x2={arrow ? 38 : 41} y2="10" stroke={ink} strokeWidth="2.6" strokeDasharray={dash} strokeLinecap="round" />{arrow && <path d="M33 4l8 6-8 6" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />}</svg>;
+  };
+  // Farbfenster unter einem Farbknopf: Grundfarben, eigene Farben und freie Mischung
+  const colorPop = (current: string, pickHex: (hex: string) => void, title: string) => (
+    <div className="xnts-pop xnts-pop--colors" role="dialog" aria-label={title} onPointerDown={(e) => e.stopPropagation()}>
+      <strong>{title}</strong>
+      <div className="xnts-pop__swatches">{palette.map((c) => <button key={c} type="button" aria-label={`Farbe ${c}`} aria-pressed={c === current} style={{ background: c }} onClick={() => pickHex(c)} />)}</div>
+      <label className="xnts-pop__mix">＋ Eigene Farbe mischen<input type="color" value={current} onChange={(e) => { const v = e.target.value.toLowerCase(); setCustomColors((old) => old.includes(v) ? old : [...old, v].slice(-12)); pickHex(v); }} /></label>
+    </div>
+  );
+  // Vier Farbplätze, unabhängig voneinander: antippen = wählen, gewählten Platz nochmal antippen = Farbe dieses Platzes ändern
+  const colorSlotsUi = (
+    <div className="xnts-ctx__group" role="group" aria-label="Farbplätze">
+      {colorSlots.map((c, i) => { const on = activeSlot === i && color === c, key = `slot${i}`;
+        return <div key={i} className="xnts-ctx__slotwrap">
+          <button type="button" className="xnts-ctx__slot" aria-pressed={on} aria-label={`Farbplatz ${i + 1}: ${c}`} title={on ? "Nochmal antippen: Farbe dieses Platzes ändern" : "Farbe wählen"} style={{ background: c }}
+            onClick={() => { if (on) setColorMenu(colorMenu === key ? null : key); else { setActiveSlot(i); setColor(c); changePen({ color: c }); setColorMenu(null); } }} />
+          {colorMenu === key && colorPop(c, (hex) => { setColorSlots((sl) => sl.map((x, j) => (j === i ? hex : x))); setActiveSlot(i); setColor(hex); changePen({ color: hex }); setColorMenu(null); }, `Farbplatz ${i + 1} festlegen`)}
+        </div>; })}
+    </div>
+  );
+  const slider = (value: number, set: (v: number) => void, label: string) => (
+    <label className="xnts-ctx__slider" title={label}>
+      <input type="range" min={0.5} max={12} step={0.5} value={value} onChange={(e) => set(+e.target.value)} aria-label={label} />
+      <span>{value.toFixed(1).replace(".", ",")} px</span>
+    </label>
+  );
+  const CtxSep = () => <span className="xnts-ctx__sep" aria-hidden="true" />;
+  const ctxContent = (): React.ReactNode => {
+    if (tool === "pen" || tool === "highlighter") {
+      const setPenSize = (v: number) => { setSize(v); changePen({ size: v }); };
+      const marker = activePen.kind === "marker";
+      return <>
+        <div className="xnts-ctx__group" role="group" aria-label="Meine Stifte">
+          {penProfiles.map((p) => <button key={p.id} type="button" className="xnts-ctx__pen" aria-pressed={activePen.id === p.id} onClick={() => choosePen(p)} title={`${p.name} · ${p.size.toFixed(1)} px`}>
+            <PenGlyph kind={p.kind} color={p.id === activePen.id ? color : p.color} className="xnts-ctx__pen-glyph" /><span>{p.name.split(" ")[0].replace("Kugelschreiber", "Kugel").replace("Textmarker", "Marker").replace("Bleistift", "Blei")}</span>
+          </button>)}
+          <button type="button" className="xnts-ctx__add" onClick={addPenProfile} title="Eigenen Stift hinzufügen" aria-label="Eigenen Stift hinzufügen">＋</button>
+        </div>
+        <CtxSep />
+        <div className="xnts-ctx__group" role="group" aria-label="Strichgröße">
+          {([["dünn", 1.5], ["mittel", 2.5], ["dick", 4]] as const).map(([l, v]) => sizeDot(v, Math.abs(size - v) < 0.01, `Strichgröße ${l}`, () => setPenSize(v)))}
+          {slider(size, setPenSize, "Strichgröße frei einstellen")}
+          <svg className="xnts-ctx__preview" aria-hidden="true" width="58" height="30" viewBox="0 0 58 30"><path d="M6 20c8-12 14-12 20-2s12 10 26-6" fill="none" stroke={color} strokeWidth={marker ? size * 5 : size} strokeOpacity={marker ? 0.35 : 1} strokeLinecap={marker ? "butt" : "round"} strokeLinejoin="round" /></svg>
+        </div>
+        <CtxSep />
+        {colorSlotsUi}
+        <button type="button" className="xnts-ctx__btn xnts-ctx__info" onClick={() => flash(penHint)} title={penHint} aria-label="Hinweis zu Linien und Formen">ⓘ</button>
+      </>;
+    }
+    if (tool === "eraser") return <>
+      <div className="xnts-ctx__seg" role="group" aria-label="Radiermodus">
+        <button type="button" aria-pressed={eraseMode === "stroke"} onClick={() => setEraseMode("stroke")} title="Berührte Striche werden komplett gelöscht">Ganzer Strich</button>
+        <button type="button" aria-pressed={eraseMode === "pixel"} onClick={() => setEraseMode("pixel")} title="Nur die Stelle unter dem Radierer wird entfernt">Nur Berührtes</button>
+      </div>
+      <CtxSep />
+      <div className="xnts-ctx__group" role="group" aria-label="Radierergröße">
+        {([["klein", 1.5], ["mittel", 2.5], ["groß", 5]] as const).map(([l, v]) => sizeDot(v, Math.abs(eraserSize - v) < 0.01, `Radierergröße ${l}`, () => setEraserSize(v), true))}
+        {slider(eraserSize, setEraserSize, "Radierergröße frei einstellen")}
+      </div>
+      <CtxSep />
+      <button type="button" role="switch" aria-checked={scribbleEraseEnabled} className="xnts-ctx__switch" onClick={() => setScribbleEraseEnabled(!scribbleEraseEnabled)} title="Wenn an: Mit Stift oder Marker über etwas kritzeln löscht es">
+        <span aria-hidden="true" />Kritzelradierer {scribbleEraseEnabled ? "an" : "aus"}
+      </button>
+    </>;
+    if (tool === "lasso") return <>
+      <span className="xnts-ctx__hint">Antippen oder umfahren · Endpunkte ziehen ändert den Winkel · ↻ dreht</span>
+      <button type="button" className="xnts-ctx__btn" aria-pressed={angleSnap} onClick={() => setAngleSnap(!angleSnap)} title="Winkel beim Ziehen, Drehen und Linienzeichnen auf 15°-Schritte einrasten. Ohne Raster ist jeder Winkel möglich; Umschalttaste rastet vorübergehend ein.">15°-Raster</button>
+      {sel.current.size > 0 && <button type="button" className="xnts-ctx__btn" onClick={perfectSelected} title="Auswahl als Schaltbild prüfen und klare Leitungen und Grundformen glätten">Schaltbild erkennen &amp; glätten</button>}
+      <button type="button" className="xnts-ctx__btn xnts-ctx__info" onClick={() => flash(lassoHint)} title={lassoHint} aria-label="Hinweis zum Lasso">ⓘ</button>
+    </>;
+    if (tool === "shape") return <>
+      <div className="xnts-ctx__group" role="group" aria-label="Formart">
+        {SHAPES.map((f) => <button key={f.id} type="button" className="xnts-ctx__shape" aria-pressed={shapeKind === f.id} title={f.label} onClick={() => setShapeKind(f.id)}>
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d={f.d} /></svg><span>{f.label}</span>
+        </button>)}
+      </div>
+      <CtxSep />
+      <button type="button" className="xnts-ctx__btn" aria-pressed={shapeFill} onClick={() => setShapeFill(!shapeFill)} title="Formen mit einer zarten Fläche in der gewählten Farbe füllen">Gefüllt</button>
+      <CtxSep />
+      {colorSlotsUi}
+    </>;
+    if (tool === "line") return <>
+      <div className="xnts-ctx__group" role="group" aria-label="Linien- und Pfeilart">
+        {LINE_STYLES.map((l) => <button key={l.id} type="button" className="xnts-ctx__line" aria-pressed={lineToolStyle === l.id} title={l.title} aria-label={l.title} onClick={() => setLineToolStyle(l.id)}>{lineIcon(l.id, lineColor)}</button>)}
+      </div>
+      <CtxSep />
+      <div className="xnts-ctx__group" role="group" aria-label="Linienbreite">
+        {([["dünn", 1.5], ["mittel", 2.5], ["dick", 4]] as const).map(([l, v]) => sizeDot(v, Math.abs(lineSize - v) < 0.01, `Linienbreite ${l}`, () => setLineSize(v)))}
+        {slider(lineSize, setLineSize, "Linienbreite frei einstellen")}
+      </div>
+      <CtxSep />
+      <div className="xnts-ctx__slotwrap">
+        <button type="button" className="xnts-ctx__slot" aria-label={`Linienfarbe ${lineColor} – eigene Farbe, unabhängig vom Stift`} title="Linienfarbe (unabhängig vom Stift)" style={{ background: lineColor }} aria-pressed={colorMenu === "line"} onClick={() => setColorMenu(colorMenu === "line" ? null : "line")} />
+        {colorMenu === "line" && colorPop(lineColor, (hex) => { setLineColor(hex); setColorMenu(null); }, "Linienfarbe (eigene, unabhängig vom Stift)")}
+      </div>
+      <button type="button" className="xnts-ctx__btn" aria-pressed={angleSnap} onClick={() => setAngleSnap(!angleSnap)} title="Linien beim Zeichnen auf 15°-Schritte einrasten. Ohne Raster ist jeder Winkel möglich; Umschalttaste rastet vorübergehend ein.">15°-Raster</button>
+    </>;
+    if (tool === "text") return <>
+      <span className="xnts-ctx__hint">Auf die Seite tippen, um ein Textfeld zu setzen</span>
+      <CtxSep />
+      {colorSlotsUi}
+    </>;
+    return null;
+  };
   const pickTool = (t: Tool) => {
     if (t === "pen") { const p = activePen.kind === "marker" ? penProfiles.find((x) => x.kind !== "marker") : activePen; if (p) choosePen(p); else setTool(t); }
     else if (t === "highlighter") { const p = penProfiles.find((x) => x.kind === "marker"); if (p) choosePen(p); else setTool(t); }
@@ -2119,43 +2282,27 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       {!compact && <div className="xnts-art-banner__lockup xnts-topbar__lockup" aria-hidden="true"><strong>XNTS</strong><span>NOTES · STUDY · ART</span></div>}
       <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-1.5 bg-white border-b border-slate-200 flex-wrap" data-collapsed={toolbarCollapsed} data-menu-open={functionMenuOpen || viewMenuOpen}>
         <div className="notiz-toolbar__row notiz-toolbar__primary">
+          {onLibrary && <button type="button" className="xnts-tools__btn xnts-tools__lib" aria-pressed={libraryOpen} onClick={() => onLibrary(!libraryOpen)} title={libraryOpen ? "Bibliothek ausblenden" : "Bibliothek anzeigen"} aria-label={libraryOpen ? "Bibliothek ausblenden" : "Bibliothek anzeigen"}>
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h4v16H4zM10 4h4v16h-4zM16.5 4.5l3.5-.9 3 15.6-3.5.9z" /></svg>
+          </button>}
           <div ref={viewMenuTriggerRef} className="notiz-toolbar__menu-trigger">
             <button className={btn(viewMenuOpen) + " notiz-toolbar__menu-button"} onClick={() => { setViewMenuOpen((v) => !v); setFunctionMenuOpen(false); }} aria-haspopup="true" aria-expanded={viewMenuOpen} aria-controls={`${toolbarId}-view`}>
               Ansicht <span aria-hidden="true">⌄</span>
             </button>
           </div>
           {readOnly && <span className="xnts-chip" title="Du kannst diese Notiz ansehen, scrollen und zoomen. Zum Mitschreiben „Meine privat“ wählen oder einen Admin um das Schreibrecht bitten.">👁 Nur ansehen</span>}
-          {canEdit && <>
-          {tools.map(([t, l]) => <button key={t} title={l} aria-label={l} aria-pressed={tool === t} className={btn(tool === t) + " notiz-toolbar__tool inline-flex items-center gap-1.5"} onClick={() => pickTool(t)}>{toolIcon(t)}{!toolbarCollapsed && <span className="notiz-toolbar__tool-label">{l.replace("✒ ", "").replace("▰ ", "")}</span>}</button>)}
-          {(tool === "pen" || tool === "highlighter") && (
-            <>
-              <select aria-label="Stifttyp" title="Strichverhalten" className="notiz-toolbar__penopt px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={activePen.kind}
-                onChange={(e) => { const kind = e.target.value as PenKind; changePen({ kind }); setTool(kind === "marker" ? "highlighter" : "pen"); }}>
-                <option value="ballpoint">Kugelschreiber</option><option value="fountain">Füller</option><option value="pencil">Bleistift</option><option value="marker">Textmarker</option>
-              </select>
-              {toolbarCollapsed && <select aria-label="Gespeichertes Stiftprofil" title="Meine Stifte" className="notiz-toolbar__penopt max-w-36 px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={activePen.id} onChange={(e) => { const p = penProfiles.find((x) => x.id === e.target.value); if (p) choosePen(p); }}>
-                {penProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.color}</option>)}
-              </select>}
-              {toolbarCollapsed && <button className={btn(false) + " notiz-toolbar__penopt"} onClick={addPenProfile} title="Eigenen Stift hinzufügen">＋ Stift</button>}
-            </>
-          )}
-          {tool === "eraser" && (
-            <select className="px-2 py-1.5 rounded-lg bg-slate-100 text-sm" value={eraseMode} onChange={(e) => setEraseMode(e.target.value as "pixel" | "stroke")}>
-              <option value="pixel">Nur berührter Teil</option>
-              <option value="stroke">Ganzer Strich</option>
-            </select>
-          )}
-          </>}
+          {canEdit && <div className="xnts-tools" role="toolbar" aria-label="Werkzeuge">
+            {TOP_TOOLS.map((t) => <button key={t.id} type="button" title={t.label + (topActive(t.id) && t.id !== "lab" && t.id !== "func" ? " – nochmal antippen blendet die Optionen ein/aus" : "")} aria-label={t.label} aria-pressed={topActive(t.id)} className="xnts-tools__btn" onClick={() => pickTop(t.id)}>{topIcon(t.id)}</button>)}
+          </div>}
           <div ref={functionMenuTriggerRef} className="notiz-toolbar__menu-trigger">
             <button className={btn(functionMenuOpen || functionActive) + " notiz-toolbar__menu-button"} onClick={() => { setFunctionMenuOpen((v) => !v); setViewMenuOpen(false); }} aria-haspopup="true" aria-expanded={functionMenuOpen} aria-controls={`${toolbarId}-function`} aria-pressed={functionActive}>
-              Funktion <span aria-hidden="true">⌄</span>
+              Mehr <span aria-hidden="true">⌄</span>
             </button>
           </div>
         </div>
         {viewMenuOpen && <div id={`${toolbarId}-view`} ref={viewMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Ansicht einstellen">
           <div className="notiz-toolbar__panel-group">
             <span className="notiz-toolbar__panel-label">Bereiche</span>
-            {onLibrary && <button className={btn(libraryOpen)} aria-pressed={libraryOpen} onClick={() => onLibrary(!libraryOpen)}>{libraryOpen ? "Bibliothek ausblenden" : "Bibliothek anzeigen"}</button>}
             <button className={btn(sidebar)} aria-pressed={sidebar} onClick={() => setSidebar((v) => !v)}>{sidebar ? "Seitenliste ausblenden" : "Seitenliste anzeigen"}</button>
             <button className={btn(toolbarCollapsed)} aria-pressed={toolbarCollapsed} onClick={() => setToolbarCollapsed((v) => !v)}>{toolbarCollapsed ? "Leiste erweitern" : "Leiste verkleinern"}</button>
             <button className={btn(false) + " inline-flex items-center gap-1.5"} onClick={() => { setViewMenuOpen(false); setFocus(true); }} title="Alle Leisten ausblenden – Esc beendet den Fokusmodus">{focusIcon} Fokusmodus</button>
@@ -2174,18 +2321,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
           </div>
         </div>}
-        {functionMenuOpen && <div id={`${toolbarId}-function`} ref={functionMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Funktionen">
+        {functionMenuOpen && <div id={`${toolbarId}-function`} ref={functionMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Mehr">
           {canEdit && <>
-            <div className="notiz-toolbar__panel-group">
-              <span className="notiz-toolbar__panel-label">Werkzeuge</span>
-              <button className={btn(tool === "shape")} aria-pressed={tool === "shape"} onClick={() => setTool("shape")}>{toolIcon("shape")} Form</button>
-              <select aria-label="Form auswählen" title="Zu zeichnende Form" value={shapeKind} onChange={(e) => setShapeKind(e.target.value as Shape)}>
-                <option value="rect">Rechteck</option><option value="triangle">Dreieck</option><option value="ellipse">Kreis</option><option value="line">Gerade Linie</option><option value="arrow">Pfeil</option>
-              </select>
-              <button className={btn(tool === "text")} aria-pressed={tool === "text"} onClick={() => { setTool("text"); setFunctionMenuOpen(false); }}>{toolIcon("text")} Text</button>
-              <button className={btn(labOpen)} aria-pressed={labOpen} onClick={() => { setLabOpen((v) => !v); setFunctionMenuOpen(false); }} title="Geräte wählen und virtuelle Versuche durchführen">⚗ Labor</button>
-              <button className={btn(functionDialog)} onClick={openFunctionForSelection} title="Funktion f(x) eingeben und interaktiv anzeigen">f(x)</button>
-            </div>
             <div className="notiz-toolbar__panel-group">
               <span className="notiz-toolbar__panel-label">Seite</span>
               <select value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
@@ -2202,23 +2339,6 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
           </div>
         </div>}
-        {canEdit && <div className="notiz-toolbar__row notiz-toolbar__ink">
-          {(tool === "pen" || tool === "shape") && <div className="notiz-toolbar__lines flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5" aria-label="Linienstil">
-            {LINE_STYLES.map((s) => <button key={s.id} title={s.title} aria-label={s.title} onClick={() => setLineStyle(s.id)} className={`rounded px-1.5 py-1 text-xs font-mono ${lineStyle === s.id ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}>{s.label}</button>)}
-          </div>}
-          <Sep />
-          {palette.map((c) => (
-            <button key={c} aria-label={`Farbe ${c}`} onClick={() => { setColor(c); changePen({ color: c }); }} style={{ background: c }} className={`notiz-toolbar__swatch w-7 h-7 rounded-full border border-slate-300 ${color === c ? "ring-2 ring-offset-2 ring-slate-900" : ""}`} />
-          ))}
-          <label className="notiz-toolbar__color-add relative inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border border-dashed border-slate-400 text-slate-500" title="Eigene Stiftfarbe hinzufügen" aria-label="Eigene Stiftfarbe hinzufügen">
-            <span aria-hidden="true">＋</span><input type="color" className="absolute inset-0 h-full w-full cursor-pointer opacity-0" onChange={(e) => addCustomColor(e.target.value)} aria-label="Eigene Stiftfarbe" />
-          </label>
-          <input type="range" min={1} max={10} step={0.5} value={size} onChange={(e) => { const v = +e.target.value; setSize(v); changePen({ size: v }); }} className="w-24" aria-label="Strichstärke / Radiergröße" />
-          {tool === "pen" && <button className={btn(false) + " notiz-toolbar__hint"} onClick={() => flash(penHint)} title={penHint} aria-label="Hinweis zu Linien und Formen">ⓘ</button>}
-          {(tool === "lasso" || tool === "shape") && <button className={btn(angleSnap) + " notiz-toolbar__angle-snap"} aria-pressed={angleSnap} onClick={() => setAngleSnap(!angleSnap)} title="Winkel beim Ziehen, Drehen und Linienzeichnen auf 15°-Schritte einrasten. Ohne Raster ist jeder Winkel möglich; Umschalttaste rastet vorübergehend ein.">15°-Raster</button>}
-          {tool === "lasso" && <button className={btn(false) + " notiz-toolbar__hint"} onClick={() => flash(lassoHint)} title={lassoHint} aria-label="Hinweis zum Lasso">ⓘ</button>}
-          {tool === "lasso" && sel.current.size > 0 && <button className={btn(false)} onClick={perfectSelected} title="Auswahl als Schaltbild prüfen und klare Leitungen und Grundformen glätten">Schaltbild erkennen &amp; glätten</button>}
-        </div>}
         <div className="notiz-toolbar__row notiz-toolbar__document">
           {canEdit && <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>}
           {canEdit && hasPdf && <button className={btn(pdfDeleteMode) + " notiz-toolbar__pdf-delete"} aria-pressed={pdfDeleteMode} onClick={togglePdfDeleteMode}
@@ -2232,16 +2352,6 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       </header>
       </div>
 
-      {canEdit && !focus && (tool === "pen" || tool === "highlighter") && !toolbarCollapsed && <div className="notiz-pen-strip flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white px-3 py-1" role="group" aria-label="Meine Stiftprofile">
-        <span className="shrink-0 text-xs font-semibold text-slate-500">Meine Stifte</span>
-        {penProfiles.map((p) => <button key={p.id} type="button" aria-pressed={activePen.id === p.id} onClick={() => choosePen(p)}
-          title={`${p.name} · ${p.size.toFixed(1)} px`} className={`notiz-pen-preset inline-flex shrink-0 items-center ${activePen.id === p.id ? "is-active" : ""}`}>
-          <PenGlyph kind={p.kind} color={p.id === activePen.id ? color : p.color} className="notiz-pen-preset__glyph" />
-          <span className="notiz-pen-preset__name">{p.name}</span>
-          <span className="notiz-pen-preset__nib" style={{ backgroundColor: p.color }} />
-        </button>)}
-        <button className={btn(false) + " shrink-0"} onClick={addPenProfile}>＋ Stift hinzufügen</button>
-      </div>}
 
       <div className="relative flex flex-1 min-h-0">
         {labOpen && <LabBench onClose={() => setLabOpen(false)} onInsert={insertLabRecord} noteCircuit={circuitAnalysis} />}
@@ -2272,18 +2382,52 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           </aside>
         )}
         <div className="relative flex flex-1 min-w-0">
-        {focus && <div className={"xnts-focusbar" + (focusMini ? " is-mini" : "")} role="toolbar" aria-label="Fokus-Leiste">
-          {canEdit && !focusMini && tools.map(([t, l]) => <button key={t} type="button" title={l.replace("✒ ", "").replace("▰ ", "")} aria-label={l} aria-pressed={tool === t} onClick={() => pickTool(t)}>{toolIcon(t)}</button>)}
+        {canEdit && !focus && ctxOpen && ctxContent() && <div className="xnts-ctx" role="toolbar" aria-label="Optionen des Werkzeugs" onPointerDown={(e) => e.stopPropagation()}>
+          <div className="xnts-ctx__inner">{ctxContent()}</div>
+        </div>}
+        {focus && <div className={"xnts-focusbar" + (focusMini ? " is-mini" : "") + (focusMenu || colorMenu?.startsWith("focus") ? " has-pop" : "")} role="toolbar" aria-label="Fokus-Leiste">
+          {!focusMini && onLibrary && <span className="xnts-focusbar__wrap">
+            <button type="button" aria-expanded={focusMenu === "lib"} title="Bibliothek – Ansicht wählen" aria-label="Bibliothek – Ansicht wählen" onClick={() => setFocusMenu(focusMenu === "lib" ? null : "lib")}>
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h4v16H4zM10 4h4v16h-4zM16.5 4.5l3.5-.9 3 15.6-3.5.9z" /></svg>
+            </button>
+            {focusMenu === "lib" && <div className="xnts-pop" role="menu" aria-label="Bibliothek · Ansicht">
+              <strong>Bibliothek · Ansicht</strong>
+              {([["tree", "Ordner", "Nach Jahren, Fächern und Themen"], ["list", "Liste", "Kompakt mit Pfad"], ["grid", "Raster", "Kacheln"], ["recent", "Zuletzt", "Zuletzt geöffnete zuerst"]] as const).map(([id, l, h]) =>
+                <button key={id} type="button" role="menuitem" className="xnts-pop__row" onClick={() => { setFocusMenu(null); setFocus(false); window.dispatchEvent(new CustomEvent("xnts-open-library", { detail: id })); }}><b>{l}</b><small>{h}</small></button>)}
+            </div>}
+          </span>}
+          {canEdit && !focusMini && <span className="xnts-focusbar__wrap">
+            <button type="button" aria-expanded={focusMenu === "pen"} aria-pressed={tool === "pen" || tool === "highlighter"} title={`Stift wählen: ${activePen.name}`} aria-label={`Stift wählen: ${activePen.name}`} className="xnts-focusbar__pen" onClick={() => { if (tool !== "pen" && tool !== "highlighter") pickTool("pen"); setFocusMenu(focusMenu === "pen" ? null : "pen"); }}>
+              <PenGlyph kind={activePen.kind} color={color} className="xnts-focusbar__pen-glyph" />
+            </button>
+            {focusMenu === "pen" && <div className="xnts-pop" role="menu" aria-label="Meine Stifte">
+              <strong>Meine Stifte</strong>
+              {penProfiles.map((p) => <button key={p.id} type="button" role="menuitemradio" aria-checked={activePen.id === p.id} className="xnts-pop__row xnts-pop__pen" onClick={() => { choosePen(p); setFocusMenu(null); }}><PenGlyph kind={p.kind} color={p.color} className="xnts-pop__pen-glyph" /><b>{p.name}</b></button>)}
+            </div>}
+          </span>}
+          {canEdit && !focusMini && (["eraser", "lasso"] as Tool[]).map((t) => <button key={t} type="button" title={t === "eraser" ? "Radierer" : "Lasso"} aria-label={t === "eraser" ? "Radierer" : "Lasso"} aria-pressed={tool === t} onClick={() => { setFocusMenu(null); pickTool(t); }}>{toolIcon(t)}</button>)}
+          {canEdit && !focusMini && <span className="xnts-focusbar__wrap">
+            <button type="button" aria-expanded={focusMenu === "line"} aria-pressed={tool === "line"} title="Linie/Pfeil" aria-label="Linie/Pfeil" onClick={() => setFocusMenu(focusMenu === "line" ? null : "line")}>{lineIcon(lineToolStyle)}</button>
+            {focusMenu === "line" && <div className="xnts-pop" role="menu" aria-label="Linien- und Pfeilart">
+              <strong>Linien- und Pfeilart</strong>
+              <div className="xnts-pop__lines">{LINE_STYLES.map((l) => <button key={l.id} type="button" aria-pressed={tool === "line" && lineToolStyle === l.id} title={l.title} aria-label={l.title} onClick={() => { setLineToolStyle(l.id); setTool("line"); setFocusMenu(null); }}>{lineIcon(l.id, "#191620")}</button>)}</div>
+            </div>}
+          </span>}
           {canEdit && !focusMini && <i aria-hidden="true" />}
-          {canEdit && !focusMini && palette.slice(0, 8).map((c) => <button key={c} type="button" aria-label={`Farbe ${c}`} aria-pressed={color === c} className="xnts-focusbar__swatch" style={{ background: c }} onClick={() => { setColor(c); changePen({ color: c }); }} />)}
+          {canEdit && !focusMini && focusSlots.map((c, i) => { const on = color === c, key = `focus${i}`;
+            return <span key={i} className="xnts-focusbar__wrap">
+              <button type="button" aria-label={`Farbplatz ${i + 1}: ${c}`} aria-pressed={on} className="xnts-focusbar__swatch" style={{ background: c }} title={on ? "Nochmal antippen: Farbe dieses Platzes ändern" : "Farbe wählen"}
+                onClick={() => { if (on) setColorMenu(colorMenu === key ? null : key); else { setColor(c); changePen({ color: c }); setColorMenu(null); } }} />
+              {colorMenu === key && colorPop(c, (hex) => { setFocusSlots((sl) => sl.map((x, j) => (j === i ? hex : x))); setColor(hex); changePen({ color: hex }); setColorMenu(null); }, `Farbplatz ${i + 1} festlegen`)}
+            </span>; })}
           {canEdit && !focusMini && <i aria-hidden="true" />}
           {canEdit && !focusMini && <button type="button" onClick={undo} title="Rückgängig" aria-label="Rückgängig">↶</button>}
           {canEdit && !focusMini && <button type="button" onClick={redo} title="Wiederholen" aria-label="Wiederholen">↷</button>}
           {!focusMini && <button type="button" onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>}
           {!focusMini && <button type="button" onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)} title="Auf Breite einpassen" className="xnts-focusbar__zoom">{Math.round(zoom * 100)} %</button>}
           {!focusMini && <button type="button" onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>}
-          <button type="button" onClick={() => setFocusMini(!focusMini)} title={focusMini ? "Werkzeuge einblenden" : "Fokus-Leiste verkleinern"} aria-label={focusMini ? "Werkzeuge einblenden" : "Fokus-Leiste verkleinern"}>{focusMini ? (canEdit ? toolIcon(tool) : "＋") : "›"}</button>
-          <button type="button" className="xnts-focusbar__exit" onClick={() => setFocus(false)} title="Fokus beenden – Leisten wieder zeigen (Esc)">✕ Leisten</button>
+          <button type="button" onClick={() => { setFocusMenu(null); setFocusMini(!focusMini); }} title={focusMini ? "Werkzeuge einblenden" : "Fokus-Leiste verkleinern"} aria-label={focusMini ? "Werkzeuge einblenden" : "Fokus-Leiste verkleinern"}>{focusMini ? (canEdit ? toolIcon(tool) : "＋") : "›"}</button>
+          <button type="button" className="xnts-focusbar__exit" onClick={() => { setFocusMenu(null); setFocus(false); }} title="Fokus beenden – Leisten wieder zeigen (Esc)">✕ Leisten</button>
         </div>}
         {pdfDeleteMode && <div className="xnts-delete-banner" role="status">
           <span><strong>Löschmodus aktiv:</strong> ✕ an einer PDF-Seite tippen. Rückgängig mit Strg+Z.</span>
@@ -2348,7 +2492,12 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                   onBlur={finishText}
                   className={`w-full bg-transparent outline-none resize-none overflow-hidden border border-dashed rounded-sm leading-snug block ${readOnly || focus ? "border-transparent" : "border-blue-300/70"}`}
                   style={{ color: displayInk(tf.color, paperAtY((topsRef.current[tf.blockId] ?? 0) + tf.y)), fontSize: tf.fontSize * zoom, height: textH(tf) * zoom }} />
-                {expression && <div className="absolute left-0" style={{ top: (textH(tf) + 8) * zoom, width: Math.min(460, Math.max(300, PAGE_W - tf.x - 18)) * zoom, pointerEvents: "auto" }}><FunctionPlot expression={expression} /></div>}
+                {(() => { // mehrere Kurven bzw. Ableiten/Integrieren je Kurve → gemeinsamer Graph; ältere Einzelfunktionen behalten ihren bisherigen Graphen
+                  const curves = curvesFromText(tf.text, tf.functionCurves), multi = curves.length > 1 || (!!tf.functionCurves && curves.length > 0);
+                  if (!multi && !expression) return null;
+                  return <div className="absolute left-0" style={{ top: (textH(tf) + 8) * zoom, width: Math.min(460, Math.max(300, PAGE_W - tf.x - 18)) * zoom, pointerEvents: "auto" }}>
+                    {multi ? <MultiFunctionPlot curves={curves} onFlags={readOnly ? undefined : (flags) => { const before = snap(); editText(tf.id, { functionCurves: flags }); pushHist(before); schedule(); }} /> : <FunctionPlot expression={expression!} />}
+                  </div>; })()}
               </div>
             ); })}
             {pdfDeleteMode && blocks.map((b) => b.kind === "pdf" ? (
@@ -2407,7 +2556,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                 <option value="lasso">Lasso-Auswahl (wie OneNote)</option><option value="eraser">Radierer</option><option value="none">Keine Funktion</option>
               </select>
               <p>Die Rückseite des Stifts (Radierer-Ende, z. B. Surface Pen oder Slim Pen 2) radiert immer – unabhängig vom gewählten Werkzeug. Kugelschreiber schreibt gleichmäßig, Füller reagiert auf Druck und Strichrichtung, Bleistift ist körnig und wird mit Druck dunkler. Voraussetzung: Das Gerät meldet Stiftrückseite, Seitentaste und Druck an die App (Windows Ink).</p>
-              <label className="notiz-check-row"><input type="checkbox" checked={scribbleEraseEnabled} onChange={(e) => setScribbleEraseEnabled(e.target.checked)} /><span><strong>Kritzelradierer</strong><small>Standardmäßig an: Kritzele eine Zickzacklinie über einen Strich oder ein Textfeld, um es zu löschen. Hier abschalten, wenn du die Geste nicht möchtest.</small></span></label>
+              <label className="notiz-check-row"><input type="checkbox" checked={scribbleEraseEnabled} onChange={(e) => setScribbleEraseEnabled(e.target.checked)} /><span><strong>Kritzelradierer</strong><small>Standardmäßig an: Kritzele mit Stift oder Marker über einen Strich oder ein Textfeld, um es zu löschen. Hier abschalten, wenn du die Geste nicht möchtest.</small></span></label>
             <PenPreview kind={activePen.kind} size={size} color={color} smoothing={inkSmoothing} sensitivity={pressureSensitivity} />
               <details className="xnts-diag-details"><summary>Stift testen (Diagnose)</summary><PenDiagnostic /></details>
             </section>
@@ -2436,8 +2585,17 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       {functionDialog && <div className="notiz-function-backdrop" role="presentation" onPointerDown={(e) => { if (e.target === e.currentTarget) setFunctionDialog(false); }}>
         <form className="notiz-function-dialog" role="dialog" aria-modal="true" aria-labelledby="function-dialog-title" onSubmit={(e) => { e.preventDefault(); addFunctionField(); }} onPointerDown={(e) => e.stopPropagation()}>
           <h2 id="function-dialog-title">Funktion darstellen</h2>
-          <label htmlFor="function-expression">Funktionsgleichung</label>
-          <input id="function-expression" autoFocus value={functionDraft} onChange={(e) => setFunctionDraft(e.target.value)} placeholder="z. B. 2(x - 3)^2 - 4" />
+          <span className="notiz-function-dialog__label">Funktionen – pro Kurve ableiten, integrieren oder beides</span>
+          <div className="notiz-function-rows">
+            {functionRows.map((r, k) => <div key={k} className="notiz-function-row">
+              <label htmlFor={`function-expression-${k}`}>{FUNCTION_NAMES[k]}(x) =</label>
+              <input id={`function-expression-${k}`} autoFocus={k === 0} value={r.expr} onChange={(e) => setFunctionRows((rs) => rs.map((x, j) => (j === k ? { ...x, expr: e.target.value } : x)))} placeholder="z. B. 2(x - 3)^2 - 4" />
+              <button type="button" aria-pressed={r.d} onClick={() => setFunctionRows((rs) => rs.map((x, j) => (j === k ? { ...x, d: !x.d } : x)))} title="Ableitung zeigen">{FUNCTION_NAMES[k]}′ ableiten</button>
+              <button type="button" aria-pressed={r.i} onClick={() => setFunctionRows((rs) => rs.map((x, j) => (j === k ? { ...x, i: !x.i } : x)))} title="Stammfunktion zeigen">∫ integrieren</button>
+              {functionRows.length > 1 && <button type="button" className="notiz-function-row__remove" aria-label={`Kurve ${FUNCTION_NAMES[k]} entfernen`} onClick={() => setFunctionRows((rs) => rs.filter((_, j) => j !== k))}>✕</button>}
+            </div>)}
+            {functionRows.length < FUNCTION_NAMES.length && <button type="button" className="notiz-function-rows__add" onClick={() => setFunctionRows((rs) => [...rs, { expr: "", d: false, i: false }])}>＋ Kurve hinzufügen</button>}
+          </div>
           <p>{functionAnchor ? "Handschrift wird lokal nicht automatisch gelesen. Tippe die Formel hier kurz ab; der interaktive Graph erscheint direkt darunter." : "Gib den Ausdruck rechts von f(x) = ein."} Unterstützt werden unter anderem x², √x, |x|, sin x, xsin(x), Rechenzeichen und Klammern. Im Graphen kannst du Werte ablesen, zoomen und ein Integral untersuchen.</p>
           <div className="notiz-function-dialog__actions"><button type="button" onClick={() => setFunctionDialog(false)}>Abbrechen</button><button type="submit">Graph einfügen</button></div>
         </form>
