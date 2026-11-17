@@ -45,7 +45,7 @@ type Stroke = { id: string; blockId: string; tool: "pen" | "highlighter"; color:
 type PenProfile = { id: string; name: string; kind: PenKind; color: string; size: number };
 type Block = { id: string; kind: "pdf" | "blank"; height: number; gap: number; docId?: string; pageNum?: number };
 // Textfeld: y ist (wie bei Strichen) RELATIV zur Oberkante des Blocks → wandert beim Platz-Einfügen mit
-interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; role?: "function"; functionExpression?: string; functionCurves?: CurveFlags[] }
+interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; role?: "function"; functionExpression?: string; functionCurves?: CurveFlags[]; plotHidden?: boolean }
 type Snap = { strokes: Stroke[]; blocks: Block[]; texts: TextField[] };
 type XF = { px: number; py: number; s: number; rot: number }; // Live-Transformation: Pivot, Skalierung, Winkel
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -293,7 +293,7 @@ const PALM_MAX = 25;       // Touch-Kontaktfläche (CSS-px), ab der ein Finger a
 const PALM_AREA = 380;     // … oder Kontaktfläche Breite×Höhe (manche Treiber melden flache, breite Ballen)
 const PALM_REVERT_MS = 180;// nur eine direkt folgende Stiftberührung nimmt versehentliches Ballen-Scrollen zurück
 const TOUCH_SLOP = 3;      // Fingerbewegung startet fast sofort das Verschieben
-const PINCH_LOCK = 0.07;   // Zwei-Finger-Geste: erst ab 7 % Abstandsänderung zoomen, darunter nur verschieben
+const PINCH_LOCK = 0.04;   // Zwei-Finger-Geste: erst ab 4 % Abstandsänderung zoomen, darunter nur verschieben
 const A4_H = 1123;         // A4-Höhe bei Seitenbreite 794 px (identisch mit den Seiten des PDF-Exports)
 // k > 1: großzügiger, z. B. für den zweiten Finger einer Zoomgeste (Daumen melden oft größere Kontaktflächen)
 const isPalm = (e: PointerEvent, k = 1): boolean => e.pointerType === "touch" && (Math.max(e.width, e.height) > PALM_MAX * k || e.width * e.height > PALM_AREA * k * k); // Stift/Maus: immer false
@@ -659,6 +659,25 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const readOnlyRef = useRef(!!readOnly); readOnlyRef.current = !!readOnly;
   const viewPan = useRef<{ id: number; x: number; y: number } | null>(null); // Nur-ansehen: Stift/Maus ziehen verschiebt die Ansicht
   const [sidebar, setSidebar] = useState(() => !compact && window.matchMedia("(min-width: 1280px)").matches); // Lernraum: Seitenliste erst auf Wunsch
+  // Breite der Seitenliste: an der Trennlinie zur Notiz ziehbar (wie die Bibliothek), bleibt gespeichert
+  const PAGES_MIN = 132, PAGES_MAX = 380, PAGES_DEFAULT = 176;
+  const [pagesWidth, setPagesWidth] = useState(() => { try { const v = Number(localStorage.getItem("xnts-pages-width")); return Number.isFinite(v) && v >= PAGES_MIN && v <= PAGES_MAX ? v : PAGES_DEFAULT; } catch { return PAGES_DEFAULT; } });
+  const [pagesDragging, setPagesDragging] = useState(false);
+  useEffect(() => { try { localStorage.setItem("xnts-pages-width", String(Math.round(pagesWidth))); } catch { /* nur für diese Sitzung */ } }, [pagesWidth]);
+  const startPagesResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault(); e.stopPropagation(); // nie auf der Zeichenfläche malen
+    const el = e.currentTarget, x0 = e.clientX, w0 = pagesWidth;
+    try { el.setPointerCapture(e.pointerId); } catch { /* Fenster-Listener reichen auch ohne Capture */ }
+    setPagesDragging(true);
+    const move = (ev: PointerEvent) => { if (ev.pointerId === e.pointerId) setPagesWidth(Math.min(PAGES_MAX, Math.max(PAGES_MIN, w0 + ev.clientX - x0))); };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
+      setPagesDragging(false); schedule();
+    };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
+  };
   const [zoom, setZoomState] = useState(() => {
     const desktopSidebars = window.matchMedia("(min-width: 1280px)").matches ? 480 : 0;
     return Math.max(MIN_Z, Math.min(1, (window.innerWidth - desktopSidebars - 16) / PAGE_W));
@@ -703,6 +722,22 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const [pdfDeleteMode, setPdfDeleteMode] = useState(false); // bewusst NICHT gespeichert: beim Öffnen einer Notiz ist Löschen immer aus
   const zoomRef = useRef(zoom);
   const anchor = useRef<{ dx: number; dy: number; cx: number; cy: number } | null>(null);
+  // Live-Ansicht während des Pinch-Zooms: Die Notiz wird nur per GPU-Transformation skaliert (kein React-Neuaufbau pro Bild);
+  // erst beim Loslassen wird der Zoom übernommen. z = Live-Zoom, x/y = Bildschirmversatz des Dokument-Nullpunkts.
+  const liveView = useRef<{ z: number; x: number; y: number; docX: number; docY: number; cx: number; cy: number } | null>(null);
+  const zoomLayerRef = useRef<HTMLDivElement>(null);
+  // Kontextmenü eines Eintrags in der Seitenliste (Rechtsklick, Gedrückthalten oder ⋯)
+  const [sheetMenu, setSheetMenu] = useState<{ id: string; x: number; y: number; confirm: boolean } | null>(null);
+  const sheetMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!sheetMenu) return;
+    const away = (e: PointerEvent) => { if (!sheetMenuRef.current?.contains(e.target as Node)) setSheetMenu(null); };
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape") setSheetMenu(null); };
+    window.addEventListener("pointerdown", away, true); window.addEventListener("keydown", key);
+    return () => { window.removeEventListener("pointerdown", away, true); window.removeEventListener("keydown", key); };
+  }, [sheetMenu]);
+  const openSheetMenu = (id: string, x: number, y: number) =>
+    setSheetMenu({ id, x: Math.max(8, Math.min(x, window.innerWidth - 276)), y: Math.max(8, Math.min(y, window.innerHeight - 190)), confirm: false });
   const loaded = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const loadWarn = useRef(""); // Hinweis vom Laden (z. B. unlesbare PDF) bleibt sichtbar statt sofort von „Gespeichert“ überschrieben zu werden
@@ -756,6 +791,13 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   useEffect(() => { try { localStorage.setItem("notizraum-scribble-erase", String(scribbleEraseEnabled)); } catch { /* preference still works for this session */ } }, [scribbleEraseEnabled]);
   useEffect(() => { try { localStorage.setItem(collapseKey, String(toolbarCollapsed)); } catch { /* preference still works for this session */ } }, [toolbarCollapsed, collapseKey]);
   useEffect(() => { try { localStorage.setItem("notizraum-custom-colors", JSON.stringify(customColors)); } catch { /* palette still works for this session */ } }, [customColors]);
+  // Ausgeblendete Grundfarben (Grundfarben lassen sich aus der Palette entfernen, eigene Farben werden gelöscht)
+  const [hiddenColors, setHiddenColors] = useState<string[]>(() => {
+    try { const saved: unknown = JSON.parse(localStorage.getItem("xnts-hidden-colors") ?? "[]"); return Array.isArray(saved) ? saved.filter((c): c is string => typeof c === "string") : []; } catch { return []; }
+  });
+  useEffect(() => { try { localStorage.setItem("xnts-hidden-colors", JSON.stringify(hiddenColors)); } catch { /* nur für diese Sitzung */ } }, [hiddenColors]);
+  const [paletteEdit, setPaletteEdit] = useState(false); // Farbfenster im Löschmodus (× an jedem Farbpunkt)
+  useEffect(() => { if (!colorMenu) setPaletteEdit(false); }, [colorMenu]);
   useEffect(() => { try { localStorage.setItem("notizraum-pressure-sensitivity", String(pressureSensitivity)); } catch { /* sensitivity still works for this session */ } }, [pressureSensitivity]);
   useEffect(() => {
     if (!penProfiles.some((p) => p.id === activePenId)) setActivePenId(penProfiles[0]?.id ?? "ballpoint");
@@ -1088,14 +1130,21 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   }, [zoom]);
   useEffect(() => {
     const sc = scRef.current!;
+    // Touchpad-Pinch (Strg+Mausrad) liefert oft mehrere Ereignisse pro Bild: sammeln und höchstens einmal pro Bild zoomen
+    let acc = 0, at = { x: 0, y: 0 }, frame = 0;
     const wheel = (e: WheelEvent) => {
       if (!e.ctrlKey) return;
       e.preventDefault();
       const r = sc.getBoundingClientRect();
-      flushSync(() => setZoom(zoomRef.current * Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top)); // gleiche Begründung wie beim Pinch
+      acc += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY; at = { x: e.clientX - r.left, y: e.clientY - r.top };
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0; const d = acc; acc = 0;
+        flushSync(() => setZoom(zoomRef.current * Math.exp(-d * 0.01), at.x, at.y)); // Größe und Bildlauf im selben Bild
+      });
     };
     sc.addEventListener("wheel", wheel, { passive: false });
-    return () => sc.removeEventListener("wheel", wheel);
+    return () => { sc.removeEventListener("wheel", wheel); cancelAnimationFrame(frame); };
   }, [setZoom]);
 
   /* ───── Zeichenebene (nur sichtbarer Ausschnitt) ───── */
@@ -1113,7 +1162,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     ctx.lineCap = ctx.lineJoin = "round";
     ctx.strokeStyle = ctx.fillStyle = ink;
     if (dash.length) ctx.setLineDash(dash);
-    if (hl) { ctx.globalAlpha = 0.35; ctx.lineWidth = s.size * 5; ctx.lineCap = "butt"; }
+    if (hl) { ctx.globalAlpha = darkMode ? 0.42 : 0.35; ctx.lineWidth = s.size * 5; ctx.lineCap = "butt"; }
     const centerline = () => { // sichtbare Mittellinie als EIN Pfad (identisch zur Radierer-Geometrie curveAt)
       ctx.beginPath(); ctx.moveTo(P[0].x + ox, top + P[0].y);
       if (shaped) { for (let i = 1; i < n; i++) ctx.lineTo(P[i].x + ox, top + P[i].y); }
@@ -1181,6 +1230,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     ctx.restore();
   };
   const paintAdaptive = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0) => {
+    // Textmarker behält seine kräftige Farbe (die aufgehellte Dunkelmodus-Variante würde helle Schrift überstrahlen);
+    // die Lesbarkeit kommt aus Transparenz + Ebene unter der Schrift.
+    if (s.tool === "highlighter") { paint(ctx, s, ox, oy, s.color); return; }
     if (s.pts.length < 2) {
       const top = topsRef.current[s.blockId] ?? 0;
       paint(ctx, s, ox, oy, displayInk(s.color, paperAtY(top + oy + (s.pts[0]?.y ?? 0))));
@@ -1207,10 +1259,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     flush();
   };
   const eraseR = () => 6 + eraserSize * 3; // eigene Radierergröße, unabhängig von der Stiftbreite
+  const eraserPreviewUntil = useRef(0); // bis wann der Vorschau-Kreis nach einer Größenänderung angezeigt wird
   const draw = useCallback(() => {
     const cv = cvRef.current, sc = scRef.current;
     if (!cv || !sc) return;
-    const dpr = window.devicePixelRatio || 1, w = sc.clientWidth, h = sc.clientHeight, z = zoomRef.current;
+    const lv = liveView.current, dpr = window.devicePixelRatio || 1, w = sc.clientWidth, h = sc.clientHeight, z = lv ? lv.z : zoomRef.current;
     if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
       cv.width = w * dpr; cv.height = h * dpr;
       cv.style.width = w + "px"; cv.style.height = h + "px"; cv.style.marginBottom = -h + "px";
@@ -1218,17 +1271,23 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     const ctx = cv.getContext("2d")!;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    ctx.translate(offX() - sc.scrollLeft, -sc.scrollTop);
+    if (lv) ctx.translate(lv.x, lv.y); else ctx.translate(offX() - sc.scrollLeft, -sc.scrollTop);
     ctx.scale(z, z);
-    const v0 = sc.scrollTop / z - 40, v1 = (sc.scrollTop + h) / z + 40;
-    for (const s of strokes.current) {
-      const top = topsRef.current[s.blockId] ?? 0, bb = bbox(s), isSel = sel.current.has(s.id);
-      const oy = isSel ? dragOff.current.y : 0;
-      if (isSel && xf.current) { paintAdaptive(ctx, xformStroke(s, xf.current)); continue; }
-      if (top + bb.y1 + oy < v0 || top + bb.y0 + oy > v1) continue;
-      paintAdaptive(ctx, s, isSel ? dragOff.current.x : 0, oy);
+    const vt = lv ? -lv.y : sc.scrollTop, v0 = vt / z - 40, v1 = (vt + h) / z + 40;
+    // Zwei Ebenen: zuerst alle Textmarker (halbtransparent), DANN die Schrift darüber –
+    // so liegt der Marker wie bei Papier unter der Handschrift und die Schrift bleibt immer voll lesbar.
+    for (let pass = 0; pass < 2; pass++) {
+      const wantHl = pass === 0;
+      for (const s of strokes.current) {
+        if ((s.tool === "highlighter") !== wantHl) continue;
+        const top = topsRef.current[s.blockId] ?? 0, bb = bbox(s), isSel = sel.current.has(s.id);
+        const oy = isSel ? dragOff.current.y : 0;
+        if (isSel && xf.current) { paintAdaptive(ctx, xformStroke(s, xf.current)); continue; }
+        if (top + bb.y1 + oy < v0 || top + bb.y0 + oy > v1) continue;
+        paintAdaptive(ctx, s, isSel ? dragOff.current.x : 0, oy);
+      }
+      if (cur.current && (cur.current.tool === "highlighter") === wantHl) paintAdaptive(ctx, cur.current);
     }
-    if (cur.current) paintAdaptive(ctx, cur.current);
     for (const t of textFields.current) if (sel.current.has(t.id)) {
       const r = textRect(liveText(t));
       ctx.save(); ctx.setLineDash([]); ctx.fillStyle = "rgba(37,99,235,.10)"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.2 / z;
@@ -1267,12 +1326,25 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
         ctx.restore();
       }
     }
-    if ((tool === "eraser" || eraserHover.current) && hover.current) { ctx.setLineDash([]); ctx.strokeStyle = "#64748b"; ctx.beginPath(); ctx.arc(hover.current.x, hover.current.y, eraseR(), 0, 7); ctx.stroke(); }
+    const previewOn = tool === "eraser" && performance.now() < eraserPreviewUntil.current;
+    if (previewOn) { // Größe gerade geändert: Vorschau-Kreis gut sichtbar in der Mitte der Ansicht (Maus/Stift ist auf der Leiste)
+      const vx = ((lv ? -lv.x : sc.scrollLeft - offX()) + w / 2) / z, vy = (vt + h / 2) / z, r = eraseR();
+      ctx.setLineDash([]); ctx.fillStyle = "rgba(100,116,139,.14)"; ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1.5 / z;
+      ctx.beginPath(); ctx.arc(vx, vy, r, 0, 7); ctx.fill(); ctx.stroke();
+    } else if ((tool === "eraser" || eraserHover.current) && hover.current) { ctx.setLineDash([]); ctx.strokeStyle = "#64748b"; ctx.beginPath(); ctx.arc(hover.current.x, hover.current.y, eraseR(), 0, 7); ctx.stroke(); }
     ctx.restore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool, size, darkMode, pressureSensitivity]);
+  }, [tool, size, darkMode, pressureSensitivity, eraserSize]);
   const schedule = useCallback(() => { cancelAnimationFrame(raf.current); raf.current = requestAnimationFrame(draw); }, [draw]);
   useEffect(schedule, [blocks, tool, size, darkMode, schedule]);
+  // Radierergröße geändert (Punkte oder Schieberegler): Kreis sofort in Echtzeit zeigen, nach 1,2 s wieder ausblenden
+  const eraserSizeMounted = useRef(false);
+  useEffect(() => {
+    if (!eraserSizeMounted.current) { eraserSizeMounted.current = true; return; }
+    eraserPreviewUntil.current = performance.now() + 1200; schedule();
+    const t = window.setTimeout(schedule, 1250);
+    return () => window.clearTimeout(t);
+  }, [eraserSize, schedule]);
   useEffect(() => {
     const sc = scRef.current!, ro = new ResizeObserver(schedule);
     ro.observe(sc); sc.addEventListener("scroll", schedule, { passive: true });
@@ -1499,11 +1571,24 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
 
   /* ───── Finger: sofortiges Ein-Finger-Verschieben, zwei Finger verschieben + zoomen, große Ballenkontakte ignorieren ───── */
   const stopGestureFrame = () => { cancelAnimationFrame(gestureRaf.current); gestureRaf.current = 0; };
+  const clearLiveTransform = () => { const el = zoomLayerRef.current; if (el) { el.style.transform = ""; el.style.willChange = ""; } };
+  // Pinch abbrechen, ohne den Zoom zu übernehmen (z. B. Handballen erkannt)
+  const dropLiveView = () => { if (!liveView.current) return; liveView.current = null; clearLiveTransform(); schedule(); };
+  // Pinch beenden: Live-Zoom in einem einzigen Schritt übernehmen – Größe, Bildlauf und Tinte im selben Bild, ohne Sprung
+  const commitLiveView = () => {
+    const v = liveView.current, sc = scRef.current;
+    if (!v || !sc) return;
+    liveView.current = null;
+    clearLiveTransform();
+    if (Math.abs(v.z - zoomRef.current) > 1e-4) { anchor.current = { dx: v.docX, dy: v.docY, cx: v.cx, cy: v.cy }; zoomRef.current = v.z; flushSync(() => setZoomState(v.z)); }
+    else { sc.scrollLeft = v.docX * v.z + offX() - v.cx; sc.scrollTop = v.docY * v.z - v.cy; schedule(); }
+  };
   // Scrollen/Zoomen der laufenden Finger-Geste zurücknehmen (wenn sich herausstellt, dass es der Handballen war)
   const revertGesture = () => {
     const g = gesture.current, sc = scRef.current;
-    if (!sc || g.mode === "idle" || performance.now() - g.t0 > PALM_REVERT_MS) return;
-    stopGestureFrame();
+    if (!sc || g.mode === "idle") return;
+    if (performance.now() - g.t0 > PALM_REVERT_MS) { stopGestureFrame(); commitLiveView(); return; } // zu spät für Ballen: Zoom behalten
+    stopGestureFrame(); dropLiveView();
     if (Math.abs(zoomRef.current - g.zoom) > 1e-4) { restoreScroll.current = { left: g.scrollLeft, top: g.scrollTop }; zoomRef.current = g.zoom; setZoomState(g.zoom); }
     else { sc.scrollLeft = g.scrollLeft; sc.scrollTop = g.scrollTop; schedule(); }
   };
@@ -1528,12 +1613,23 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     if (g.mode !== "pinch" || !p || !sc || touches.current.size < 2) return;
     const [a, b] = [...touches.current.values()], r = sc.getBoundingClientRect(), d = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
     const cx = (a.x + b.x) / 2 - r.left, cy = (a.y + b.y) / 2 - r.top;
-    if (p.locked && Math.abs(d / p.d0 - 1) > PINCH_LOCK) { p.locked = false; p.d0 = d; p.z0 = zoomRef.current; } // ab jetzt zoomen – ohne Sprung
-    const z = p.locked ? zoomRef.current : clamp((p.z0 * d) / p.d0, MIN_Z, MAX_Z);
-    // flushSync: neue Größe, Bildlaufposition und Tinte erscheinen im SELBEN Bild. Ohne das zeichnete der Browser zwischendurch
-    // die alte Größe mit der neuen Bildlaufposition (oder umgekehrt) – die Ansicht sprang beim Zoomen hin und her.
-    if (Math.abs(z - zoomRef.current) > 1e-4) { anchor.current = { dx: p.docX, dy: p.docY, cx, cy }; zoomRef.current = z; flushSync(() => setZoomState(z)); }
-    else { sc.scrollLeft = p.docX * z + offX() - cx; sc.scrollTop = p.docY * z - cy; schedule(); }
+    if (p.locked && Math.abs(d / p.d0 - 1) > PINCH_LOCK) { p.locked = false; p.d0 = d; p.z0 = liveView.current?.z ?? zoomRef.current; } // ab jetzt zoomen – ohne Sprung
+    const zc = zoomRef.current, z = p.locked ? (liveView.current?.z ?? zc) : clamp((p.z0 * d) / p.d0, MIN_Z, MAX_Z);
+    if (!liveView.current && Math.abs(z - zc) <= 1e-4) { // nur verschieben: echter Bildlauf, kein Neuaufbau nötig
+      sc.scrollLeft = p.docX * z + offX() - cx; sc.scrollTop = p.docY * z - cy; schedule(); return;
+    }
+    // Zoomen: KEIN React-Neuaufbau pro Bild (das war bei großen Notizen/PDFs die Ursache für Ruckeln und Verzögerung).
+    // Die Notiz wird per GPU-Transformation skaliert, die Tinte direkt im selben Bild neu gezeichnet; der Punkt unter der
+    // Fingermitte bleibt exakt unter der Fingermitte. Übernommen wird der Zoom erst beim Loslassen (commitLiveView).
+    const lv = { z, x: cx - p.docX * z, y: cy - p.docY * z, docX: p.docX, docY: p.docY, cx, cy };
+    liveView.current = lv;
+    const el = zoomLayerRef.current;
+    if (el) {
+      const k = z / zc, tx = lv.x - offX() + sc.scrollLeft, ty = lv.y + sc.scrollTop;
+      el.style.willChange = "transform"; el.style.transformOrigin = "0 0";
+      el.style.transform = `translate3d(${tx}px, ${ty}px, 0) scale(${k})`;
+    }
+    cancelAnimationFrame(raf.current); draw();
   };
   const touchDown = (e: React.PointerEvent) => {
     const now = performance.now(), g = gesture.current, x = e.clientX, y = e.clientY;
@@ -1574,8 +1670,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     rejected.current.delete(e.pointerId);
     if (!touches.current.delete(e.pointerId)) return;
     const g = gesture.current;
-    if (touches.current.size === 0) { stopGestureFrame(); g.mode = "idle"; g.pinch = undefined; }
-    else if (g.mode === "pinch") { stopGestureFrame(); g.mode = "blocked"; g.pinch = undefined; } // ein Finger bleibt liegen: nicht plötzlich losscrollen
+    if (touches.current.size === 0) { stopGestureFrame(); commitLiveView(); g.mode = "idle"; g.pinch = undefined; }
+    else if (g.mode === "pinch") { stopGestureFrame(); commitLiveView(); g.mode = "blocked"; g.pinch = undefined; } // ein Finger bleibt liegen: nicht plötzlich losscrollen
   };
 
   /* ───── Pointer-Events: Stift/Maus zeichnen, Finger navigieren ───── */
@@ -1881,6 +1977,18 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     pushHist(s0); bump(); schedule();
     flash(`PDF-Seite ${pdfPageLabel(b)} gelöscht · Rückgängig mit Strg+Z`);
   };
+  /** Löscht ein eingefügtes Notizblatt (leere Seite ohne PDF) samt Strichen und Texten darauf; Rückgängig stellt alles wieder her. */
+  const deleteNoteSheet = (blockId: string) => {
+    const bs = blocksRef.current, i = bs.findIndex((x) => x.id === blockId), b = bs[i];
+    if (!b || b.kind !== "blank" || i === bs.length - 1) return; // der freie Bereich am Ende bleibt immer bestehen
+    const s0 = snap();
+    strokes.current = strokes.current.filter((s) => s.blockId !== blockId);
+    textFields.current = textFields.current.filter((t) => t.blockId !== blockId);
+    sel.current = new Set();
+    setBlocks(bs.filter((x) => x.id !== blockId));
+    pushHist(s0); bump(); schedule();
+    flash("Notizblatt gelöscht · Rückgängig mit Strg+Z");
+  };
   const togglePdfDeleteMode = () => {
     const next = !pdfDeleteMode;
     setPdfDeleteMode(next);
@@ -1889,37 +1997,34 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
 
   /* ───── Zwischenraum ───── */
   const setGap = (id: string, gap: number) => setBlocks((bs) => bs.map((b) => (b.id === id ? { ...b, gap: Math.max(MIN_GAP, gap) } : b)));
-  /** Messprotokoll aus dem Labor einfügen: Textfeld + Oszillogramm als normale Striche (Lasso, Radierer, Undo, Export funktionieren). */
+  /** Grafik aus dem Labor einfügen: NUR das Oszillogramm als normale Striche (Lasso, Radierer, Undo, Export funktionieren).
+   *  Der rohe Protokolltext (Datum, Gerätenamen, Messwerte …) wird bewusst NICHT mehr in die Notiz geschrieben. */
   const insertLabRecord = (rec: LabRecord) => {
+    if (!rec.scope) { flash("Nichts eingefügt · Übernommen wird nur die Grafik – bitte das Oszilloskop einschalten"); return; }
     const sc = scRef.current!, z = zoomRef.current, s0 = snap();
-    const viewTop = sc.scrollTop / z + 24, b = blockAt(viewTop), top = topsRef.current[b.id] ?? 0;
-    const x0 = 40, fontSize = 13, width = Math.min(PAGE_W - 2 * x0, 700);
-    const lines = [rec.title, ...rec.lines];
-    const estRows = lines.reduce((n, l) => n + Math.max(1, Math.ceil((l.length * fontSize * 0.55) / (width - 16))), 0);
-    const textHeight = Math.ceil(estRows * fontSize * 1.5 + 18);
-    let y = viewTop - top;
-    const newTexts: TextField[] = [{ id: uid(), blockId: b.id, text: lines.join("\n"), x: x0, y, width, height: textHeight, fontSize, color: "#1f2937" }];
+    const viewTop = sc.scrollTop / z + 24, viewBottom = (sc.scrollTop + sc.clientHeight) / z, b = blockAt(viewTop), top = topsRef.current[b.id] ?? 0;
+    const x0 = 40, W = 400, H = 320;
+    // Nicht über vorhandene Notizen legen: unter dem untersten Inhalt im sichtbaren Ausschnitt einfügen
+    let freeY = viewTop;
+    for (const st of strokes.current) { const t = topsRef.current[st.blockId] ?? 0, bb = bbox(st); if (t + bb.y1 >= viewTop && t + bb.y0 <= viewBottom && bb.x0 <= x0 + W && bb.x1 >= x0) freeY = Math.max(freeY, t + bb.y1 + 24); }
+    for (const tf of textFields.current) { const r = textRect(tf); if (r.y1 >= viewTop && r.y0 <= viewBottom && r.x0 <= x0 + W && r.x1 >= x0) freeY = Math.max(freeY, r.y1 + 24); }
+    const y = freeY - top;
     const newStrokes: Stroke[] = [];
-    y += textHeight + 14;
-    if (rec.scope) {
-      const W = 400, H = 320, dx = W / 10, dy = H / 8, P = (x: number, yy: number): Pt => ({ x, y: yy, p: 0.5 });
-      const line = (pts: Pt[], color: string, sz: number, lineStyle: LineStyle = "solid"): Stroke => ({ id: uid(), blockId: b.id, tool: "pen", color, size: sz, penKind: "ballpoint", lineStyle, pts, raw: true });
-      for (let i = 1; i < 10; i++) newStrokes.push(line([P(x0 + i * dx, y), P(x0 + i * dx, y + H)], "#cbd5e1", 0.8, i === 5 ? "solid" : "dotted"));
-      for (let j = 1; j < 8; j++) newStrokes.push(line([P(x0, y + j * dy), P(x0 + W, y + j * dy)], "#cbd5e1", 0.8, j === 4 ? "solid" : "dotted"));
-      newStrokes.push(line([P(x0, y), P(x0 + W, y), P(x0 + W, y + H), P(x0, y + H), P(x0, y)], "#475569", 1.4));
-      for (const t of rec.scope.traces) {
-        const step = Math.max(1, Math.floor(t.points.length / 600)), pts: Pt[] = [];
-        for (let i = 0; i < t.points.length; i += step) pts.push(P(x0 + (i / (t.points.length - 1)) * W, y + H / 2 - clamp(t.points[i], -4, 4) * dy));
-        newStrokes.push(line(pts, t.color, 1.8));
-      }
-      newTexts.push({ id: uid(), blockId: b.id, text: `${rec.scope.caption} · ${rec.scope.traces.map((t) => `${t.label} ${t.color === "#b45309" ? "braun" : "blau"}`).join(", ")}`, x: x0, y: y + H + 6, width: W + 160, height: 24, fontSize: 11, color: "#475569" });
-      y += H + 36;
+    const dx = W / 10, dy = H / 8, P = (x: number, yy: number): Pt => ({ x, y: yy, p: 0.5 });
+    const line = (pts: Pt[], color: string, sz: number, lineStyle: LineStyle = "solid"): Stroke => ({ id: uid(), blockId: b.id, tool: "pen", color, size: sz, penKind: "ballpoint", lineStyle, pts, raw: true });
+    for (let i = 1; i < 10; i++) newStrokes.push(line([P(x0 + i * dx, y), P(x0 + i * dx, y + H)], "#cbd5e1", 0.8, i === 5 ? "solid" : "dotted"));
+    for (let j = 1; j < 8; j++) newStrokes.push(line([P(x0, y + j * dy), P(x0 + W, y + j * dy)], "#cbd5e1", 0.8, j === 4 ? "solid" : "dotted"));
+    newStrokes.push(line([P(x0, y), P(x0 + W, y), P(x0 + W, y + H), P(x0, y + H), P(x0, y)], "#475569", 1.4));
+    for (const t of rec.scope.traces) {
+      const step = Math.max(1, Math.floor(t.points.length / 600)), pts: Pt[] = [];
+      for (let i = 0; i < t.points.length; i += step) pts.push(P(x0 + (i / (t.points.length - 1)) * W, y + H / 2 - clamp(t.points[i], -4, 4) * dy));
+      newStrokes.push(line(pts, t.color, 1.8));
     }
-    growTail(top + y + 200);
+    growTail(top + y + H + 200);
     strokes.current = [...strokes.current, ...newStrokes];
-    textFields.current = [...textFields.current, ...newTexts];
     pushHist(s0); bump(); schedule();
-    flash("Messprotokoll eingefügt · Rückgängig mit Strg+Z");
+    const sc2 = scRef.current; if (sc2 && (top + y + H) * z > sc2.scrollTop + sc2.clientHeight) sc2.scrollTo({ top: (top + y) * z - 40, behavior: "smooth" });
+    flash("Grafik eingefügt · Rückgängig mit Strg+Z");
   };
   /** Kleinster erlaubter Platz unter einer PDF-Seite: Notizen im Platz dürfen nicht unter die nächste Seite rutschen. */
   const gapFloor = (b: Block) => {
@@ -2079,7 +2184,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           if (b.gap > MIN_GAP) drawTpl(ctx, t + b.height, b.gap); // wie auf dem Bildschirm: Papier nur im eingefügten Platz
         } else drawTpl(ctx, t, b.height);
       }
-      strokes.current.forEach((s) => {
+      [...strokes.current].sort((a, b) => Number(b.tool === "highlighter") - Number(a.tool === "highlighter")).forEach((s) => { // Textmarker unter der Schrift
         const st = topsRef.current[s.blockId] ?? 0, bb = bbox(s);
         if (st + bb.y1 < y0 - 40 || st + bb.y0 > y0 + TH + 40) return; // liegt nicht auf dieser Seite
         paint(ctx, s, 0, 0, printableInk(s.color));
@@ -2196,7 +2301,12 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     : tpl === "dots" ? { backgroundImage: `radial-gradient(circle, ${darkMode ? "#475569" : "#cbd5e1"} 1px, transparent 1.2px)`, backgroundSize: "24px 24px", backgroundPosition: "12px 12px" }
     : {};
   const btn = (on: boolean) => `px-2.5 py-1.5 rounded-lg text-sm transition select-none ${on ? "bg-slate-900 text-white" : "hover:bg-slate-200 text-slate-700"}`;
-  const palette = [...COLORS, ...customColors.filter((c) => !COLORS.includes(c))];
+  const palette = [...COLORS.filter((c) => !hiddenColors.includes(c)), ...customColors.filter((c) => !COLORS.includes(c))];
+  const removePaletteColor = (c: string) => {
+    if (palette.length <= 1) return; // mindestens eine Farbe bleibt stehen
+    if (COLORS.includes(c)) setHiddenColors((h) => (h.includes(c) ? h : [...h, c]));
+    else setCustomColors((old) => old.filter((x) => x !== c));
+  };
   // Obere Leiste zeigt nur, WAS gewählt ist; die Optionen stehen in der Kontextleiste darunter (Vorlage „XNTS Werkzeugleiste“)
   type TopTool = Tool | "lab" | "func";
   const TOP_TOOLS: { id: TopTool; label: string }[] = [
@@ -2246,10 +2356,25 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   };
   // Farbfenster unter einem Farbknopf: Grundfarben, eigene Farben und freie Mischung
   const colorPop = (current: string, pickHex: (hex: string) => void, title: string) => (
-    <div className="xnts-pop xnts-pop--colors" role="dialog" aria-label={title} onPointerDown={(e) => e.stopPropagation()}>
-      <strong>{title}</strong>
-      <div className="xnts-pop__swatches">{palette.map((c) => <button key={c} type="button" aria-label={`Farbe ${c}`} aria-pressed={c === current} style={{ background: c }} onClick={() => pickHex(c)} />)}</div>
-      <label className="xnts-pop__mix">＋ Eigene Farbe mischen<input type="color" value={current} onChange={(e) => { const v = e.target.value.toLowerCase(); setCustomColors((old) => old.includes(v) ? old : [...old, v].slice(-12)); pickHex(v); }} /></label>
+    <div className="xnts-pop xnts-pop--colors" role="dialog" aria-label={title} data-editing={paletteEdit || undefined} onPointerDown={(e) => e.stopPropagation()}>
+      <div className="xnts-pop__head">
+        <strong>{title}</strong>
+        <button type="button" className="xnts-pop__edit" aria-pressed={paletteEdit} title={paletteEdit ? "Fertig" : "Farben entfernen (auch per Rechtsklick oder Gedrückthalten auf eine Farbe)"} onClick={() => setPaletteEdit((v) => !v)}>
+          {paletteEdit ? "Fertig" : <svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>}
+        </button>
+      </div>
+      <div className="xnts-pop__swatches">{palette.map((c) => {
+        let hold: number | undefined;
+        return <span key={c} className="xnts-pop__swatch">
+          <button type="button" aria-label={paletteEdit ? `Farbe ${c} entfernen` : `Farbe ${c}`} aria-pressed={!paletteEdit && c === current} style={{ background: c }}
+            onClick={() => (paletteEdit ? removePaletteColor(c) : pickHex(c))}
+            onContextMenu={(e) => { e.preventDefault(); setPaletteEdit(true); }}
+            onPointerDown={(e) => { if (e.pointerType !== "mouse") hold = window.setTimeout(() => setPaletteEdit(true), 500); }}
+            onPointerUp={() => window.clearTimeout(hold)} onPointerLeave={() => window.clearTimeout(hold)} onPointerCancel={() => window.clearTimeout(hold)} />
+          {paletteEdit && palette.length > 1 && <button type="button" className="xnts-pop__del" aria-label={`Farbe ${c} entfernen`} title="Farbe entfernen" onClick={() => removePaletteColor(c)}>×</button>}
+        </span>; })}</div>
+      {paletteEdit && hiddenColors.length > 0 && <button type="button" className="xnts-pop__restore" onClick={() => setHiddenColors([])}>Grundfarben wiederherstellen</button>}
+      {!paletteEdit && <label className="xnts-pop__mix">＋ Eigene Farbe mischen<input type="color" value={current} onChange={(e) => { const v = e.target.value.toLowerCase(); setCustomColors((old) => old.includes(v) ? old : [...old, v].slice(-12)); setHiddenColors((h) => h.filter((x) => x !== v)); pickHex(v); }} /></label>}
     </div>
   );
   // Vier Farbplätze, unabhängig voneinander: antippen = wählen, gewählten Platz nochmal antippen = Farbe dieses Platzes ändern
@@ -2318,7 +2443,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       </div>
       <CtxSep />
       <div className="xnts-ctx__group" role="group" aria-label="Radierergröße">
-        {([["klein", 1.5], ["mittel", 2.5], ["groß", 5]] as const).map(([l, v]) => sizeDot(v, Math.abs(eraserSize - v) < 0.01, `Radierergröße ${l}`, () => setEraserSize(v), true))}
+        {([["klein", 1.5], ["mittel", 2.5], ["groß", 5]] as const).map(([l, v]) => sizeDot(v, Math.abs(eraserSize - v) < 0.01, `Radierergröße ${l}`, () => { setEraserSize(v); eraserPreviewUntil.current = performance.now() + 1200; schedule(); window.setTimeout(schedule, 1250); }, true))}
         {slider(eraserSize, setEraserSize, "Radierergröße frei einstellen")}
       </div>
       <CtxSep />
@@ -2382,6 +2507,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       {!compact && <div className="xnts-art-banner__lockup xnts-topbar__lockup" aria-hidden="true"><strong>XNTS</strong><span>NOTES · STUDY · ART</span></div>}
       <header className="notiz-toolbar flex items-center gap-1.5 px-3 py-1.5 bg-white border-b border-slate-200 flex-wrap" data-collapsed={toolbarCollapsed} data-menu-open={functionMenuOpen || viewMenuOpen}>
         <div className="notiz-toolbar__row notiz-toolbar__primary">
+          <div className="notiz-toolbar__side notiz-toolbar__side--left">
           {onLibrary && <button type="button" className="xnts-tools__btn xnts-tools__lib" aria-pressed={libraryOpen} onClick={() => onLibrary(!libraryOpen)} title={libraryOpen ? "Bibliothek ausblenden" : "Bibliothek anzeigen"} aria-label={libraryOpen ? "Bibliothek ausblenden" : "Bibliothek anzeigen"}>
             <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h4v16H4zM10 4h4v16h-4zM16.5 4.5l3.5-.9 3 15.6-3.5.9z" /></svg>
           </button>}
@@ -2391,6 +2517,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             </button>
           </div>
           {readOnly && <span className="xnts-chip" title="Du kannst diese Notiz ansehen, scrollen und zoomen. Zum Mitschreiben „Meine privat“ wählen oder einen Admin um das Schreibrecht bitten.">👁 Nur ansehen</span>}
+          </div>
+          {/* Mittige Werkzeuggruppe: Werkzeuge · Verlauf · Mehr · Fokus – alles als Symbole */}
+          <div className="notiz-toolbar__center">
           {canEdit && <div className="xnts-tools" role="toolbar" aria-label="Werkzeuge">
             {TOP_TOOLS.map((t) => <button key={t.id} type="button" title={t.label + (topActive(t.id) && t.id !== "lab" && t.id !== "func" ? " – nochmal antippen blendet die Optionen ein/aus" : "")} aria-label={t.label} aria-pressed={topActive(t.id)} className="xnts-tools__btn" onClick={() => pickTop(t.id)}>{topIcon(t.id)}</button>)}
           </div>}
@@ -2402,17 +2531,26 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
               <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 14 5-5-5-5" /><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13" /></svg>
             </button>
           </div>}
-          <div ref={functionMenuTriggerRef} className="notiz-toolbar__menu-trigger">
-            <button className={btn(functionMenuOpen || functionActive) + " notiz-toolbar__menu-button"} onClick={() => { setFunctionMenuOpen((v) => !v); setViewMenuOpen(false); }} aria-haspopup="true" aria-expanded={functionMenuOpen} aria-controls={`${toolbarId}-function`} aria-pressed={functionActive}>
-              Mehr <span aria-hidden="true">⌄</span>
+          <div className="xnts-tools xnts-tools--extra" role="group" aria-label="Mehr und Fokus">
+            <div ref={functionMenuTriggerRef} className="notiz-toolbar__menu-trigger">
+              <button type="button" className="xnts-tools__btn" onClick={() => { setFunctionMenuOpen((v) => !v); setViewMenuOpen(false); }} aria-haspopup="true" aria-expanded={functionMenuOpen} aria-controls={`${toolbarId}-function`} aria-pressed={functionMenuOpen || functionActive}
+                title="Mehr: Papiervorlage, PDF importieren/exportieren …" aria-label="Mehr">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
+              </button>
+            </div>
+            <button type="button" className="xnts-tools__btn" onClick={() => { setViewMenuOpen(false); setFunctionMenuOpen(false); setFocus(true); }} title="Fokusmodus – alle Leisten ausblenden (Esc beendet)" aria-label="Fokusmodus">
+              {focusIcon}
             </button>
           </div>
+          </div>
+          <div className="notiz-toolbar__side notiz-toolbar__side--right">
           {pdfDeleteMode && <button className={btn(true) + " notiz-toolbar__pdf-delete"} aria-pressed onClick={togglePdfDeleteMode} title="Löschmodus beenden – PDF-Seiten sind dann wieder geschützt">🗑 Löschmodus beenden</button>}
           <span className="notiz-toolbar__status">
             {title && <span className="notiz-toolbar__title text-sm font-medium truncate">{title}</span>}
             <span className="notiz-toolbar__saved text-xs text-slate-500">{saved}</span>
           </span>
           <button className={btn(settingsOpen) + " notiz-toolbar__settings"} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings" title="Einstellungen" aria-label="Einstellungen">⚙</button>
+          </div>
         </div>
       </header>
       </div>
@@ -2421,13 +2559,14 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       <div className="relative flex flex-1 min-h-0">
         {labOpen && <LabBench onClose={() => setLabOpen(false)} onInsert={insertLabRecord} noteCircuit={circuitAnalysis} />}
         {sidebar && !focus && (
-          <aside className="notiz-page-sidebar w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2" aria-label="Seiten">
+          <aside className={"notiz-page-sidebar shrink-0 overflow-auto bg-white border-r border-slate-200 p-2" + (pagesDragging ? " is-resizing" : "")} style={{ width: pagesWidth }} aria-label="Seiten" onContextMenu={(e) => e.preventDefault() /* kein Browser-Menü („Zurück“, „Drucken“ …) in der Seitenliste */}>
             <div className="notiz-page-sidebar__head"><strong>Seiten</strong>{canEdit && <small>{hasPdf ? "Zwischen PDF-Seiten: Griff ⇕ in der Notiz ziehen. Sonst ＋ = mehr Platz." : "＋ = mehr Platz auf der Seite."}</small>}</div>
             {blocks.map((b, i) => {
               const last = i === blocks.length - 1, on = activeBlock === b.id, go = (y: number) => scRef.current!.scrollTo({ top: y * zoom - 12, behavior: "smooth" });
               const label = b.kind === "pdf" ? <>Seite <b>{pdfPageLabel(b)}</b></> : last ? "Freier Bereich" : "Notizblatt";
               return (
-                <div key={b.id} className={"notiz-page-sidebar__entry" + (on ? " is-active" : "") + (b.kind === "pdf" ? " is-pdf" : " is-blank")}>
+                <div key={b.id} className={"notiz-page-sidebar__entry" + (on ? " is-active" : "") + (b.kind === "pdf" ? " is-pdf" : " is-blank") + (sheetMenu?.id === b.id ? " is-menu" : "")}
+                  onContextMenu={(e) => { e.preventDefault(); if (canEdit && b.kind === "blank" && !last) openSheetMenu(b.id, e.clientX, e.clientY); }}>
                   <div className="notiz-page-sidebar__row">
                     <button className="notiz-page-sidebar__item" aria-current={on ? "page" : undefined} onClick={() => go(tops[b.id])}
                       title={b.kind === "pdf" ? `PDF-Seite ${pdfPageLabel(b)}` + (pdfPageLabel(b) !== String(b.pageNum) ? ` (Datei-Seite ${b.pageNum})` : "") : undefined}>
@@ -2436,6 +2575,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                     {pdfDeleteMode && b.kind === "pdf" && <button className="notiz-page-sidebar__act is-danger" onClick={() => deletePdfPage(b.id)} aria-label={`PDF-Seite ${pdfPageLabel(b)} löschen`} title="Diese PDF-Seite löschen">🗑</button>}
                     {canEdit && !pdfDeleteMode && b.kind === "pdf" && blocks[i + 1]?.kind !== "pdf" && <button className="notiz-page-sidebar__act" onClick={() => addSpaceUnder(b)} aria-label={`Platz unter Seite ${pdfPageLabel(b)} einfügen`} title={`Platz unter Seite ${pdfPageLabel(b)} einfügen – jedes Antippen etwas mehr, am Griff ⇕ genau anpassen`}>＋</button>}
                     {canEdit && !pdfDeleteMode && b.kind === "blank" && <button className="notiz-page-sidebar__act" onClick={() => extendBlank(b)} aria-label="Mehr Platz auf dieser Seite" title="＋ = mehr Platz auf dieser Seite (jedes Antippen etwas mehr)">＋</button>}
+                    {canEdit && !pdfDeleteMode && b.kind === "blank" && !last && <button className="notiz-page-sidebar__act notiz-page-sidebar__more" aria-haspopup="menu" aria-expanded={sheetMenu?.id === b.id}
+                      onClick={(e) => { const r = e.currentTarget.getBoundingClientRect(); if (sheetMenu?.id === b.id) setSheetMenu(null); else openSheetMenu(b.id, r.right + 4, r.top); }}
+                      aria-label="Aktionen für dieses Notizblatt" title="Aktionen (auch Rechtsklick oder Gedrückthalten)">⋯</button>}
                   </div>
                   {b.kind === "pdf" && b.gap > MIN_GAP && <div className="notiz-page-sidebar__row notiz-page-sidebar__sub">
                     <button className="notiz-page-sidebar__item" onClick={() => go(tops[b.id] + b.height)} title="Eigener Schreibplatz unter dieser Seite">
@@ -2452,6 +2594,28 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             })}
           </aside>
         )}
+        {sidebar && !focus && <div className={"xnts-col-resizer notiz-page-resizer" + (pagesDragging ? " is-dragging" : "")} role="separator" aria-orientation="vertical" aria-label="Breite der Seitenliste ändern"
+          aria-valuemin={PAGES_MIN} aria-valuemax={PAGES_MAX} aria-valuenow={Math.round(pagesWidth)} tabIndex={0}
+          title="Ziehen = Breite ändern · Doppelklick = Standardbreite"
+          onPointerDown={startPagesResize} onDoubleClick={() => setPagesWidth(PAGES_DEFAULT)}
+          onKeyDown={(e) => { if (e.key === "ArrowLeft") setPagesWidth((w) => Math.max(PAGES_MIN, w - 16)); else if (e.key === "ArrowRight") setPagesWidth((w) => Math.min(PAGES_MAX, w + 16)); }} />}
+        {sheetMenu && (() => { const b = blocks.find((x) => x.id === sheetMenu.id); if (!b) return null;
+          const n = strokes.current.filter((s) => s.blockId === b.id).length + textFields.current.filter((t) => t.blockId === b.id).length;
+          return <div ref={sheetMenuRef} className="notiz-entry-menu" role="menu" aria-label="Notizblatt" style={{ left: sheetMenu.x, top: sheetMenu.y }}>
+            <div className="notiz-entry-menu__head">
+              <span className="notiz-entry-menu__icon" aria-hidden="true">✎</span>
+              <span className="min-w-0"><strong>Notizblatt</strong><small>{n ? `${n} Element${n === 1 ? "" : "e"} darauf` : "leer"}</small></span>
+            </div>
+            {!sheetMenu.confirm ? <>
+              <button role="menuitem" onClick={() => { extendBlank(b); setSheetMenu(null); }}><span aria-hidden="true">＋</span> Mehr Platz</button>
+              <div className="notiz-entry-menu__sep" role="separator" />
+              <button role="menuitem" className="is-danger" onClick={() => { if (n) setSheetMenu({ ...sheetMenu, confirm: true }); else { deleteNoteSheet(b.id); setSheetMenu(null); } }}><span aria-hidden="true">🗑</span> Notizblatt löschen …</button>
+            </> : <>
+              <p className="notiz-entry-menu__ask">Notizblatt mit allem darauf löschen? Rückgängig mit Strg+Z möglich.</p>
+              <button role="menuitem" className="is-danger" autoFocus onClick={() => { deleteNoteSheet(b.id); setSheetMenu(null); }}><span aria-hidden="true">🗑</span> Ja, löschen</button>
+              <button role="menuitem" onClick={() => setSheetMenu(null)}><span aria-hidden="true">✕</span> Abbrechen</button>
+            </>}
+          </div>; })()}
         <div className="relative flex flex-1 min-w-0">
         {!focus && viewMenuOpen && <div className="xnts-ctx xnts-ctx--menu" onPointerDown={(e) => e.stopPropagation()}>
           <div id={`${toolbarId}-view`} ref={viewMenuPanelRef} className="xnts-ctx__inner" role="group" aria-label="Ansicht einstellen">
@@ -2459,7 +2623,6 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
               <span className="xnts-ctx__label">Bereiche</span>
               <button type="button" className="xnts-ctx__btn" aria-pressed={sidebar} onClick={() => setSidebar((v) => !v)}>{sidebar ? "Seitenliste ausblenden" : "Seitenliste anzeigen"}</button>
               <button type="button" className="xnts-ctx__btn" aria-pressed={toolbarCollapsed} onClick={() => setToolbarCollapsed((v) => !v)}>{toolbarCollapsed ? "Leiste erweitern" : "Leiste verkleinern"}</button>
-              <button type="button" className="xnts-ctx__btn inline-flex items-center gap-1.5" onClick={() => { setViewMenuOpen(false); setFocus(true); }} title="Alle Leisten ausblenden – Esc beendet den Fokusmodus">{focusIcon} Fokusmodus</button>
             </div>
             <CtxSep />
             <div className="xnts-ctx__group" role="group" aria-label="Zoom">
@@ -2575,7 +2738,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           }}>
           <canvas ref={cvRef} className="sticky top-0 left-0 z-10 pointer-events-none block" />
           <div className="xnts-canvas-notice" role="status" aria-live="polite">{notice && <span>{notice}</span>}</div>
-          <div className="relative mx-auto" style={{ width: PAGE_W * zoom, height: (total + 400) * zoom }}>
+          <div ref={zoomLayerRef} className="relative mx-auto" style={{ width: PAGE_W * zoom, height: (total + 400) * zoom }}>
             <div className="absolute top-0 left-0" style={{ width: PAGE_W, transform: `scale(${zoom})`, transformOrigin: "0 0" }}>
               {blocks.map((b) => (
                 <div key={b.id}>
@@ -2606,8 +2769,12 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                 {(() => { // mehrere Kurven bzw. Ableiten/Integrieren je Kurve → gemeinsamer Graph; ältere Einzelfunktionen behalten ihren bisherigen Graphen
                   const curves = curvesFromText(tf.text, tf.functionCurves), multi = curves.length > 1 || (!!tf.functionCurves && curves.length > 0);
                   if (!multi && !expression) return null;
+                  const setHidden = (hidden: boolean) => { const before = snap(); editText(tf.id, { plotHidden: hidden }); pushHist(before); schedule(); };
+                  if (tf.plotHidden) return readOnly ? null : <button type="button" className="xnts-function-plot__reopen absolute left-0" style={{ top: (textH(tf) + 6) * zoom, pointerEvents: "auto" }}
+                    onPointerDown={(e) => e.stopPropagation()} onClick={() => setHidden(false)} title="Graph wieder anzeigen">📈 Graph zeigen</button>;
+                  const close = () => setHidden(true);
                   return <div className="absolute left-0" style={{ top: (textH(tf) + 8) * zoom, width: Math.min(460, Math.max(300, PAGE_W - tf.x - 18)) * zoom, pointerEvents: "auto" }}>
-                    {multi ? <MultiFunctionPlot curves={curves} onFlags={readOnly ? undefined : (flags) => { const before = snap(); editText(tf.id, { functionCurves: flags }); pushHist(before); schedule(); }} /> : <FunctionPlot expression={expression!} />}
+                    {multi ? <MultiFunctionPlot curves={curves} onClose={close} onFlags={readOnly ? undefined : (flags) => { const before = snap(); editText(tf.id, { functionCurves: flags }); pushHist(before); schedule(); }} /> : <FunctionPlot expression={expression!} onClose={close} />}
                   </div>; })()}
               </div>
             ); })}

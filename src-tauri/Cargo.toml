@@ -1,6 +1,6 @@
 [package]
 name = "notizraum"
-version = "1.0.16"
+version = "1.0.17"
 description = "Lokaler Lernraum für PDFs und handschriftliche Notizen"
 authors = ["Notizraum"]
 edition = "2021"

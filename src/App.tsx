@@ -360,9 +360,7 @@ export default function App() {
           <div className="notiz-library-resizer" role="separator" aria-orientation="vertical" aria-label="Bibliotheksbreite ändern" aria-valuemin={LIB_MIN} aria-valuemax={LIB_MAX} aria-valuenow={Math.round(libWidth)} tabIndex={0}
             title="Ziehen = Breite ändern · ganz nach links = einklappen · Doppelklick = Standardbreite"
             onPointerDown={startLibResize} onDoubleClick={() => setLibWidth(LIB_DEFAULT)}
-            onKeyDown={(e) => { if (e.key === "ArrowLeft") setLibWidth((w) => Math.max(LIB_MIN, w - 16)); else if (e.key === "ArrowRight") setLibWidth((w) => Math.min(LIB_MAX, w + 16)); }}>
-            <span aria-hidden="true">‹‖›</span>
-          </div>
+            onKeyDown={(e) => { if (e.key === "ArrowLeft") setLibWidth((w) => Math.max(LIB_MIN, w - 16)); else if (e.key === "ArrowRight") setLibWidth((w) => Math.min(LIB_MAX, w + 16)); }} />
           <div className="notiz-library-brand flex items-center justify-between px-3 pt-3 pb-1">
             <img src={import.meta.env.BASE_URL + "notizraum-logo.svg"} alt="XNTS" className="h-9 w-auto" />
             <button className="notiz-library-close" onClick={() => setLib(false)} aria-label="Bibliothek schließen">✕</button>

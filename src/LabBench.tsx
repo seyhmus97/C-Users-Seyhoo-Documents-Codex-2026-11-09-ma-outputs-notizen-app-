@@ -180,7 +180,7 @@ const TUTORIALS: Tutorial[] = [
       { target: "pt3340.switch", text: "PeakTech als Amperemeter: Drehschalter auf „mA⎓“ (Gleichstrom).", done: (s) => s.meters.pt3340.pos === "mADC" },
       { target: "pt3340.jack", text: "Rote Leitung in die mA-Buchse stecken (bis 400 mA abgesichert).", done: (s) => s.meters.pt3340.jack === "mA" },
       { target: "pt3340.leads", text: "Amperemeter in Reihe schalten: „Netzteil · Strom durch R“. Strommesser kommen immer in den Stromkreis, nie parallel!", done: (s) => s.meters.pt3340.point === "psu.i" },
-      { target: null, text: "Ablesen: U ≈ 10 V und I ≈ 45 mA → R = U / I ≈ 220 Ω. Mit „In Notiz übernehmen“ landet alles im Protokoll." },
+      { target: null, text: "Ablesen: U ≈ 10 V und I ≈ 45 mA → R = U / I ≈ 220 Ω. Die Werte stehen hier im Labor; „In Notiz übernehmen“ fügt nur die Grafik ein." },
     ],
   },
   {
@@ -530,7 +530,7 @@ export default function LabBench({ onClose, onInsert, noteCircuit }: { onClose: 
 
       <footer className="xnts-lab-foot">
         <button className="xnts-lab-primary" disabled={noDevice} onClick={() => onInsert(buildRecord())}>In Notiz übernehmen</button>
-        <small>Fügt ein Messprotokoll{on.scope ? " mit Oszillogramm" : ""} an der sichtbaren Stelle ein · Rückgängig mit Strg+Z</small>
+        <small>{on.scope ? "Fügt nur die Grafik (Oszillogramm) ohne Protokolltext an einer freien Stelle ein · Rückgängig mit Strg+Z" : "Übernommen wird nur die Grafik – dafür das Oszilloskop einschalten"}</small>
         {tutorial && <button className="xnts-lab-linkbtn" onClick={() => setTut(null)}>Übung verlassen</button>}
         <details><summary>Gerätedaten aus den Handbüchern</summary><ul>
           {[...PSU.notes.map((n) => `Netzteil: ${n}`), ...GENERATOR.notes.map((n) => `Generator: ${n}`), ...SCOPE.notes.map((n) => `Oszilloskop: ${n}`), ...METERS.flatMap((m) => m.notes.map((n) => `${m.short}: ${n}`)), "Frontplatten sind vereinfachte Zeichnungen; Anordnung kann vom echten Gerät abweichen."].map((n) => <li key={n}>{n}</li>)}

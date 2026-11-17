@@ -25,7 +25,7 @@ type Series = { key: string; label: string; color: string; dash?: string; values
  * Mehrere Kurven in einem Koordinatensystem. Pro Kurve lässt sich die Ableitung f′ (numerisch, zentrale Differenz)
  * und die Stammfunktion F(x) = ∫₀ˣ f(t) dt (numerisch, Trapezregel) einzeln zuschalten.
  */
-export default function MultiFunctionPlot({ curves, onFlags }: { curves: Curve[]; onFlags?: (flags: CurveFlags[]) => void }) {
+export default function MultiFunctionPlot({ curves, onFlags, onClose }: { curves: Curve[]; onFlags?: (flags: CurveFlags[]) => void; onClose?: () => void }) {
   const [range, setRange] = useState({ min: -10, max: 10 });
   const [hoverX, setHoverX] = useState<number | null>(null);
   const plot = useMemo(() => {
@@ -79,11 +79,11 @@ export default function MultiFunctionPlot({ curves, onFlags }: { curves: Curve[]
     setHoverX(Math.max(range.min, Math.min(range.max, range.min + ((x - PAD.l) / (W - PAD.l - PAD.r)) * (range.max - range.min))));
   };
   const hk = hoverX === null ? -1 : Math.round(((hoverX - range.min) / (range.max - range.min)) * (plot.xs.length - 1));
-  return <section className="xnts-function-plot xnts-multi-plot" role="group" aria-label="Interaktiver Graph mehrerer Funktionen" onPointerDown={(e) => e.stopPropagation()}>
+  return <section className="xnts-function-plot xnts-multi-plot" role="group" aria-label="Interaktiver Graph mehrerer Funktionen" tabIndex={-1} onPointerDown={(e) => { e.stopPropagation(); e.currentTarget.focus({ preventScroll: true }); }} onKeyDown={(e) => { if (e.key === "Escape" && onClose) { e.stopPropagation(); onClose(); } }}>
     <header>
       <strong>{curves.map((c) => c.name + "(x)").join(", ")}</strong>
       <span className="xnts-function-plot__readout">{hk < 0 ? "Kurve antippen oder darüberfahren" : `x = ${fmt(hoverX!)} · ` + plot.paths.map((s) => `${s.label.split(" =")[0]} = ${fmt(s.values[hk])}`).join(" · ")}</span>
-      <div className="xnts-function-plot__controls"><button type="button" onClick={() => zoom(0.65)} aria-label="Graph vergrößern">＋</button><button type="button" onClick={() => zoom(1.55)} aria-label="Graph verkleinern">−</button><button type="button" onClick={() => setRange({ min: -10, max: 10 })} aria-label="Bereich zurücksetzen">⟲</button></div>
+      <div className="xnts-function-plot__controls"><button type="button" onClick={() => zoom(0.65)} aria-label="Graph vergrößern">＋</button><button type="button" onClick={() => zoom(1.55)} aria-label="Graph verkleinern">−</button><button type="button" onClick={() => setRange({ min: -10, max: 10 })} aria-label="Bereich zurücksetzen">⟲</button>{onClose && <button type="button" className="xnts-function-plot__close" onClick={onClose} aria-label="Graph schließen" title="Schließen (Esc)">✕</button>}</div>
     </header>
     <svg viewBox={`0 0 ${W} ${H}`} className="xnts-function-plot__svg xnts-multi-plot__svg" onPointerMove={onMove} onPointerLeave={() => setHoverX(null)} role="img" aria-label="Graph">
       {Array.from({ length: 11 }, (_, k) => range.min + ((range.max - range.min) * k) / 10).map((x, k) => <line key={`gx${k}`} x1={plot.px(x)} x2={plot.px(x)} y1={PAD.t} y2={H - PAD.b} className="xnts-function-plot__grid" />)}

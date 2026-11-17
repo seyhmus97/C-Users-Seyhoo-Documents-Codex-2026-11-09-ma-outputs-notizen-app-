@@ -7,7 +7,7 @@ type LimitKey = keyof Limits;
 const W = 460, H = 220, PAD = { l: 42, r: 14, t: 14, b: 28 };
 const fmt = (n: number) => Number.isFinite(n) ? Number(n.toPrecision(4)).toString().replace(".", ",") : "—";
 
-export default function FunctionPlot({ expression }: { expression: string }) {
+export default function FunctionPlot({ expression, onClose }: { expression: string; onClose?: () => void }) {
   const [range, setRange] = useState<Range>({ min: -10, max: 10 });
   const [hoverX, setHoverX] = useState<number | null>(null);
   const [integralOn, setIntegralOn] = useState(false);
@@ -105,9 +105,9 @@ export default function FunctionPlot({ expression }: { expression: string }) {
   const yAt = hoverX === null ? NaN : plot.evaluate(hoverX);
   const hx = hoverX === null ? null : plot.px(hoverX), hy = Number.isFinite(yAt) ? plot.py(yAt) : null;
   const aOnScreen = limits.a >= range.min && limits.a <= range.max, bOnScreen = limits.b >= range.min && limits.b <= range.max;
-  return <section className="xnts-function-plot" role="group" aria-label={`Interaktiver Funktionsgraph f(x) = ${expression}`} onPointerDown={stop}>
+  return <section className="xnts-function-plot" role="group" aria-label={`Interaktiver Funktionsgraph f(x) = ${expression}`} tabIndex={-1} onPointerDown={(e) => { stop(e); e.currentTarget.focus({ preventScroll: true }); }} onKeyDown={(e) => { if (e.key === "Escape" && onClose) { e.stopPropagation(); onClose(); } }}>
       <header><strong>f(x) = {expression}</strong><span className="xnts-function-plot__readout">{hoverX === null ? "Kurve antippen oder darüberfahren" : `x = ${fmt(hoverX)}  ·  f(x) = ${fmt(yAt)}${showAntiderivative ? `  ·  F(x) ≈ ${fmt(plot.integrate(limits.a, hoverX, 120))}` : ""}`}</span>
-      <div className="xnts-function-plot__controls"><button type="button" onClick={() => zoom(.65)} aria-label="Graph vergrößern">＋</button><button type="button" onClick={() => zoom(1.55)} aria-label="Graph verkleinern">−</button><button type="button" onClick={() => { setRange({ min: -10, max: 10 }); setHoverX(null); }} aria-label="Graph zurücksetzen">↺</button><button type="button" className={integralOn ? "is-on" : ""} onClick={() => setIntegralOn((v) => !v)} aria-label="Integralfläche anzeigen oder ausblenden" aria-pressed={integralOn}>∫</button></div>
+      <div className="xnts-function-plot__controls"><button type="button" onClick={() => zoom(.65)} aria-label="Graph vergrößern">＋</button><button type="button" onClick={() => zoom(1.55)} aria-label="Graph verkleinern">−</button><button type="button" onClick={() => { setRange({ min: -10, max: 10 }); setHoverX(null); }} aria-label="Graph zurücksetzen">↺</button><button type="button" className={integralOn ? "is-on" : ""} onClick={() => setIntegralOn((v) => !v)} aria-label="Integralfläche anzeigen oder ausblenden" aria-pressed={integralOn}>∫</button>{onClose && <button type="button" className="xnts-function-plot__close" onClick={onClose} aria-label="Graph schließen" title="Schließen (Esc)">✕</button>}</div>
     </header>
     {plot.error ? <p className="xnts-function-plot__error">Funktion noch nicht darstellbar: {plot.error}</p> : <>
       <svg viewBox={`0 0 ${W} ${H}`} className="xnts-function-plot__svg" onPointerMove={onMove} onPointerDown={onDown} onPointerUp={onUp} onPointerCancel={onUp} onPointerLeave={() => { if (!draggingLimit.current) setHoverX(null); }} role="img" aria-label="Graph mit verstellbarem Ausschnitt, Funktionswerten und Integral">
