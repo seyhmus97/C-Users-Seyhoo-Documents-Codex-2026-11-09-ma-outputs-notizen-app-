@@ -5,6 +5,7 @@ import { PenDiagnostic, PenPreview } from "./PenExtras";
 import { openTutorial } from "./Tutorial";
 import { GROUPS_ENABLED } from "./features";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import type { RasterIn, RasterOut } from "./pdfRaster.worker";
 import { saveFile } from "./saveFile";
@@ -36,7 +37,7 @@ const PAGE_W = 794, MIN_GAP = 16, SPACE_STEP = 200, TAIL_GROW = 1200, MIN_Z = 0.
 type Tool = "pen" | "highlighter" | "eraser" | "lasso" | "shape" | "line" | "text";
 type Shape = "rect" | "square" | "ellipse" | "circle" | "triangle" | "diamond" | "pentagon" | "star" | "axes" | "line" | "arrow";
 type Tpl = "blank" | "lined" | "grid" | "dots";
-type LineStyle = "solid" | "dashed" | "dotted" | "arrow" | "dashedArrow" | "dottedArrow";
+type LineStyle = "solid" | "dashed" | "fineDashed" | "dotted" | "arrow" | "dashedArrow" | "dottedArrow";
 type ThemePreference = "system" | "light" | "dark";
 type Pt = { x: number; y: number; p: number };
 // y ist RELATIV zum Block → Notizen wandern mit, wenn davor Platz eingefügt wird
@@ -72,7 +73,14 @@ const readPenProfiles = (): PenProfile[] => {
   return DEFAULT_PENS;
 };
 const hasArrow = (style: LineStyle | undefined) => !!style?.toLowerCase().includes("arrow");
-const dashFor = (style: LineStyle | undefined) => style?.toLowerCase().includes("dotted") ? [1.5, 5] : style?.toLowerCase().includes("dashed") ? [10, 7] : [];
+const dashFor = (style: LineStyle | undefined) => style === "fineDashed" ? [4, 3.5] : style?.toLowerCase().includes("dotted") ? [1.5, 5] : style?.toLowerCase().includes("dashed") ? [10, 7] : [];
+/** Stricharten für die Handschrift (Stift-Kontextleiste) */
+const PEN_STROKE_STYLES: { id: LineStyle; title: string }[] = [
+  { id: "solid", title: "Durchgezogen" },
+  { id: "dashed", title: "Gestrichelt" },
+  { id: "fineDashed", title: "Fein gestrichelt" },
+  { id: "dotted", title: "Gepunktet" },
+];
 
 /* ───────── Mini-IndexedDB (Key-Value) ───────── */
 let _db: Promise<IDBDatabase> | null = null;
@@ -287,7 +295,8 @@ const PALM_REVERT_MS = 180;// nur eine direkt folgende Stiftberührung nimmt ver
 const TOUCH_SLOP = 3;      // Fingerbewegung startet fast sofort das Verschieben
 const PINCH_LOCK = 0.07;   // Zwei-Finger-Geste: erst ab 7 % Abstandsänderung zoomen, darunter nur verschieben
 const A4_H = 1123;         // A4-Höhe bei Seitenbreite 794 px (identisch mit den Seiten des PDF-Exports)
-const isPalm = (e: PointerEvent): boolean => e.pointerType === "touch" && (Math.max(e.width, e.height) > PALM_MAX || e.width * e.height > PALM_AREA); // Stift/Maus: immer false
+// k > 1: großzügiger, z. B. für den zweiten Finger einer Zoomgeste (Daumen melden oft größere Kontaktflächen)
+const isPalm = (e: PointerEvent, k = 1): boolean => e.pointerType === "touch" && (Math.max(e.width, e.height) > PALM_MAX * k || e.width * e.height > PALM_AREA * k * k); // Stift/Maus: immer false
 type TouchPt = { x: number; y: number; sx: number; sy: number };
 type TouchGesture = {
   mode: "idle" | "pending" | "pan" | "pinch" | "blocked";
@@ -574,7 +583,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const [tool, setTool] = useState<Tool>("pen");
   const [eraseMode, setEraseMode] = useState<"pixel" | "stroke">("pixel");
   const [shapeKind, setShapeKind] = useState<Shape>("rect");
-  const [lineStyle, setLineStyle] = useState<LineStyle>("solid");
+  // Strichart der Handschrift (durchgezogen, gestrichelt, fein gestrichelt, gepunktet) – bleibt nach dem Neustart erhalten
+  const [lineStyle, setLineStyle] = useState<LineStyle>(() => { try { const v = JSON.parse(localStorage.getItem("xnts-pen-line-style") ?? "null"); return [...PEN_STROKE_STYLES, ...LINE_STYLES].some((l) => l.id === v) ? v : "solid"; } catch { return "solid"; } });
+  useEffect(() => { try { localStorage.setItem("xnts-pen-line-style", JSON.stringify(lineStyle)); } catch { /* nur für diese Sitzung */ } }, [lineStyle]);
   const [tpl, setTplState] = useState<Tpl>("blank");
   const [color, setColor] = useState(COLORS[0]);
   const [size, setSize] = useState(2.5);
@@ -658,6 +669,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const scRef = useRef<HTMLDivElement>(null);
   const cvRef = useRef<HTMLCanvasElement>(null);
   const docs = useRef(new Map<string, PDFDocumentProxy>());
+  /** Gedruckte Seitenzahlen der PDFs (PDF-Seitenbeschriftungen, z. B. „51“ statt Dateiseite 55); null = PDF hat keine eigenen Beschriftungen */
+  const [pageLabels, setPageLabels] = useState<Record<string, (string | null)[] | null>>({});
   const strokes = useRef<Stroke[]>([]);
   const cur = useRef<Stroke | null>(null);
   const lasso = useRef<{ x: number; y: number }[] | null>(null);
@@ -931,9 +944,11 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const topsRef = useRef(tops); topsRef.current = tops;
   const hasPdf = blocks.some((b) => b.kind === "pdf");
   useEffect(() => { if (!hasPdf) setPdfDeleteMode(false); }, [hasPdf]); // letzte PDF-Seite gelöscht → Modus aus
-  // A4-Seitengrenzen (alle 1123 px, wie die Seiten des PDF-Exports) – nur auf Schreibflächen, nicht über PDF-Seiten
+  // A4-Seitengrenzen (alle 1123 px, wie die Seiten des PDF-Exports) – nur in Notizen ohne PDF.
+  // In PDF-Notizen gilt die Seitenzählung des PDFs; eine zweite, durchlaufende Zählung („Seite 55“ über PDF-Seite 51) verwirrt nur.
   const pageBreaks = useMemo(() => {
     const out: number[] = [];
+    if (blocks.some((b) => b.kind === "pdf")) return out;
     for (const b of blocks) {
       const top = tops[b.id];
       const y0 = b.kind === "blank" ? top : top + b.height, y1 = top + b.height + (b.kind === "blank" ? 0 : b.gap);
@@ -943,6 +958,17 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     return out;
   }, [blocks, tops]);
   const blocksRef = useRef(blocks); blocksRef.current = blocks;
+  useEffect(() => { // Seitenbeschriftungen einmal je PDF laden (für die Seitenliste)
+    let alive = true;
+    for (const id of new Set(blocks.map((b) => b.docId).filter(Boolean) as string[])) {
+      const doc = docs.current.get(id);
+      if (!doc || id in pageLabels) continue;
+      doc.getPageLabels().then((labels: string[] | null) => { if (alive) setPageLabels((m) => ({ ...m, [id]: labels })); }, () => { if (alive) setPageLabels((m) => ({ ...m, [id]: null })); });
+    }
+    return () => { alive = false; };
+  }, [blocks, pageLabels]);
+  /** Seitenzahl wie im PDF gedruckt (Beschriftung), sonst die Seitennummer innerhalb der PDF-Datei – nie die Position in der Notiz */
+  const pdfPageLabel = (b: Block) => pageLabels[b.docId!]?.[b.pageNum! - 1]?.trim() || String(b.pageNum);
 
   const paperAtY = (y: number): "pdf" | "blank" | "gap" => {
     for (const b of blocksRef.current) {
@@ -1042,6 +1068,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   };
   const undo = () => { const s = past.current.pop(); if (s) { future.current.push(snap()); apply(s); } };
   const redo = () => { const s = future.current.pop(); if (s) { past.current.push(snap()); apply(s); } };
+  // Werte für die Knöpfe in der Hauptleiste (jede Änderung löst über markDirty/bump ohnehin ein Neuzeichnen aus)
+  const canUndo = past.current.length > 0, canRedo = future.current.length > 0;
 
   /* ───── Zoom (Pinch, Strg+Mausrad/Touchpad, Buttons) ───── */
   const setZoom = useCallback((z: number, cx?: number, cy?: number) => {
@@ -1064,7 +1092,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       if (!e.ctrlKey) return;
       e.preventDefault();
       const r = sc.getBoundingClientRect();
-      setZoom(zoomRef.current * Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top);
+      flushSync(() => setZoom(zoomRef.current * Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top)); // gleiche Begründung wie beim Pinch
     };
     sc.addEventListener("wheel", wheel, { passive: false });
     return () => sc.removeEventListener("wheel", wheel);
@@ -1282,6 +1310,30 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     for (const b of bs) if (y < topsRef.current[b.id] + b.height + b.gap) return b;
     return bs[bs.length - 1];
   };
+  // Seitenliste: welche Seite gerade auf dem Bildschirm ist (wird hervorgehoben und zeigt ihre Aktionen)
+  const [activeBlock, setActiveBlock] = useState<string | null>(null);
+  useEffect(() => {
+    const sc = scRef.current;
+    if (!sc) return;
+    let raf = 0;
+    const update = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => setActiveBlock(blockAt((sc.scrollTop + sc.clientHeight * 0.4) / zoomRef.current)?.id ?? null)); };
+    update();
+    sc.addEventListener("scroll", update, { passive: true });
+    return () => { cancelAnimationFrame(raf); sc.removeEventListener("scroll", update); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocks, zoom]);
+  useEffect(() => { document.querySelector(".notiz-page-sidebar .is-active")?.scrollIntoView({ block: "nearest" }); }, [activeBlock]);
+  /**
+   * Seitenliste „＋“: Schreibplatz direkt unter dieser PDF-Seite – in kleinen Schritten (wie ＋ am Griff), nicht als feste A4-Seite.
+   * Viele PDF-Seiten sind kleiner als A4; ein ganzes Blatt wäre fast immer zu viel. Feinjustieren am Griff ⇕ (größer und kleiner).
+   */
+  const addSpaceUnder = (b: Block) => {
+    const s0 = snap(), y = (topsRef.current[b.id] ?? 0) + b.height + Math.max(b.gap, MIN_GAP) - MIN_GAP;
+    setBlocks((list) => list.map((x) => (x.id === b.id ? { ...x, gap: Math.max(x.gap, MIN_GAP) + SPACE_STEP } : x)));
+    pushHist(s0);
+    scRef.current?.scrollTo({ top: Math.max(0, (y - 60) * zoomRef.current), behavior: "smooth" });
+    flash(`Platz unter Seite ${pdfPageLabel(b)} eingefügt · nochmal ＋ = mehr · Griff ⇕ ziehen = genau anpassen`);
+  };
   const inPoly = (pt: { x: number; y: number }, poly: { x: number; y: number }[]) => {
     let c = false;
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++)
@@ -1478,12 +1530,14 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     const cx = (a.x + b.x) / 2 - r.left, cy = (a.y + b.y) / 2 - r.top;
     if (p.locked && Math.abs(d / p.d0 - 1) > PINCH_LOCK) { p.locked = false; p.d0 = d; p.z0 = zoomRef.current; } // ab jetzt zoomen – ohne Sprung
     const z = p.locked ? zoomRef.current : clamp((p.z0 * d) / p.d0, MIN_Z, MAX_Z);
-    if (Math.abs(z - zoomRef.current) > 1e-4) { anchor.current = { dx: p.docX, dy: p.docY, cx, cy }; zoomRef.current = z; setZoomState(z); }
+    // flushSync: neue Größe, Bildlaufposition und Tinte erscheinen im SELBEN Bild. Ohne das zeichnete der Browser zwischendurch
+    // die alte Größe mit der neuen Bildlaufposition (oder umgekehrt) – die Ansicht sprang beim Zoomen hin und her.
+    if (Math.abs(z - zoomRef.current) > 1e-4) { anchor.current = { dx: p.docX, dy: p.docY, cx, cy }; zoomRef.current = z; flushSync(() => setZoomState(z)); }
     else { sc.scrollLeft = p.docX * z + offX() - cx; sc.scrollTop = p.docY * z - cy; schedule(); }
   };
   const touchDown = (e: React.PointerEvent) => {
     const now = performance.now(), g = gesture.current, x = e.clientX, y = e.clientY;
-    const palm = isPalm(e.nativeEvent) || penActive.current;
+    const palm = isPalm(e.nativeEvent, touches.current.size === 1 ? 1.6 : 1) || penActive.current;
     if (palm || g.mode === "blocked" || touches.current.size >= 2) {
       rejected.current.add(e.pointerId);
       // Dritter Kontakt oder Ballen neben einem laufenden Finger: Geste stoppen (und zurücknehmen, falls sie gerade erst begann)
@@ -1499,7 +1553,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     const t = touches.current.get(e.pointerId);
     if (!t) return;
     const g = gesture.current;
-    if (isPalm(e.nativeEvent) || penActive.current) { // Kontakt wächst zum Ballen oder der Stift schreibt: Geste beenden
+    // Während des Zoomens wachsen Fingerkontakte oft (Druck, Daumen) – das ist kein Handballen und darf die Geste nicht abbrechen
+    if ((g.mode !== "pinch" && isPalm(e.nativeEvent, touches.current.size > 1 ? 1.6 : 1)) || penActive.current) { // Kontakt wächst zum Ballen oder der Stift schreibt: Geste beenden
       rejected.current.add(e.pointerId); touches.current.delete(e.pointerId);
       revertGesture(); stopGestureFrame();
       g.mode = touches.current.size ? "blocked" : "idle"; g.pinch = undefined;
@@ -1800,18 +1855,6 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     sc.scrollTo({ top: Math.max(0, topsRef.current[id] * zoomRef.current - 12), behavior: "smooth" });
   }, [blocks]);
 
-  /** Fügt eine leere Blanko-Seite (1600 px) VOR dem Block an blockIndex ein. Der freie Bereich am Ende bleibt der letzte Block. */
-  const insertEmptyPageAt = (blockIndex: number) => {
-    const bs = blocksRef.current;
-    if (!Number.isFinite(blockIndex)) return;
-    const i = clamp(Math.round(blockIndex), 0, bs.length - 1);
-    const page: Block = { id: uid(), kind: "blank", height: 1600, gap: MIN_GAP };
-    const s0 = snap(); // Verlaufs-Snapshot VOR der Änderung
-    pendingScroll.current = page.id;
-    setBlocks([...bs.slice(0, i), page, ...bs.slice(i)]);
-    pushHist(s0);      // setzt den Undo-Schritt und startet das Auto-Speichern
-  };
-
   /** Verschiebt den Block fromIndex so, dass er danach an toIndex steht. Der freie Bereich am Ende bleibt fest. */
   const moveBlock = (fromIndex: number, toIndex: number) => {
     const bs = blocksRef.current, last = bs.length - 1;
@@ -1836,7 +1879,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     sel.current = new Set();
     setBlocks(bs.filter((x) => x.id !== blockId));
     pushHist(s0); bump(); schedule();
-    flash(`PDF-Seite ${b.pageNum} gelöscht · Rückgängig mit Strg+Z`);
+    flash(`PDF-Seite ${pdfPageLabel(b)} gelöscht · Rückgängig mit Strg+Z`);
   };
   const togglePdfDeleteMode = () => {
     const next = !pdfDeleteMode;
@@ -1878,21 +1921,59 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     pushHist(s0); bump(); schedule();
     flash("Messprotokoll eingefügt · Rückgängig mit Strg+Z");
   };
-  const addSpaceAtView = () => {
-    const sc = scRef.current!, b = blockAt((sc.scrollTop + sc.clientHeight / 2) / zoomRef.current), s0 = snap();
-    setBlocks((bs) => bs.map((x) => (x.id === b.id ? { ...x, gap: Math.max(x.gap, MIN_GAP) + SPACE_STEP } : x)));
-    pushHist(s0);
+  /** Kleinster erlaubter Platz unter einer PDF-Seite: Notizen im Platz dürfen nicht unter die nächste Seite rutschen. */
+  const gapFloor = (b: Block) => {
+    let bottom = 0;
+    for (const st of strokes.current) if (st.blockId === b.id) bottom = Math.max(bottom, bbox(st).y1);
+    for (const t of textFields.current) if (t.blockId === b.id) bottom = Math.max(bottom, t.y + textH(t));
+    return bottom > b.height + MIN_GAP / 2 ? Math.max(MIN_GAP, Math.ceil(bottom - b.height + 12)) : MIN_GAP;
   };
-  const startGapDrag = (e: React.PointerEvent, b: Block) => {
-    if (e.pointerType === "touch" || readOnlyRef.current) return; // Finger/Handballen: nicht den Zwischenraum ziehen, sondern normal scrollen (Zeichenfläche entscheidet)
-    e.stopPropagation();
-    const y0 = e.clientY, g0 = b.gap, s0 = snap();
-    const mv = (ev: PointerEvent) => setGap(b.id, g0 + (ev.clientY - y0) / zoomRef.current);
-    const up = () => {
-      window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up);
+  /**
+   * „Platz einfügen“ ist eine Funktion des Griffs ⇕ an den PDF-Seitengrenzen (Stift, Maus und Finger), kein eigener Knopf:
+   * zwischen zwei PDF-Seiten nur ZIEHEN (größer/kleiner, genau so viel wie nötig) · Doppelklick = Platz entfernen.
+   * Wo keine PDF-Seite folgt, fügt Antippen (＋) zusätzlich SPACE_STEP ein.
+   */
+  const startGapDrag = (e: React.PointerEvent, b: Block, allowTap: boolean) => {
+    if (readOnlyRef.current || (e.pointerType === "mouse" && e.button !== 0)) return;
+    e.stopPropagation(); e.preventDefault();
+    try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* ohne Capture geht es auch */ }
+    const id = e.pointerId, y0 = e.clientY, g0 = b.gap, s0 = snap(), floor = gapFloor(b);
+    let warned = false, moved = false;
+    const mv = (ev: PointerEvent) => {
+      if (ev.pointerId !== id) return;
+      if (!moved && Math.abs(ev.clientY - y0) < 4) return; // kleines Zittern beim Antippen ist kein Ziehen
+      moved = true;
+      const want = g0 + (ev.clientY - y0) / zoomRef.current;
+      if (want < floor - 1 && floor > MIN_GAP && !warned) { warned = true; flash("Im Platz stehen Notizen – zum weiteren Verkleinern erst radieren oder verschieben"); }
+      setGap(b.id, Math.max(floor, want));
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== id) return;
+      window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
+      if (!moved && ev.type === "pointerup") {
+        if (allowTap) { // ＋ antippen (keine PDF-Seite darunter): Platz in kleinen Schritten
+          setGap(b.id, Math.max(b.gap, MIN_GAP) + SPACE_STEP);
+          flash("Platz eingefügt · nochmal ＋ = mehr · Griff ziehen = genau anpassen");
+        } else flash("Griff nach unten ziehen = Platz einfügen · nach oben = kleiner");
+      }
       setTimeout(() => { if (blocksRef.current !== s0.blocks) pushHist(s0); }, 0);
     };
-    window.addEventListener("pointermove", mv); window.addEventListener("pointerup", up);
+    window.addEventListener("pointermove", mv); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
+  };
+  /** ＋ auf leeren Seiten und am Ende der Notiz: die Schreibfläche wird um SPACE_STEP länger (Inhalt darunter rückt mit) */
+  const extendBlank = (b: Block) => {
+    const s0 = snap();
+    setBlocks((list) => list.map((x) => (x.id === b.id ? { ...x, height: x.height + SPACE_STEP } : x)));
+    pushHist(s0);
+    flash("Mehr Platz eingefügt · nochmal ＋ = noch mehr");
+  };
+  const resetGap = (b: Block) => {
+    const floor = gapFloor(b);
+    if (Math.abs(b.gap - floor) < 1) return;
+    const s0 = snap();
+    setGap(b.id, floor);
+    pushHist(s0);
+    flash(floor > MIN_GAP ? "Platz auf die Notizen darin verkleinert" : "Platz entfernt · Rückgängig mit Strg+Z");
   };
 
   /* ───── PDF-Import (Datei wird in IndexedDB abgelegt) ───── */
@@ -1995,7 +2076,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
         if (b.kind === "pdf") {
           const img = bmp.get(b.id);
           if (img) ctx.drawImage(img, 0, t, PAGE_W, b.height);
-          if (b.gap > 0) drawTpl(ctx, t + b.height, b.gap);
+          if (b.gap > MIN_GAP) drawTpl(ctx, t + b.height, b.gap); // wie auf dem Bildschirm: Papier nur im eingefügten Platz
         } else drawTpl(ctx, t, b.height);
       }
       strokes.current.forEach((s) => {
@@ -2189,6 +2270,13 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     </label>
   );
   const CtxSep = () => <span className="xnts-ctx__sep" aria-hidden="true" />;
+  /** Kleine handschriftliche Welle als Vorschau einer Strichart (gleiches Strichmuster wie auf der Notizfläche) */
+  const strokeWave = (style: LineStyle, ink: string, marker = false) => (
+    <svg className="xnts-ctx__preview" aria-hidden="true" width="58" height="30" viewBox="0 0 58 30">
+      <path d="M6 20c8-12 14-12 20-2s12 10 26-6" fill="none" stroke={ink} strokeWidth={marker ? size * 5 : Math.min(Math.max(size, 1.5), 4)} strokeOpacity={marker ? 0.35 : 1}
+        strokeLinecap={marker ? "butt" : "round"} strokeLinejoin="round" strokeDasharray={dashFor(style).join(" ") || undefined} />
+    </svg>
+  );
   const ctxContent = (): React.ReactNode => {
     if (tool === "pen" || tool === "highlighter") {
       const setPenSize = (v: number) => { setSize(v); changePen({ size: v }); };
@@ -2204,8 +2292,20 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
         <div className="xnts-ctx__group" role="group" aria-label="Strichgröße">
           {([["dünn", 1.5], ["mittel", 2.5], ["dick", 4]] as const).map(([l, v]) => sizeDot(v, Math.abs(size - v) < 0.01, `Strichgröße ${l}`, () => setPenSize(v)))}
           {slider(size, setPenSize, "Strichgröße frei einstellen")}
-          <svg className="xnts-ctx__preview" aria-hidden="true" width="58" height="30" viewBox="0 0 58 30"><path d="M6 20c8-12 14-12 20-2s12 10 26-6" fill="none" stroke={color} strokeWidth={marker ? size * 5 : size} strokeOpacity={marker ? 0.35 : 1} strokeLinecap={marker ? "butt" : "round"} strokeLinejoin="round" /></svg>
         </div>
+        <CtxSep />
+        <span className="xnts-ctx__slotwrap">
+          <button type="button" className="xnts-ctx__stroke" aria-haspopup="true" aria-expanded={colorMenu === "stroke"} disabled={marker}
+            title={marker ? "Der Textmarker zeichnet immer durchgezogen" : `Strichart: ${PEN_STROKE_STYLES.find((x) => x.id === lineStyle)?.title ?? "Durchgezogen"} – antippen zum Wechseln`}
+            aria-label="Strichart der Handschrift wählen" onClick={() => setColorMenu(colorMenu === "stroke" ? null : "stroke")}>
+            {strokeWave(marker ? "solid" : lineStyle, color, marker)}<span aria-hidden="true">⌄</span>
+          </button>
+          {colorMenu === "stroke" && <div className="xnts-pop xnts-pop--strokes" role="menu" aria-label="Strichart der Handschrift">
+            <strong>Strichart</strong>
+            {PEN_STROKE_STYLES.map((st) => <button key={st.id} type="button" role="menuitemradio" aria-checked={lineStyle === st.id} className="xnts-pop__row xnts-pop__stroke"
+              onClick={() => { setLineStyle(st.id); setColorMenu(null); flash(`Strichart: ${st.title}`); }}>{strokeWave(st.id, "#191620")}<b>{st.title}</b></button>)}
+          </div>}
+        </span>
         <CtxSep />
         {colorSlotsUi}
         <button type="button" className="xnts-ctx__btn xnts-ctx__info" onClick={() => flash(penHint)} title={penHint} aria-label="Hinweis zu Linien und Formen">ⓘ</button>
@@ -2294,60 +2394,25 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           {canEdit && <div className="xnts-tools" role="toolbar" aria-label="Werkzeuge">
             {TOP_TOOLS.map((t) => <button key={t.id} type="button" title={t.label + (topActive(t.id) && t.id !== "lab" && t.id !== "func" ? " – nochmal antippen blendet die Optionen ein/aus" : "")} aria-label={t.label} aria-pressed={topActive(t.id)} className="xnts-tools__btn" onClick={() => pickTop(t.id)}>{topIcon(t.id)}</button>)}
           </div>}
+          {canEdit && <div className="xnts-tools xnts-tools--history" role="group" aria-label="Verlauf">
+            <button type="button" className="xnts-tools__btn" onClick={undo} disabled={!canUndo} title="Rückgängig (Strg+Z)" aria-label="Rückgängig">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" /></svg>
+            </button>
+            <button type="button" className="xnts-tools__btn" onClick={redo} disabled={!canRedo} title="Wiederholen (Strg+Y)" aria-label="Wiederholen">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 14 5-5-5-5" /><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13" /></svg>
+            </button>
+          </div>}
           <div ref={functionMenuTriggerRef} className="notiz-toolbar__menu-trigger">
             <button className={btn(functionMenuOpen || functionActive) + " notiz-toolbar__menu-button"} onClick={() => { setFunctionMenuOpen((v) => !v); setViewMenuOpen(false); }} aria-haspopup="true" aria-expanded={functionMenuOpen} aria-controls={`${toolbarId}-function`} aria-pressed={functionActive}>
               Mehr <span aria-hidden="true">⌄</span>
             </button>
           </div>
-        </div>
-        {viewMenuOpen && <div id={`${toolbarId}-view`} ref={viewMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Ansicht einstellen">
-          <div className="notiz-toolbar__panel-group">
-            <span className="notiz-toolbar__panel-label">Bereiche</span>
-            <button className={btn(sidebar)} aria-pressed={sidebar} onClick={() => setSidebar((v) => !v)}>{sidebar ? "Seitenliste ausblenden" : "Seitenliste anzeigen"}</button>
-            <button className={btn(toolbarCollapsed)} aria-pressed={toolbarCollapsed} onClick={() => setToolbarCollapsed((v) => !v)}>{toolbarCollapsed ? "Leiste erweitern" : "Leiste verkleinern"}</button>
-            <button className={btn(false) + " inline-flex items-center gap-1.5"} onClick={() => { setViewMenuOpen(false); setFocus(true); }} title="Alle Leisten ausblenden – Esc beendet den Fokusmodus">{focusIcon} Fokusmodus</button>
-          </div>
-          {canEdit && <div className="notiz-toolbar__panel-group">
-            <span className="notiz-toolbar__panel-label">Verlauf</span>
-            <button className={btn(false)} onClick={undo} title="Rückgängig (Strg+Z)" aria-label="Rückgängig">↶ Rückgängig</button>
-            <button className={btn(false)} onClick={redo} title="Wiederholen (Strg+Y)" aria-label="Wiederholen">↷ Wiederholen</button>
-          </div>}
-          <div className="notiz-toolbar__panel-group notiz-toolbar__zoom-group">
-            <span className="notiz-toolbar__panel-label">Zoom</span>
-            <button className={btn(false)} onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
-            <button className={btn(false)} onClick={() => setZoom(1)} title="Auf 100 Prozent setzen (Strg+0)">{Math.round(zoom * 100)}%</button>
-            <button className={btn(false)} onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
-            <input type="range" min={MIN_Z} max={MAX_Z} step={0.05} value={zoom} onChange={(e) => setZoom(+e.target.value)} aria-label="Zoomstufe" />
-            <button className={btn(false)} onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)}>Breite</button>
-          </div>
-        </div>}
-        {functionMenuOpen && <div id={`${toolbarId}-function`} ref={functionMenuPanelRef} className="notiz-toolbar__panel" role="group" aria-label="Mehr">
-          {canEdit && <>
-            <div className="notiz-toolbar__panel-group">
-              <span className="notiz-toolbar__panel-label">Seite</span>
-              <select value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Seitenvorlage">
-                <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
-              </select>
-              <label className="notiz-toolbar__panel-file cursor-pointer">
-                PDF importieren
-                <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; }} />
-              </label>
-            </div>
-          </>}
-          <div className="notiz-toolbar__panel-group">
-            <span className="notiz-toolbar__panel-label">PDF</span>
-            <button className={btn(false)} onClick={exportPdf}>Als PDF exportieren</button>
-          </div>
-        </div>}
-        <div className="notiz-toolbar__row notiz-toolbar__document">
-          {canEdit && <button className={btn(false)} onClick={addSpaceAtView}>Platz einfügen</button>}
-          {canEdit && hasPdf && <button className={btn(pdfDeleteMode) + " notiz-toolbar__pdf-delete"} aria-pressed={pdfDeleteMode} onClick={togglePdfDeleteMode}
-            title={pdfDeleteMode ? "Löschmodus beenden – PDF-Seiten können dann nicht mehr gelöscht werden" : "Löschmodus einschalten: an jeder PDF-Seite erscheint ein Löschknopf"}>
-            {pdfDeleteMode ? "🗑 Löschen AN – beenden" : "🗑 PDF-Seiten löschen"}
-          </button>}
-          <button className={btn(settingsOpen)} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings">⚙ Einstellungen</button>
-          {title && <span className="notiz-toolbar__title text-sm font-medium truncate max-w-[18rem] ml-auto">{title}</span>}
-          <span className="notiz-toolbar__saved text-xs text-slate-500">{saved}</span>
+          {pdfDeleteMode && <button className={btn(true) + " notiz-toolbar__pdf-delete"} aria-pressed onClick={togglePdfDeleteMode} title="Löschmodus beenden – PDF-Seiten sind dann wieder geschützt">🗑 Löschmodus beenden</button>}
+          <span className="notiz-toolbar__status">
+            {title && <span className="notiz-toolbar__title text-sm font-medium truncate">{title}</span>}
+            <span className="notiz-toolbar__saved text-xs text-slate-500">{saved}</span>
+          </span>
+          <button className={btn(settingsOpen) + " notiz-toolbar__settings"} onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-controls="notizraum-settings" title="Einstellungen" aria-label="Einstellungen">⚙</button>
         </div>
       </header>
       </div>
@@ -2356,33 +2421,84 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       <div className="relative flex flex-1 min-h-0">
         {labOpen && <LabBench onClose={() => setLabOpen(false)} onInsert={insertLabRecord} noteCircuit={circuitAnalysis} />}
         {sidebar && !focus && (
-          <aside className="notiz-page-sidebar w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2 space-y-1">
-            {blocks.map((b, i) => (
-              <div key={b.id}>
-                {canEdit && <button onClick={() => insertEmptyPageAt(i)} title="Leere Seite hier einfügen" aria-label={"Leere Seite vor Seite " + (i + 1) + " einfügen"}
-                  className="w-full h-6 rounded text-[11px] text-slate-400 hover:text-blue-600 hover:bg-blue-50 select-none">＋ Seite</button>}
-                <div className="flex items-center gap-0.5">
-                  <button className="flex-1 min-w-0 text-left px-2 py-2 rounded-md text-sm truncate hover:bg-slate-100"
-                    onClick={() => scRef.current!.scrollTo({ top: tops[b.id] * zoom - 12, behavior: "smooth" })}>
-                    {i + 1}. {b.kind === "pdf" ? `PDF S. ${b.pageNum}` : i === blocks.length - 1 ? "Freier Bereich" : "Leere Seite"}
-                  </button>
-                  {pdfDeleteMode && b.kind === "pdf" && <button onClick={() => deletePdfPage(b.id)} aria-label={`PDF-Seite ${b.pageNum} löschen`} title="Diese PDF-Seite löschen"
-                    className="w-8 h-9 rounded-md text-xs text-red-600 hover:bg-red-50">🗑</button>}
-                  {canEdit && i < blocks.length - 1 && !(pdfDeleteMode && b.kind === "pdf") && (
-                    <>
-                      <button disabled={i === 0} onClick={() => moveBlock(i, i - 1)} aria-label="Seite nach oben"
-                        className="w-8 h-9 rounded-md text-xs hover:bg-slate-100 disabled:opacity-25">▲</button>
-                      <button disabled={i >= blocks.length - 2} onClick={() => moveBlock(i, i + 1)} aria-label="Seite nach unten"
-                        className="w-8 h-9 rounded-md text-xs hover:bg-slate-100 disabled:opacity-25">▼</button>
-                    </>
-                  )}
+          <aside className="notiz-page-sidebar w-44 shrink-0 overflow-auto bg-white border-r border-slate-200 p-2" aria-label="Seiten">
+            <div className="notiz-page-sidebar__head"><strong>Seiten</strong>{canEdit && <small>{hasPdf ? "Zwischen PDF-Seiten: Griff ⇕ in der Notiz ziehen. Sonst ＋ = mehr Platz." : "＋ = mehr Platz auf der Seite."}</small>}</div>
+            {blocks.map((b, i) => {
+              const last = i === blocks.length - 1, on = activeBlock === b.id, go = (y: number) => scRef.current!.scrollTo({ top: y * zoom - 12, behavior: "smooth" });
+              const label = b.kind === "pdf" ? <>Seite <b>{pdfPageLabel(b)}</b></> : last ? "Freier Bereich" : "Notizblatt";
+              return (
+                <div key={b.id} className={"notiz-page-sidebar__entry" + (on ? " is-active" : "") + (b.kind === "pdf" ? " is-pdf" : " is-blank")}>
+                  <div className="notiz-page-sidebar__row">
+                    <button className="notiz-page-sidebar__item" aria-current={on ? "page" : undefined} onClick={() => go(tops[b.id])}
+                      title={b.kind === "pdf" ? `PDF-Seite ${pdfPageLabel(b)}` + (pdfPageLabel(b) !== String(b.pageNum) ? ` (Datei-Seite ${b.pageNum})` : "") : undefined}>
+                      <span className="notiz-page-sidebar__icon" aria-hidden="true">{b.kind === "pdf" ? "📄" : "✎"}</span>{label}
+                    </button>
+                    {pdfDeleteMode && b.kind === "pdf" && <button className="notiz-page-sidebar__act is-danger" onClick={() => deletePdfPage(b.id)} aria-label={`PDF-Seite ${pdfPageLabel(b)} löschen`} title="Diese PDF-Seite löschen">🗑</button>}
+                    {canEdit && !pdfDeleteMode && b.kind === "pdf" && blocks[i + 1]?.kind !== "pdf" && <button className="notiz-page-sidebar__act" onClick={() => addSpaceUnder(b)} aria-label={`Platz unter Seite ${pdfPageLabel(b)} einfügen`} title={`Platz unter Seite ${pdfPageLabel(b)} einfügen – jedes Antippen etwas mehr, am Griff ⇕ genau anpassen`}>＋</button>}
+                    {canEdit && !pdfDeleteMode && b.kind === "blank" && <button className="notiz-page-sidebar__act" onClick={() => extendBlank(b)} aria-label="Mehr Platz auf dieser Seite" title="＋ = mehr Platz auf dieser Seite (jedes Antippen etwas mehr)">＋</button>}
+                  </div>
+                  {b.kind === "pdf" && b.gap > MIN_GAP && <div className="notiz-page-sidebar__row notiz-page-sidebar__sub">
+                    <button className="notiz-page-sidebar__item" onClick={() => go(tops[b.id] + b.height)} title="Eigener Schreibplatz unter dieser Seite">
+                      <span className="notiz-page-sidebar__icon" aria-hidden="true">↳</span>Notizplatz
+                    </button>
+                    {canEdit && <button className="notiz-page-sidebar__act" onClick={() => resetGap(b)} aria-label={`Notizplatz unter Seite ${pdfPageLabel(b)} entfernen`} title="Leeren Platz entfernen (Notizen darin bleiben erhalten)">✕</button>}
+                  </div>}
+                  {canEdit && on && !last && !pdfDeleteMode && <div className="notiz-page-sidebar__move">
+                    <button disabled={i === 0} onClick={() => moveBlock(i, i - 1)} aria-label="Seite nach oben verschieben" title="Seite nach oben verschieben">▲ nach oben</button>
+                    <button disabled={i >= blocks.length - 2} onClick={() => moveBlock(i, i + 1)} aria-label="Seite nach unten verschieben" title="Seite nach unten verschieben">▼ nach unten</button>
+                  </div>}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </aside>
         )}
         <div className="relative flex flex-1 min-w-0">
-        {canEdit && !focus && ctxOpen && ctxContent() && <div className="xnts-ctx" role="toolbar" aria-label="Optionen des Werkzeugs" onPointerDown={(e) => e.stopPropagation()}>
+        {!focus && viewMenuOpen && <div className="xnts-ctx xnts-ctx--menu" onPointerDown={(e) => e.stopPropagation()}>
+          <div id={`${toolbarId}-view`} ref={viewMenuPanelRef} className="xnts-ctx__inner" role="group" aria-label="Ansicht einstellen">
+            <div className="xnts-ctx__group" role="group" aria-label="Bereiche">
+              <span className="xnts-ctx__label">Bereiche</span>
+              <button type="button" className="xnts-ctx__btn" aria-pressed={sidebar} onClick={() => setSidebar((v) => !v)}>{sidebar ? "Seitenliste ausblenden" : "Seitenliste anzeigen"}</button>
+              <button type="button" className="xnts-ctx__btn" aria-pressed={toolbarCollapsed} onClick={() => setToolbarCollapsed((v) => !v)}>{toolbarCollapsed ? "Leiste erweitern" : "Leiste verkleinern"}</button>
+              <button type="button" className="xnts-ctx__btn inline-flex items-center gap-1.5" onClick={() => { setViewMenuOpen(false); setFocus(true); }} title="Alle Leisten ausblenden – Esc beendet den Fokusmodus">{focusIcon} Fokusmodus</button>
+            </div>
+            <CtxSep />
+            <div className="xnts-ctx__group" role="group" aria-label="Zoom">
+              <span className="xnts-ctx__label">Zoom</span>
+              <button type="button" className="xnts-ctx__btn xnts-ctx__info" onClick={() => setZoom(zoomRef.current / 1.25)} aria-label="Verkleinern">−</button>
+              <button type="button" className="xnts-ctx__btn" onClick={() => setZoom(1)} title="Auf 100 Prozent setzen (Strg+0)">{Math.round(zoom * 100)} %</button>
+              <button type="button" className="xnts-ctx__btn xnts-ctx__info" onClick={() => setZoom(zoomRef.current * 1.25)} aria-label="Vergrößern">+</button>
+              <label className="xnts-ctx__slider"><input type="range" min={MIN_Z} max={MAX_Z} step={0.05} value={zoom} onChange={(e) => setZoom(+e.target.value)} aria-label="Zoomstufe" /></label>
+              <button type="button" className="xnts-ctx__btn" onClick={() => setZoom((scRef.current!.clientWidth - 32) / PAGE_W)} title="Seite auf Fensterbreite einpassen">Breite</button>
+            </div>
+          </div>
+        </div>}
+        {!focus && functionMenuOpen && <div className="xnts-ctx xnts-ctx--menu" onPointerDown={(e) => e.stopPropagation()}>
+          <div id={`${toolbarId}-function`} ref={functionMenuPanelRef} className="xnts-ctx__inner" role="group" aria-label="Mehr">
+            {canEdit && <><div className="xnts-ctx__group" role="group" aria-label="Papier">
+              <span className="xnts-ctx__label">Papier</span>
+              <select className="xnts-ctx__select" value={tpl} onChange={(e) => setTplState(e.target.value as Tpl)} aria-label="Papiervorlage">
+                <option value="blank">Blanko</option><option value="lined">Liniert</option><option value="grid">Kariert</option><option value="dots">Punktraster</option>
+              </select>
+            </div>
+            <CtxSep /></>}
+            <div className="xnts-ctx__group" role="group" aria-label="PDF">
+              <span className="xnts-ctx__label">PDF</span>
+              {canEdit && <label className="xnts-ctx__btn xnts-ctx__file">
+                PDF importieren
+                <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; setFunctionMenuOpen(false); }} />
+              </label>}
+              <button type="button" className="xnts-ctx__btn" onClick={() => { setFunctionMenuOpen(false); exportPdf(); }}>Als PDF exportieren</button>
+            </div>
+            {canEdit && hasPdf && <><CtxSep />
+            <div className="xnts-ctx__group" role="group" aria-label="Seiten entfernen">
+              <button type="button" className="xnts-ctx__btn xnts-ctx__btn--danger" aria-pressed={pdfDeleteMode} onClick={() => { setFunctionMenuOpen(false); togglePdfDeleteMode(); }}
+                title={pdfDeleteMode ? "Löschmodus beenden – PDF-Seiten können dann nicht mehr gelöscht werden" : "Löschmodus einschalten: an jeder PDF-Seite erscheint ein Löschknopf"}>
+                {pdfDeleteMode ? "🗑 Löschmodus beenden" : "🗑 PDF-Seiten löschen …"}
+              </button>
+            </div></>}
+          </div>
+        </div>}
+        {canEdit && !focus && !viewMenuOpen && !functionMenuOpen && ctxOpen && ctxContent() && <div className="xnts-ctx" role="toolbar" aria-label="Optionen des Werkzeugs" onPointerDown={(e) => e.stopPropagation()}>
           <div className="xnts-ctx__inner">{ctxContent()}</div>
         </div>}
         {focus && <div className={"xnts-focusbar" + (focusMini ? " is-mini" : "") + (focusMenu || colorMenu?.startsWith("focus") ? " has-pop" : "")} role="toolbar" aria-label="Fokus-Leiste">
@@ -2466,14 +2582,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                   <div className={`absolute left-0 bg-white shadow-md${pdfDeleteMode && b.kind === "pdf" ? " xnts-pdf-deletable" : ""}`} data-note-paper={b.kind} style={{ top: tops[b.id], width: PAGE_W, height: b.height, backgroundColor: b.kind === "blank" && darkMode ? "#111827" : "#fff", ...(b.kind === "blank" ? tplStyle : {}) }}>
                     {b.kind === "pdf" && docs.current.get(b.docId!) && <PdfPage doc={docs.current.get(b.docId!)!} docId={b.docId!} pageNum={b.pageNum!} height={b.height} zoom={zoom} getRoot={getScroller} />}
                   </div>
-                  {b.kind === "pdf" && (
-                    <div onPointerDown={(e) => startGapDrag(e, b)} onDoubleClick={() => setGap(b.id, MIN_GAP)}
-                      title="Ziehen = Platz einfügen · Doppelklick = zurücksetzen"
-                      className="absolute left-0 group cursor-row-resize" style={{ top: tops[b.id] + b.height, width: PAGE_W, height: Math.max(b.gap, 20) }}>
-                      <div className={`w-full border-y border-dashed flex items-center justify-center ${b.gap > MIN_GAP ? "border-blue-300" : "border-transparent group-hover:border-blue-300"}`} style={{ height: b.gap, backgroundColor: darkMode ? "#111827" : "#fff", ...tplStyle }}>
-                        <span className="text-xs text-blue-600 opacity-0 group-hover:opacity-100">↕ {Math.round(b.gap)} px Platz</span>
-                      </div>
-                    </div>
+                  {b.kind === "pdf" && b.gap > MIN_GAP && ( // Blatt nur dort, wo wirklich Platz eingefügt wurde – genau so groß wie nötig
+                    <div className="absolute left-0 shadow-md xnts-gap-paper" data-note-paper="gap" aria-hidden="true"
+                      style={{ top: tops[b.id] + b.height, width: PAGE_W, height: b.gap, backgroundColor: darkMode ? "#111827" : "#fff", ...tplStyle }} />
                   )}
                 </div>
               ))}
@@ -2500,11 +2611,25 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                   </div>; })()}
               </div>
             ); })}
+            {canEdit && !pdfDeleteMode && blocks.map((b, i) => { if (b.kind !== "pdf") return null;
+              const between = blocks[i + 1]?.kind === "pdf"; // zwischen zwei PDF-Seiten: nur ziehen; sonst zusätzlich ＋ antippen
+              return <button key={"gap-" + b.id} type="button" className={"xnts-gap-grip" + (b.gap > MIN_GAP ? " has-space" : "") + (between ? "" : " is-plus")}
+                style={{ top: (tops[b.id] + b.height + Math.max(b.gap, MIN_GAP) - MIN_GAP / 2) * zoom, left: PAGE_W * zoom - 30 }}
+                aria-label={between ? `Platz unter PDF-Seite ${pdfPageLabel(b)}: ${Math.round(b.gap)} Pixel – nach unten ziehen = mehr, nach oben = weniger` : `Unter PDF-Seite ${pdfPageLabel(b)} Platz einfügen`}
+                title={between ? "Ziehen: nach unten = Platz einfügen, nach oben = kleiner · Doppelklick = Platz entfernen" : "＋ antippen = mehr Platz · Ziehen = genau anpassen · Doppelklick = entfernen"}
+                onPointerDown={(e) => startGapDrag(e, b, !between)}
+                onDoubleClick={(e) => { e.stopPropagation(); resetGap(b); }}>
+                <span aria-hidden="true">{between ? "⇕" : "＋"}</span>{b.gap > MIN_GAP && <small>{Math.round(b.gap)}</small>}
+              </button>; })}
+            {canEdit && !pdfDeleteMode && blocks.length > 0 && (() => { const lastB = blocks[blocks.length - 1]; return (
+              <button type="button" className="xnts-more-space" style={{ top: (tops[lastB.id] + lastB.height) * zoom + 14, left: (PAGE_W * zoom) / 2 }}
+                onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); extendBlank(lastB); }}
+                title="Am Ende der Notiz mehr Schreibplatz anfügen">＋ Mehr Platz</button>); })()}
             {pdfDeleteMode && blocks.map((b) => b.kind === "pdf" ? (
               <button key={"del-" + b.id} type="button" className="xnts-pdf-delete" style={{ top: tops[b.id] * zoom + 10, right: 10 }}
-                aria-label={`PDF-Seite ${b.pageNum} löschen`} title={`PDF-Seite ${b.pageNum} löschen (Rückgängig mit Strg+Z)`}
+                aria-label={`PDF-Seite ${pdfPageLabel(b)} löschen`} title={`PDF-Seite ${pdfPageLabel(b)} löschen (Rückgängig mit Strg+Z)`}
                 onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}
-                onClick={(e) => { e.stopPropagation(); deletePdfPage(b.id); }}>✕ Seite {b.pageNum} löschen</button>
+                onClick={(e) => { e.stopPropagation(); deletePdfPage(b.id); }}>✕ Seite {pdfPageLabel(b)} löschen</button>
             ) : null)}
           </div>
         </div>
@@ -2535,7 +2660,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             <section className="notiz-settings-section">
               <h3>Linien &amp; Formen</h3><label htmlFor="settings-line-style">Linienstil</label>
               <select id="settings-line-style" value={lineStyle} onChange={(e) => setLineStyle(e.target.value as LineStyle)} className="notiz-settings-select">
-                {LINE_STYLES.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
+                {[...PEN_STROKE_STYLES, ...LINE_STYLES.filter((l) => !PEN_STROKE_STYLES.some((p) => p.id === l.id))].map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
               </select>
               <label className="notiz-check-row"><input type="checkbox" checked={smartShapesEnabled} onChange={(e) => setSmartShapesEnabled(e.target.checked)} /><span><strong>Smart Shapes</strong><small>Linien, Rechtecke, Dreiecke und Kreise beim Halten (0,5 s) glätten – Start, Ende und Winkel bleiben erhalten. Nur exakt fluchtende Linien (≤ 2,5°) werden automatisch verlängert; ein Hinweis zeigt das an.</small></span></label>
               <label className="notiz-check-row"><input type="checkbox" checked={autoStraighten} disabled={!smartShapesEnabled} onChange={(e) => setAutoStraighten(e.target.checked)} /><span><strong>Linien automatisch begradigen</strong><small>Gerade gezogene Linien und Leitungen mit Knicken werden beim Absetzen sofort begradigt – ohne Lasso und ohne Halten. Winkel, Start und Ende bleiben erhalten; kurze Striche und Handschrift bleiben unverändert. „Rückgängig“ stellt den Freihandstrich wieder her.</small></span></label>

@@ -1,5 +1,5 @@
 // App.tsx – Bibliothek mit beliebig tiefen Ordnern; jede Notiz ist eine eigene unendliche Leinwand
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useRegisterSW } from "virtual:pwa-register/react";
 import NoteCanvas, { flushNote, kvAll, kvDel, kvGet, kvReplaceAll, kvSet, rasterKey } from "./NoteCanvas";
 import { saveFile } from "./saveFile";
@@ -77,6 +77,10 @@ export default function App() {
   const [libraryMenu, setLibraryMenu] = useState(false);
   const [edit, setEdit] = useState<string | null>(null);
   const [menu, setMenu] = useState<string | null>(null);
+  // Kontextmenü eines Eintrags: schwebt direkt am Eintrag (⋯, Rechtsklick oder Gedrückthalten) und nennt ihn in der Kopfzeile
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number; alignRight?: boolean } | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const longPress = useRef<{ timer: number; x: number; y: number; fired: boolean } | null>(null);
   const [moving, setMoving] = useState<string | null>(null);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const restoreInput = useRef<HTMLInputElement>(null);
@@ -146,11 +150,23 @@ export default function App() {
   const desc = (id: string): string[] => nodes.filter((n) => n.parentId === id).flatMap((c) => [c.id, ...desc(c.id)]);
   const reveal = (id: string) => { const up = new Set<string>(); let n = byId(id)?.parentId; while (n) { up.add(n); n = byId(n)?.parentId ?? null; } setNodes((ns) => ns.map((x) => (up.has(x.id) ? { ...x, open: true } : x))); };
 
+  const openMenu = (id: string, x: number, y: number, alignRight = false) => { setMenu(id); setMenuPos({ x, y, alignRight }); };
+  const closeMenu = () => { setMenu(null); setMenuPos(null); };
+  const startLongPress = (e: React.PointerEvent, id: string) => {
+    if (e.pointerType === "mouse") return; // Maus: Rechtsklick
+    const x = e.clientX, y = e.clientY;
+    if (longPress.current) clearTimeout(longPress.current.timer);
+    longPress.current = { x, y, fired: false, timer: window.setTimeout(() => { if (longPress.current) { longPress.current.fired = true; openMenu(id, x, y); } }, 520) };
+  };
+  const moveLongPress = (e: React.PointerEvent) => { const l = longPress.current; if (l && !l.fired && Math.hypot(e.clientX - l.x, e.clientY - l.y) > 8) { clearTimeout(l.timer); longPress.current = null; } };
+  const endLongPress = () => { const l = longPress.current; if (l && !l.fired) { clearTimeout(l.timer); longPress.current = null; } };
+  /** true, wenn der folgende Klick zum Gedrückthalten gehört (dann Notiz/Ordner nicht zusätzlich öffnen) */
+  const consumeLongPress = () => { const fired = !!longPress.current?.fired; longPress.current = null; return fired; };
   const add = (parentId: string | null, type: "folder" | "note") => {
     const id = uid(), d = parentId ? depthOf(byId(parentId)!) + 1 : 0;
     const name = type === "note" ? "Neues Thema" : d === 0 ? "Neues Semester" : d === 1 ? "Neues Fach" : "Neuer Ordner";
     setNodes((ns) => [...ns.map((n) => (n.id === parentId ? { ...n, open: true } : n)), { id, parentId, type, name, ...(type === "folder" ? { color: FOLDER_COLORS[d % FOLDER_COLORS.length], icon: d === 0 ? "🎓" : "📚" } : {}) }]);
-    setEdit(id); setMenu(null);
+    setEdit(id); closeMenu();
     if (type === "note") setActive(id);
   };
   const remove = (id: string) => {
@@ -165,7 +181,7 @@ export default function App() {
       kvDel("note:" + i);
     }), 400);
     const rest = nodes.filter((n) => !ids.includes(n.id));
-    setNodes(rest); setMenu(null);
+    setNodes(rest); closeMenu();
     if (active && ids.includes(active)) setActive(rest.find((n) => n.type === "note")?.id ?? null);
   };
   const moveTo = (to: string | null) => {
@@ -229,15 +245,17 @@ export default function App() {
   );
 
   const row = (n: N, depth: number, flat = false): React.ReactNode => {
-    const isAct = active === n.id, canDrop = moving && n.type === "folder" && n.id !== moving && !desc(moving).includes(n.id);
+    const isAct = active === n.id, canDrop = moving && n.type === "folder" && n.id !== moving && !desc(moving).includes(n.id), menuOpen = menu === n.id;
     return (
       <div key={n.id}>
-        <div className={`flex items-center rounded-lg pr-1 ${isAct ? "bg-slate-900 text-white" : "hover:bg-slate-100"}`} style={{ paddingLeft: flat ? 8 : 6 + depth * 14 }}>
+        <div className={`notiz-library-row flex items-center rounded-lg pr-1 ${isAct ? "bg-slate-900 text-white" : "hover:bg-slate-100"}${menuOpen ? " is-menu-open" : ""}`} style={{ paddingLeft: flat ? 8 : 6 + depth * 14 }}
+          onContextMenu={(e) => { if (edit === n.id || moving) return; e.preventDefault(); openMenu(n.id, e.clientX, e.clientY); }}
+          onPointerDown={(e) => { if (edit !== n.id && !moving) startLongPress(e, n.id); }} onPointerMove={moveLongPress} onPointerUp={endLongPress} onPointerCancel={endLongPress}>
           {edit === n.id ? (
             <input autoFocus defaultValue={n.name} className="flex-1 min-w-0 my-1 px-2 py-1 rounded bg-white text-slate-900 text-sm outline-none ring-2 ring-blue-400"
               onFocus={(e) => e.target.select()} onBlur={(e) => commit(n.id, e.target.value)} onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()} />
           ) : (
-            <button className="flex-1 min-w-0 text-left py-2 text-sm" onClick={() => { if (flat) { reveal(n.id); setQ(""); } open(n); }}>
+            <button className="flex-1 min-w-0 text-left py-2 text-sm" onClick={() => { if (consumeLongPress()) return; if (flat) { reveal(n.id); setQ(""); } open(n); }}>
               <span className="opacity-60">{n.type === "folder" ? (n.open && !flat ? "▾ " : "▸ ") : "▪ "}</span>
               {n.type === "folder" && <span className="mr-1" aria-hidden="true">{n.icon ?? "📁"}</span>}
               {n.type === "folder" && <span className="inline-block w-2 h-2 rounded-full mr-2 align-middle" style={{ backgroundColor: n.color ?? FOLDER_COLORS[0] }} />}
@@ -246,30 +264,68 @@ export default function App() {
             </button>
           )}
           {canDrop && <button className="notiz-library-drop" onClick={() => moveTo(n.id)}>In Ordner</button>}
-          {edit !== n.id && !moving && <button aria-label="Aktionen" className="px-2 py-1 rounded opacity-70 hover:opacity-100" onClick={() => setMenu(menu === n.id ? null : n.id)}>⋯</button>}
+          {edit !== n.id && !moving && <button aria-label={`Aktionen für „${n.name}“`} aria-haspopup="menu" aria-expanded={menuOpen} title="Aktionen (auch Rechtsklick oder Gedrückthalten)" className="notiz-library-row__more px-2 py-1 rounded opacity-70 hover:opacity-100"
+            onClick={(e) => { if (menuOpen) { closeMenu(); return; } const r = e.currentTarget.getBoundingClientRect(); openMenu(n.id, r.right, r.bottom + 4, true); }}>⋯</button>}
         </div>
-        {menu === n.id && (
-          <div className="flex flex-wrap gap-1 py-1.5" style={{ paddingLeft: flat ? 8 : 10 + depth * 14 }}>
-            {n.type === "folder" && <Btn on={() => add(n.id, "folder")}>Neuer Ordner</Btn>}
-            {n.type === "folder" && <Btn on={() => add(n.id, "note")}>Neue Notiz</Btn>}
-            {n.type === "folder" && (
-              <div className="w-full flex items-center gap-1.5 py-1" aria-label="Fachfarbe und Fachsymbol">
-                {FOLDER_COLORS.map((c) => <button key={c} title={`Farbe ${c}`} aria-label={`Farbe ${c}`} onClick={() => patch(n.id, { color: c })}
-                  className={`w-5 h-5 rounded-full border border-slate-300 ${n.color === c ? "ring-2 ring-offset-1 ring-slate-800" : ""}`} style={{ backgroundColor: c }} />)}
-                <select aria-label="Fach-Icon" value={n.icon ?? "📁"} onChange={(e) => patch(n.id, { icon: e.target.value })} className="ml-1 rounded border border-slate-200 bg-white px-1 py-0.5 text-base">
-                  {FOLDER_ICONS.map((icon) => <option key={icon} value={icon}>{icon}</option>)}
-                </select>
-              </div>
-            )}
-            <Btn on={() => { setEdit(n.id); setMenu(null); }}>Umbenennen</Btn>
-            <Btn on={() => { setMoving(n.id); setMenu(null); }}>Verschieben</Btn>
-            <Btn on={() => remove(n.id)}>Löschen</Btn>
-          </div>
-        )}
         {!flat && n.type === "folder" && n.open && nodes.filter((c) => c.parentId === n.id).map((c) => row(c, depth + 1))}
       </div>
     );
   };
+
+  /** Ein schwebendes Menü für genau einen Eintrag – die Kopfzeile zeigt, worauf sich die Aktionen beziehen. */
+  const entryMenu = (): React.ReactNode => {
+    const n = menu ? byId(menu) : undefined;
+    if (!n || !menuPos) return null;
+    const parent = n.parentId ? pathOf(n.parentId) : "Oberste Ebene";
+    const kind = n.type === "folder" ? "Ordner" : "Notiz";
+    const act = (f: () => void) => () => { closeMenu(); f(); };
+    return (
+      <div ref={menuRef} className="notiz-entry-menu" role="menu" aria-label={`${kind} „${n.name}“`} style={{ left: menuPos.x, top: menuPos.y }}
+        onKeyDown={(e) => { if (e.key === "Escape") closeMenu(); }}>
+        <div className="notiz-entry-menu__head">
+          <span className="notiz-entry-menu__icon" aria-hidden="true" style={n.type === "folder" ? { backgroundColor: n.color ?? FOLDER_COLORS[0] } : undefined}>{n.type === "folder" ? (n.icon ?? "📁") : "▪"}</span>
+          <span className="min-w-0"><strong>{n.name}</strong><small>{kind} · in {parent}</small></span>
+        </div>
+        {n.type === "folder" && <>
+          <button role="menuitem" onClick={act(() => add(n.id, "note"))}><span aria-hidden="true">＋</span> Neue Notiz in „{n.name}“</button>
+          <button role="menuitem" onClick={act(() => add(n.id, "folder"))}><span aria-hidden="true">＋</span> Neuer Unterordner</button>
+          <div className="notiz-entry-menu__sep" role="separator" />
+          <div className="notiz-entry-menu__look" aria-label="Farbe und Symbol des Ordners">
+            <span>Farbe</span>
+            <div>{FOLDER_COLORS.map((c) => <button key={c} type="button" title={`Farbe ${c}`} aria-label={`Farbe ${c}`} aria-pressed={n.color === c} onClick={() => patch(n.id, { color: c })} style={{ backgroundColor: c }} />)}</div>
+            <span>Symbol</span>
+            <select aria-label="Ordnersymbol" value={n.icon ?? "📁"} onChange={(e) => patch(n.id, { icon: e.target.value })}>
+              {FOLDER_ICONS.map((icon) => <option key={icon} value={icon}>{icon}</option>)}
+            </select>
+          </div>
+          <div className="notiz-entry-menu__sep" role="separator" />
+        </>}
+        {n.type === "note" && <button role="menuitem" onClick={act(() => open(n))}><span aria-hidden="true">↗</span> Öffnen</button>}
+        <button role="menuitem" onClick={act(() => setEdit(n.id))}><span aria-hidden="true">✎</span> Umbenennen</button>
+        <button role="menuitem" onClick={act(() => setMoving(n.id))}><span aria-hidden="true">⇄</span> Verschieben …</button>
+        <div className="notiz-entry-menu__sep" role="separator" />
+        <button role="menuitem" className="is-danger" onClick={() => remove(n.id)}><span aria-hidden="true">🗑</span> {kind} löschen …</button>
+      </div>
+    );
+  };
+  useLayoutEffect(() => { // Menü vollständig im Fenster halten (bei Platzmangel nach oben bzw. links aufklappen)
+    const el = menuRef.current, p = menuPos;
+    if (!el || !p) return;
+    const r = el.getBoundingClientRect(), pad = 8;
+    let x = p.alignRight ? p.x - r.width : p.x, y = p.y;
+    if (x + r.width > window.innerWidth - pad) x = window.innerWidth - pad - r.width;
+    if (y + r.height > window.innerHeight - pad) y = Math.max(pad, (p.alignRight ? p.y - 4 - 34 : p.y) - r.height);
+    el.style.left = Math.max(pad, x) + "px"; el.style.top = Math.max(pad, y) + "px";
+  }, [menu, menuPos, nodes]);
+  useEffect(() => { // außerhalb tippen, Esc, Bildlauf oder Fenstergröße schließen das Menü
+    if (!menu) return;
+    const down = (e: PointerEvent) => { if (!menuRef.current?.contains(e.target as Node) && !(e.target as HTMLElement)?.closest?.(".notiz-library-row.is-menu-open .notiz-library-row__more")) closeMenu(); };
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape") closeMenu(); };
+    const away = (e: Event) => { if (!menuRef.current?.contains(e.target as Node)) closeMenu(); };
+    window.addEventListener("pointerdown", down, true); window.addEventListener("keydown", key); window.addEventListener("resize", closeMenu); window.addEventListener("scroll", away, true);
+    return () => { window.removeEventListener("pointerdown", down, true); window.removeEventListener("keydown", key); window.removeEventListener("resize", closeMenu); window.removeEventListener("scroll", away, true); };
+  }, [menu]);
+  useEffect(() => { menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus({ preventScroll: true }); }, [menu]);
 
   const ago = (t?: number) => { if (!t) return "noch nicht geöffnet"; const m = Math.round((Date.now() - t) / 60000); return m < 1 ? "gerade eben" : m < 60 ? `vor ${m} min` : m < 1440 ? `vor ${Math.round(m / 60)} h` : `vor ${Math.round(m / 1440)} Tagen`; };
   const folderColor = (n: N) => { let p = n.parentId ? byId(n.parentId) : undefined; while (p && !p.color) p = p.parentId ? byId(p.parentId) : undefined; return p?.color ?? FOLDER_COLORS[0]; };
@@ -350,6 +406,7 @@ export default function App() {
           </div>
         </aside>
       )}
+      {showLib && entryMenu()}
       <Tutorial />
       <main className="flex-1 min-w-0 flex h-screen">
         {GROUPS_ENABLED && studySpace ? (

@@ -1899,3 +1899,148 @@ select {
 .xnts-lab-cardbar button { min-width: 28px; height: 28px; padding: 0 6px; border: 1px solid rgb(25 22 32 / 25%); border-radius: 6px; background: #fff; color: #191620; font-weight: 800; }
 .xnts-lab-cardbar__size { width: 18px; height: 18px; flex: 0 0 auto; border-radius: 3px; background: linear-gradient(135deg, transparent 0 50%, #5738df 50% 100%); cursor: nwse-resize; touch-action: none; }
 .xnts-lab-chips button.is-background { border-style: dashed !important; border-color: #5738df !important; color: #3d22a8 !important; }
+
+/* ═════════ Leiste v2 (Nutzertest 17.11.): eine Zeile, Rückgängig/Wiederholen sichtbar, Menüs als schwebende Tafeln ═════════ */
+.notiz-workspace .notiz-toolbar { position: relative; }
+.xnts-topbar:has(.notiz-toolbar[data-menu-open="true"]) { z-index: 36; }
+.notiz-toolbar__panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 8px;
+  z-index: 60;
+  flex: none !important;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 10px;
+  width: max-content;
+  max-width: min(640px, calc(100vw - 24px));
+  box-shadow: 0 12px 32px rgb(25 22 32 / 28%);
+}
+.notiz-toolbar__panel-group { flex-wrap: wrap; }
+.notiz-toolbar__panel .notiz-toolbar__panel-label { min-width: 74px; }
+.notiz-toolbar__panel-danger { margin-top: 2px; padding-top: 10px; border-top: 1px dashed rgb(220 38 38 / 50%); }
+.notiz-toolbar__panel-danger .notiz-toolbar__panel-label { color: #b91c1c; }
+.notiz-workspace .notiz-toolbar .notiz-toolbar__panel-danger .notiz-toolbar__pdf-delete:not([aria-pressed="true"]) { border-color: rgb(220 38 38 / 55%) !important; color: #b91c1c !important; }
+.xnts-tools--history { gap: 2px; }
+.xnts-tools__btn:disabled { opacity: .35; cursor: default; }
+.xnts-tools__btn:disabled:hover { background: transparent; }
+.notiz-toolbar__space { white-space: nowrap; font-weight: 600; }
+.notiz-toolbar__status { display: inline-flex; flex: 0 1 auto; align-items: center; gap: 8px; min-width: 0; margin-left: auto; }
+.notiz-toolbar__status .notiz-toolbar__title { max-width: 18rem; }
+.notiz-toolbar__settings { min-width: 40px; font-size: 17px; line-height: 1; }
+@media (max-width: 1279px) {
+  .notiz-toolbar__status .notiz-toolbar__title { max-width: 10rem; }
+  .notiz-toolbar__panel { top: calc(100% + 4px); }
+}
+@media (max-width: 760px) {
+  .notiz-toolbar__status .notiz-toolbar__title { display: none; }
+}
+
+/* ───── Platz einfügen: Blatt nur bei Bedarf + eigener Griff (statt ganzer Fläche als Ziehzone) ───── */
+.xnts-gap-paper { pointer-events: none; }
+.xnts-gap-grip {
+  position: absolute;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 26px;
+  min-width: 30px;
+  padding: 0 8px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgb(87 56 223 / 45%);
+  border-radius: 999px;
+  background: rgb(255 253 244 / 94%);
+  color: #4e33cc;
+  font: 700 13px/1 Inter, system-ui, sans-serif;
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+  opacity: .7;
+  box-shadow: 0 2px 7px rgb(0 0 0 / 20%);
+  transition: opacity .12s;
+}
+.xnts-gap-grip:hover, .xnts-gap-grip:active, .xnts-gap-grip:focus-visible, .xnts-gap-grip.has-space { opacity: 1; }
+.xnts-gap-grip small { color: #5b4fa0; font-size: 10px; font-weight: 600; }
+.notiz-workspace[data-theme="dark"] .xnts-gap-grip { background: rgb(31 27 52 / 94%); color: #c4b5fd; border-color: rgb(167 139 250 / 50%); }
+.notiz-workspace[data-theme="dark"] .xnts-gap-grip small { color: #a99bdc; }
+
+/* ───── Bibliothek: Kontextmenü direkt am Eintrag (⋯, Rechtsklick, Gedrückthalten) ───── */
+.notiz-library-row { -webkit-touch-callout: none; user-select: none; }
+.notiz-library-row.is-menu-open:not(.bg-slate-900) { background: rgb(87 56 223 / 12%); box-shadow: inset 3px 0 0 var(--xnts-violet); }
+.notiz-library-row.is-menu-open .notiz-library-row__more { opacity: 1; background: var(--xnts-violet); color: #fff; }
+.notiz-entry-menu {
+  position: fixed;
+  z-index: 70;
+  display: grid;
+  gap: 1px;
+  width: 268px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--xnts-ink);
+  border-radius: 10px;
+  background: var(--xnts-paper);
+  color: var(--xnts-ink);
+  box-shadow: 0 14px 34px rgb(25 22 32 / 30%), 4px 4px 0 rgb(25 22 32 / 18%);
+  font-size: 13px;
+}
+.notiz-entry-menu__head { display: flex; align-items: center; gap: 9px; margin: -2px -2px 4px; padding: 8px 9px; border-radius: 7px; background: rgb(25 22 32 / 6%); }
+.notiz-entry-menu__head strong { display: block; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.notiz-entry-menu__head small { display: block; overflow: hidden; color: #5b5546; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.notiz-entry-menu__icon { display: grid; flex: 0 0 auto; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: rgb(25 22 32 / 10%); font-size: 16px; }
+.notiz-entry-menu > button { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 4px 10px; border-radius: 7px; text-align: left; }
+.notiz-entry-menu > button > span { width: 16px; text-align: center; opacity: .75; }
+.notiz-entry-menu > button:hover, .notiz-entry-menu > button:focus-visible { background: #f2e8a8; outline: none; }
+.notiz-entry-menu > button.is-danger { color: #b91c1c; }
+.notiz-entry-menu > button.is-danger:hover { background: #fde2e2; }
+.notiz-entry-menu__sep { height: 1px; margin: 4px 6px; background: rgb(25 22 32 / 15%); }
+.notiz-entry-menu__look { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 6px 10px; padding: 4px 10px; }
+.notiz-entry-menu__look > span { color: #5b5546; font-size: 11px; font-weight: 700; }
+.notiz-entry-menu__look > div { display: flex; flex-wrap: wrap; gap: 5px; }
+.notiz-entry-menu__look > div button { width: 20px; height: 20px; border: 1px solid rgb(25 22 32 / 30%); border-radius: 50%; }
+.notiz-entry-menu__look > div button[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--xnts-paper), 0 0 0 4px var(--xnts-ink); }
+.notiz-entry-menu__look select { justify-self: start; padding: 2px 6px; border: 1px solid rgb(25 22 32 / 25%); border-radius: 6px; background: #fff; font-size: 15px; }
+.xnts-ctx__stroke { display: inline-flex; align-items: center; gap: 2px; height: 42px; padding: 0 6px 0 2px; border: 1px solid rgb(25 22 32 / 20%); border-radius: 8px; background: #fff; color: var(--xnts-ink); }
+.xnts-ctx__stroke[aria-expanded="true"] { border-color: var(--xnts-violet); box-shadow: inset 0 0 0 1px var(--xnts-violet); }
+.xnts-ctx__stroke:disabled { opacity: .55; }
+.xnts-ctx__stroke .xnts-ctx__preview { border: 0; }
+.xnts-ctx__stroke > span { font-size: 11px; opacity: .7; }
+.xnts-pop--strokes { min-width: 220px; }
+.xnts-pop__stroke .xnts-ctx__preview { flex: 0 0 auto; border: 1px solid rgb(25 22 32 / 15%); }
+
+/* ───── Seitenliste: PDF-Seitenzahlen, Notizblätter als Unterpunkt, Aktionen nur an der aktuellen Seite ───── */
+.notiz-page-sidebar__head { display: grid; gap: 2px; margin: 0 2px 6px; padding-bottom: 6px; border-bottom: 1px solid rgb(25 22 32 / 12%); }
+.notiz-page-sidebar__head strong { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; }
+.notiz-page-sidebar__head small { font-size: 10px; line-height: 1.3; opacity: .7; }
+.notiz-page-sidebar__entry { margin-bottom: 2px; border-radius: 8px; }
+.notiz-page-sidebar__entry.is-active { background: rgb(87 56 223 / 10%); box-shadow: inset 3px 0 0 var(--xnts-violet); }
+.notiz-page-sidebar__row { display: flex; align-items: center; gap: 2px; }
+.notiz-page-sidebar__item { display: flex; flex: 1 1 auto; align-items: center; gap: 6px; min-width: 0; padding: 7px 6px; border-radius: 7px; font-size: 13px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.notiz-page-sidebar__item:hover { background: rgb(25 22 32 / 6%); }
+.notiz-page-sidebar__item b { font-weight: 700; }
+.notiz-page-sidebar__item small { margin-left: auto; font-size: 10px; opacity: .65; }
+.notiz-page-sidebar__icon { flex: 0 0 14px; font-size: 11px; text-align: center; opacity: .7; }
+.notiz-page-sidebar__entry.is-blank > .notiz-page-sidebar__row .notiz-page-sidebar__item { font-style: italic; }
+.notiz-page-sidebar__sub { padding-left: 12px; }
+.notiz-page-sidebar__sub .notiz-page-sidebar__item { padding-top: 4px; padding-bottom: 4px; font-size: 12px; }
+.notiz-page-sidebar__act { flex: 0 0 auto; width: 28px; height: 28px; border-radius: 7px; font-size: 14px; line-height: 1; opacity: .45; }
+.notiz-page-sidebar__entry.is-active .notiz-page-sidebar__act, .notiz-page-sidebar__act:hover, .notiz-page-sidebar__act:focus-visible { opacity: 1; }
+.notiz-page-sidebar__act:hover { background: rgb(87 56 223 / 14%); color: var(--xnts-violet); }
+.notiz-page-sidebar__act.is-danger { color: #b91c1c; opacity: 1; }
+.notiz-page-sidebar__move { display: flex; gap: 4px; padding: 0 4px 6px 24px; }
+.notiz-page-sidebar__move button { flex: 1 1 0; padding: 3px 4px; border: 1px solid rgb(25 22 32 / 18%); border-radius: 6px; font-size: 10px; white-space: nowrap; }
+.notiz-page-sidebar__move button:disabled { opacity: .3; }
+.xnts-gap-grip.is-plus { font-size: 15px; }
+.xnts-more-space { position: absolute; z-index: 15; transform: translateX(-50%); padding: 7px 16px; border: 1px dashed rgb(87 56 223 / 55%); border-radius: 999px; background: rgb(255 253 244 / 94%); color: #4e33cc; font: 700 13px/1 Inter, system-ui, sans-serif; touch-action: manipulation; box-shadow: 0 2px 7px rgb(0 0 0 / 15%); }
+.xnts-more-space:hover { background: #ede9fe; }
+.notiz-workspace[data-theme="dark"] .xnts-more-space { background: rgb(31 27 52 / 94%); color: #c4b5fd; border-color: rgb(167 139 250 / 55%); }
+/* Ansicht/Mehr erscheinen wie die Stift-Leiste: schwebende helle Karte unter der Werkzeugleiste (Nutzerwunsch 17.11.) */
+.xnts-ctx--menu { z-index: 28; }
+.xnts-ctx__label { margin: 0 2px 0 4px; color: #3b3020; font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.xnts-ctx__select { height: 38px; padding: 0 8px; border: 1px solid rgb(25 22 32 / 35%); border-radius: 8px; background: #fff; color: var(--xnts-ink); font-size: 13px; font-weight: 700; }
+.xnts-ctx__file { display: inline-flex; align-items: center; cursor: pointer; }
+.xnts-ctx__btn--danger { border-color: rgb(220 38 38 / 55%); color: #b91c1c; }
+.xnts-ctx__btn.xnts-ctx__btn--danger[aria-pressed="true"] { border-color: #dc2626; background: #dc2626; color: #fff; }
+.xnts-ctx--menu .xnts-ctx__slider input { width: clamp(90px, 14vw, 180px); }
