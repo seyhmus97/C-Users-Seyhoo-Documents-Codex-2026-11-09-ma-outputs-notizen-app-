@@ -2,7 +2,8 @@
 // Einbindung (Vite): new Worker(new URL("./pdfRaster.worker.ts", import.meta.url), { type: "module" })
 import * as pdfjs from "pdfjs-dist";
 
-export type RasterIn = { type: "start"; data: ArrayBuffer; width: number; quality: number };
+/** pages: nur diese Seiten (1-basiert) rendern – z. B. bei selektivem Import; fehlt die Liste, werden alle Seiten gerendert. */
+export type RasterIn = { type: "start"; data: ArrayBuffer; width: number; quality: number; pages?: number[] };
 export type RasterOut =
   | { type: "page"; pageNum: number; numPages: number; blob: Blob }
   | { type: "done" }
@@ -46,7 +47,8 @@ self.addEventListener("message", async (ev: MessageEvent<RasterIn>) => {
       disableFontFace: true, useSystemFonts: false, // Schriften als Pfade zeichnen (FontFace braucht ein document)
     } as Parameters<typeof pdfjs.getDocument>[0]);
     const doc = await loading.promise;
-    for (let i = 1; i <= doc.numPages; i++) {
+    const wanted = msg.pages?.length ? msg.pages.filter((n) => n >= 1 && n <= doc.numPages) : Array.from({ length: doc.numPages }, (_, k) => k + 1);
+    for (const i of wanted) {
       try {
         const page = await doc.getPage(i);
         const base = page.getViewport({ scale: 1 });

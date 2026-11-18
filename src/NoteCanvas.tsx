@@ -13,6 +13,10 @@ import LabBench, { type LabRecord } from "./LabBench";
 import FunctionPlot from "./FunctionPlot";
 import MultiFunctionPlot, { curvesFromText, type CurveFlags } from "./MultiFunctionPlot";
 import PenGlyph from "./PenGlyph";
+import PageSelectDialog, { ImagePlaceDialog, type PageSelectResult, type PageSelectSuggestion } from "./PageSelectDialog";
+import { classifyFile, convertToPdf, IMAGE_ACCEPT, IMPORT_ACCEPT } from "./officeConvert";
+import { prepareImage } from "./imageImport";
+import { formatPageRange, normalizePageText } from "./pageRange";
 import { functionExpressionFromText, parseMathExpression } from "./mathExpression";
 import { analyzeCircuitStrokes, type CircuitAnalysis } from "./circuitRecognition";
 import { junctionPoints, recognizeSymbols, type SymbolInput } from "./circuitSymbols";
@@ -33,6 +37,8 @@ const loadPdfJs = (): Promise<PdfJsModule> => {
 };
 
 /* ───────── Typen & Konstanten ───────── */
+/** Textmarker-Deckkraft: Ebene auf hellem Papier (multiply) bzw. dunklem Papier (screen). Ein Wert für Bildschirm und PDF-Export. */
+const HL_OPACITY_LIGHT = 0.38, HL_OPACITY_DARK = 0.4;
 const PAGE_W = 794, MIN_GAP = 16, SPACE_STEP = 200, TAIL_GROW = 1200, MIN_Z = 0.4, MAX_Z = 4;
 type Tool = "pen" | "highlighter" | "eraser" | "lasso" | "shape" | "line" | "text";
 type Shape = "rect" | "square" | "ellipse" | "circle" | "triangle" | "diamond" | "pentagon" | "star" | "axes" | "line" | "arrow";
@@ -46,7 +52,9 @@ type PenProfile = { id: string; name: string; kind: PenKind; color: string; size
 type Block = { id: string; kind: "pdf" | "blank"; height: number; gap: number; docId?: string; pageNum?: number };
 // Textfeld: y ist (wie bei Strichen) RELATIV zur Oberkante des Blocks → wandert beim Platz-Einfügen mit
 interface TextField { id: string; blockId: string; text: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; role?: "function"; functionExpression?: string; functionCurves?: CurveFlags[]; plotHidden?: boolean }
-type Snap = { strokes: Stroke[]; blocks: Block[]; texts: TextField[] };
+/** Eingefügtes Bild: frei verschieb-/skalierbar; x/y relativ zum Block wie Striche. Die Bilddaten liegen einmal in IndexedDB („img:“+assetId). */
+type ImageItem = { id: string; blockId: string; assetId: string; x: number; y: number; w: number; h: number };
+type Snap = { strokes: Stroke[]; blocks: Block[]; texts: TextField[]; images: ImageItem[] };
 type XF = { px: number; py: number; s: number; rot: number }; // Live-Transformation: Pivot, Skalierung, Winkel
 const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
@@ -396,7 +404,7 @@ export const rasterKey = (docId: string, pageNum: number) => `pgimg:${docId}:${p
 
 /** Rendert alle Seiten im Worker zu JPEGs und übergibt sie nacheinander an onPage. true = vollständig fertig.
  *  Fehler oder fehlende Unterstützung → false; die Seiten fallen dann einfach auf den Canvas-Pfad zurück. */
-const rasterizeInWorker = (buf: ArrayBuffer, onPage: (pageNum: number, numPages: number, blob: Blob) => Promise<void>): Promise<boolean> =>
+const rasterizeInWorker = (buf: ArrayBuffer, onPage: (pageNum: number, numPages: number, blob: Blob) => Promise<void>, pages?: number[]): Promise<boolean> =>
   new Promise<boolean>((resolve) => {
     let w: Worker;
     try { w = new Worker(new URL("./pdfRaster.worker.ts", import.meta.url), { type: "module" }); }
@@ -415,7 +423,7 @@ const rasterizeInWorker = (buf: ArrayBuffer, onPage: (pageNum: number, numPages:
       else if (m.type === "done") finish();
     };
     w.onerror = () => { ok = false; finish(); };
-    const msg: RasterIn = { type: "start", data: buf, width: PAGE_W * RASTER_SCALE, quality: 0.86 };
+    const msg: RasterIn = { type: "start", data: buf, width: PAGE_W * RASTER_SCALE, quality: 0.86, pages };
     w.postMessage(msg, [buf]);
   });
 
@@ -687,6 +695,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
 
   const scRef = useRef<HTMLDivElement>(null);
   const cvRef = useRef<HTMLCanvasElement>(null);
+  const hlLightRef = useRef<HTMLCanvasElement>(null); // Textmarker-Ebene über hellem Papier/PDF (mix-blend-mode: multiply)
+  const hlDarkRef = useRef<HTMLCanvasElement>(null);  // Textmarker-Ebene über dunklem Notizpapier im Dunkelmodus (mix-blend-mode: screen)
   const docs = useRef(new Map<string, PDFDocumentProxy>());
   /** Gedruckte Seitenzahlen der PDFs (PDF-Seitenbeschriftungen, z. B. „51“ statt Dateiseite 55); null = PDF hat keine eigenen Beschriftungen */
   const [pageLabels, setPageLabels] = useState<Record<string, (string | null)[] | null>>({});
@@ -699,9 +709,19 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const hover = useRef<{ x: number; y: number } | null>(null);
   const shapeA = useRef<{ x: number; y: number } | null>(null);
   const tplRef = useRef<Tpl>("blank"); tplRef.current = tpl;
-  const before = useRef<Snap>({ strokes: [], blocks: [], texts: [] });
+  const before = useRef<Snap>({ strokes: [], blocks: [], texts: [], images: [] });
   const textFields = useRef<TextField[]>([]);
-  const textBefore = useRef<Snap>({ strokes: [], blocks: [], texts: [] });
+  const imagesRef = useRef<ImageItem[]>([]);
+  const [selImg, setSelImg] = useState<string | null>(null); // ausgewähltes Bild (nur mit dem Lasso)
+  const [imgUrls, setImgUrls] = useState<Record<string, string>>({});
+  /** Offener Seitenauswahl-Dialog (Import eines Dokuments oder Export der Notiz) */
+  const [pageDialog, setPageDialog] = useState<null | {
+    mode: "import" | "export"; title: string; subtitle?: string; pageCount: number; pageLabel?: (i: number) => string;
+    renderThumb: (i: number, cv: HTMLCanvasElement, width: number) => Promise<void>; insertOptions?: { value: string; label: string }[];
+    suggestion?: Promise<PageSelectSuggestion | null>; confirmLabel: (n: number) => string; onConfirm: (r: PageSelectResult) => void; onCancel: () => void;
+  }>(null);
+  const [pendingImages, setPendingImages] = useState<File[] | null>(null);
+  const textBefore = useRef<Snap>({ strokes: [], blocks: [], texts: [], images: [] });
   const creating = useRef(false);
   const focusId = useRef<string | null>(null);
   const xf = useRef<(XF & { mode: "scale" | "rotate"; d0: number; a0: number }) | null>(null);
@@ -1044,7 +1064,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
 
   /* ───── Speichern / Laden ───── */
   const save = useCallback(async () => {
-    try { if ((window as unknown as { restoring?: boolean }).restoring) return true; await kvSet("note:" + noteId, { blocks: blocksRef.current, strokes: strokes.current, texts: textFields.current, tpl: tplRef.current }); setSaved(loadWarn.current || "Gespeichert"); return true; }
+    try { if ((window as unknown as { restoring?: boolean }).restoring) return true; await kvSet("note:" + noteId, { blocks: blocksRef.current, strokes: strokes.current, texts: textFields.current, images: imagesRef.current, tpl: tplRef.current }); setSaved(loadWarn.current || "Gespeichert"); return true; }
     catch (err) {
       if (isQuotaError(err)) {
         setSaved("Speicher voll – NICHT gespeichert!");
@@ -1060,7 +1080,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     (async () => {
       navigator.storage?.persist?.(); // verhindert, dass iPadOS/Browser die Daten selbständig löscht
       try {
-        const st = await kvGet<{ blocks: Block[]; strokes: Stroke[]; texts?: TextField[]; tpl?: Tpl }>("note:" + noteId);
+        const st = await kvGet<{ blocks: Block[]; strokes: Stroke[]; texts?: TextField[]; images?: ImageItem[]; tpl?: Tpl }>("note:" + noteId);
         if (st?.blocks?.length) {
           let unreadable = 0;
           for (const id of new Set(st.blocks.map((b) => b.docId).filter(Boolean) as string[])) {
@@ -1072,7 +1092,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             } catch { unreadable++; }
           }
           if (unreadable) loadNote = unreadable === 1 ? "1 PDF konnte nicht gelesen werden – Notiz ohne diese PDF geladen" : `${unreadable} PDFs konnten nicht gelesen werden – Notiz ohne sie geladen`;
-          strokes.current = st.strokes; textFields.current = st.texts ?? []; setBlocks(st.blocks); if (st.tpl) setTplState(st.tpl);
+          strokes.current = st.strokes; textFields.current = st.texts ?? []; imagesRef.current = Array.isArray(st.images) ? st.images : []; setBlocks(st.blocks); if (st.tpl) setTplState(st.tpl);
         }
         await clipWrite; // laufende Schreibvorgänge zuerst abwarten
         if (clipSize() === 0) { // nur nach einem Neustart aus der DB laden; im Speicher ist sonst alles aktueller
@@ -1101,12 +1121,12 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   }, [save, noteId]);
 
   /* ───── Verlauf (Undo/Redo über Snapshots; Striche sind unveränderlich) ───── */
-  const snap = (): Snap => ({ strokes: strokes.current, blocks: blocksRef.current, texts: textFields.current });
+  const snap = (): Snap => ({ strokes: strokes.current, blocks: blocksRef.current, texts: textFields.current, images: imagesRef.current });
   const pushHist = (b: Snap) => { past.current.push(b); if (past.current.length > 300) past.current.shift(); future.current = []; markDirty(); };
   const apply = (s: Snap) => {
     const cl = blocksRef.current[blocksRef.current.length - 1], sl = s.blocks[s.blocks.length - 1];
     const bs = cl && sl && cl.id === sl.id ? s.blocks.map((b, i, a) => (i === a.length - 1 ? { ...b, height: Math.max(b.height, cl.height) } : b)) : s.blocks;
-    strokes.current = s.strokes; textFields.current = s.texts; sel.current = new Set(); bump(); setBlocks(bs); markDirty(); schedule();
+    strokes.current = s.strokes; textFields.current = s.texts; imagesRef.current = s.images ?? []; sel.current = new Set(); setSelImg(null); bump(); setBlocks(bs); markDirty(); schedule();
   };
   const undo = () => { const s = past.current.pop(); if (s) { future.current.push(snap()); apply(s); } };
   const redo = () => { const s = future.current.pop(); if (s) { past.current.push(snap()); apply(s); } };
@@ -1149,7 +1169,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
 
   /* ───── Zeichenebene (nur sichtbarer Ausschnitt) ───── */
   // Zero-Allocation: nur Zahlen und Indexschleifen, keine Arrays, Objekte oder Closures pro Aufruf
-  const paint = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0, ink = s.color, taperStart = true, taperEnd = true) => {
+  const paint = (ctx: CanvasRenderingContext2D, s: Stroke, ox = 0, oy = 0, ink = s.color, taperStart = true, taperEnd = true, hlAlpha?: number) => {
     const top = (topsRef.current[s.blockId] ?? 0) + oy, hl = s.tool === "highlighter", P = s.pts, n = P.length;
     const dash = dashFor(s.lineStyle);
     const kind = s.penKind, shaped = !!s.raw || n < 3;
@@ -1162,7 +1182,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     ctx.lineCap = ctx.lineJoin = "round";
     ctx.strokeStyle = ctx.fillStyle = ink;
     if (dash.length) ctx.setLineDash(dash);
-    if (hl) { ctx.globalAlpha = darkMode ? 0.42 : 0.35; ctx.lineWidth = s.size * 5; ctx.lineCap = "butt"; }
+    // hlAlpha = 1: Zeichnen in die eigene Marker-Ebene (Deckkraft + Mischmodus kommen dort von der Ebene, nicht je Strich)
+    if (hl) { ctx.globalAlpha = hlAlpha ?? HL_OPACITY_LIGHT; ctx.lineWidth = s.size * 5; ctx.lineCap = "butt"; }
     const centerline = () => { // sichtbare Mittellinie als EIN Pfad (identisch zur Radierer-Geometrie curveAt)
       ctx.beginPath(); ctx.moveTo(P[0].x + ox, top + P[0].y);
       if (shaped) { for (let i = 1; i < n; i++) ctx.lineTo(P[i].x + ox, top + P[i].y); }
@@ -1274,20 +1295,49 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     if (lv) ctx.translate(lv.x, lv.y); else ctx.translate(offX() - sc.scrollLeft, -sc.scrollTop);
     ctx.scale(z, z);
     const vt = lv ? -lv.y : sc.scrollTop, v0 = vt / z - 40, v1 = (vt + h) / z + 40;
-    // Zwei Ebenen: zuerst alle Textmarker (halbtransparent), DANN die Schrift darüber –
-    // so liegt der Marker wie bei Papier unter der Handschrift und die Schrift bleibt immer voll lesbar.
-    for (let pass = 0; pass < 2; pass++) {
-      const wantHl = pass === 0;
-      for (const s of strokes.current) {
-        if ((s.tool === "highlighter") !== wantHl) continue;
-        const top = topsRef.current[s.blockId] ?? 0, bb = bbox(s), isSel = sel.current.has(s.id);
-        const oy = isSel ? dragOff.current.y : 0;
-        if (isSel && xf.current) { paintAdaptive(ctx, xformStroke(s, xf.current)); continue; }
-        if (top + bb.y1 + oy < v0 || top + bb.y0 + oy > v1) continue;
-        paintAdaptive(ctx, s, isSel ? dragOff.current.x : 0, oy);
+    // Textmarker liegen auf EIGENEN Ebenen-Canvases UNTER der Handschrift-Ebene (z-Index) und werden per CSS-Mischmodus
+    // mit Papier, PDF und Textfeldern verrechnet: „multiply“ auf hellem Papier (dunkle Schrift bleibt schwarz),
+    // „screen“ auf dunklem Papier im Dunkelmodus (weiße Schrift bleibt weiß). Die Striche werden deckend in die Ebene
+    // gezeichnet, die Deckkraft (~38–45 %) trägt die Ebene → überlappende Markerstriche dunkeln sich nicht auf.
+    const layers: [HTMLCanvasElement | null, "light" | "dark"][] = [[hlLightRef.current, "light"], [hlDarkRef.current, "dark"]];
+    const hlCtx: (CanvasRenderingContext2D | null)[] = layers.map(([lc, region]) => {
+      if (!lc) return null;
+      if (lc.width !== cv.width || lc.height !== cv.height) {
+        lc.width = cv.width; lc.height = cv.height;
+        lc.style.width = w + "px"; lc.style.height = h + "px"; lc.style.marginBottom = -h + "px";
       }
-      if (cur.current && (cur.current.tool === "highlighter") === wantHl) paintAdaptive(ctx, cur.current);
+      const c = lc.getContext("2d")!;
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, w, h);
+      if (region === "dark" && !darkMode) return null; // im Hellmodus ist alles Papier hell → nur die multiply-Ebene
+      if (lv) c.translate(lv.x, lv.y); else c.translate(offX() - sc.scrollLeft, -sc.scrollTop);
+      c.scale(z, z);
+      if (darkMode) { // Dunkelmodus: PDF-Seiten bleiben weiß (multiply), Notizpapier ist dunkel (screen) → je Ebene beschneiden
+        const clip = new Path2D();
+        let any = false;
+        for (const b of blocksRef.current) {
+          const t = topsRef.current[b.id] ?? 0;
+          if (b.kind === "pdf" && region === "light") { clip.rect(-PAGE_W, t, PAGE_W * 3, b.height); any = true; }
+          if (region === "dark") {
+            if (b.kind === "pdf") { if (b.gap > 0) { clip.rect(-PAGE_W, t + b.height, PAGE_W * 3, b.gap); any = true; } }
+            else { clip.rect(-PAGE_W, t, PAGE_W * 3, b.height + b.gap); any = true; }
+          }
+        }
+        if (!any) return null;
+        c.clip(clip);
+      }
+      return c;
+    });
+    const paintHl = (s: Stroke, ox = 0, oy = 0) => { for (const c of hlCtx) if (c) paint(c, s, ox, oy, s.color, true, true, 1); };
+    for (const s of strokes.current) {
+      const hl = s.tool === "highlighter";
+      const top = topsRef.current[s.blockId] ?? 0, bb = bbox(s), isSel = sel.current.has(s.id);
+      const oy = isSel ? dragOff.current.y : 0;
+      if (isSel && xf.current) { const t = xformStroke(s, xf.current); if (hl) paintHl(t); else paintAdaptive(ctx, t); continue; }
+      if (top + bb.y1 + oy < v0 || top + bb.y0 + oy > v1) continue;
+      if (hl) paintHl(s, isSel ? dragOff.current.x : 0, oy); else paintAdaptive(ctx, s, isSel ? dragOff.current.x : 0, oy);
     }
+    if (cur.current) { if (cur.current.tool === "highlighter") paintHl(cur.current); else paintAdaptive(ctx, cur.current); }
     for (const t of textFields.current) if (sel.current.has(t.id)) {
       const r = textRect(liveText(t));
       ctx.save(); ctx.setLineDash([]); ctx.fillStyle = "rgba(37,99,235,.10)"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.2 / z;
@@ -1972,6 +2022,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     const s0 = snap();
     strokes.current = strokes.current.filter((s) => s.blockId !== blockId);
     textFields.current = textFields.current.filter((t) => t.blockId !== blockId);
+    imagesRef.current = imagesRef.current.filter((im) => im.blockId !== blockId);
     sel.current = new Set();
     setBlocks(bs.filter((x) => x.id !== blockId));
     pushHist(s0); bump(); schedule();
@@ -1984,6 +2035,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     const s0 = snap();
     strokes.current = strokes.current.filter((s) => s.blockId !== blockId);
     textFields.current = textFields.current.filter((t) => t.blockId !== blockId);
+    imagesRef.current = imagesRef.current.filter((im) => im.blockId !== blockId);
     sel.current = new Set();
     setBlocks(bs.filter((x) => x.id !== blockId));
     pushHist(s0); bump(); schedule();
@@ -2081,76 +2133,292 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     flash(floor > MIN_GAP ? "Platz auf die Notizen darin verkleinert" : "Platz entfernt · Rückgängig mit Strg+Z");
   };
 
-  /* ───── PDF-Import (Datei wird in IndexedDB abgelegt) ───── */
-  const importPdf = async (file: File) => {
-    const docId = uid();
-    setSaved("PDF wird geprüft …");
+  /* ───── Import: PDF, Office/Text (→ PDF) und Bilder; Seiten wählbar, Einfügen ohne Überschreiben ───── */
+  /** Unterster belegter Punkt eines Blocks (Striche, Texte, Bilder), relativ zum Block */
+  const contentBottom = (blockId: string) => {
+    let y = 0;
+    for (const s of strokes.current) if (s.blockId === blockId) y = Math.max(y, bbox(s).y1);
+    for (const t of textFields.current) if (t.blockId === blockId) y = Math.max(y, t.y + t.height);
+    for (const im of imagesRef.current) if (im.blockId === blockId) y = Math.max(y, im.y + im.h);
+    return y;
+  };
+  /** Fügt neue Blöcke ein. „end“ hängt hinter alles Geschriebene an: Liegt im freien Bereich am Notizende schon Inhalt,
+   *  wird er zu einem normalen Notizblatt (auf seinen Inhalt gekürzt) und dahinter entsteht ein neuer freier Bereich. */
+  const insertBlocks = (bs: Block[], nb: Block[], insertAt: string): Block[] => {
+    const tail = bs[bs.length - 1], tailUsed = tail && tail.kind === "blank" ? contentBottom(tail.id) : 0;
+    const appendEnd = (): Block[] => tail && tail.kind === "blank"
+      ? (tailUsed > 0 ? [...bs.slice(0, -1), { ...tail, height: Math.max(SPACE_STEP, Math.ceil(tailUsed + 60)), gap: MIN_GAP }, ...nb, { id: uid(), kind: "blank", height: 1200, gap: 0 }] : [...bs.slice(0, -1), ...nb, tail])
+      : [...bs, ...nb];
+    if (insertAt === "start") return [...nb, ...bs];
+    if (insertAt.startsWith("after:")) {
+      const i = bs.findIndex((b) => b.id === insertAt.slice(6));
+      if (i >= 0 && i < bs.length - 1) return [...bs.slice(0, i + 1), ...nb, ...bs.slice(i + 1)];
+    }
+    return appendEnd();
+  };
+  const insertOptionsFor = (): { value: string; label: string }[] => {
+    const bs = blocksRef.current, opts = [{ value: "end", label: "Am Ende der Notiz" }];
+    const cur = bs.find((b) => b.id === activeBlock), lastId = bs[bs.length - 1]?.id;
+    const nameOf = (b: Block) => b.kind === "pdf" ? `Seite ${pdfPageLabel(b)}` : "Notizblatt";
+    if (cur && cur.id !== lastId) opts.push({ value: "after:" + cur.id, label: `Nach der aktuellen Seite (${nameOf(cur)})` });
+    if (bs.length > 1) opts.push({ value: "start", label: "Am Anfang der Notiz" });
+    bs.forEach((b, i) => { if (b.id !== lastId && b.id !== cur?.id) opts.push({ value: "after:" + b.id, label: `Nach ${nameOf(b)} (Position ${i + 1})` }); });
+    return opts;
+  };
+  const pageText = async (doc: PDFDocumentProxy, n: number) => {
+    try { const tc = await (await doc.getPage(n)).getTextContent(); return tc.items.map((it) => ("str" in it ? it.str : "")).join(" "); } catch { return ""; }
+  };
+  /** Erkennt ein fortgeschriebenes Skript: Stimmen die ersten Seiten mit einem schon importierten PDF überein,
+   *  werden nur die neuen Seiten vorgeschlagen (Text-Vergleich, Leerraum und Groß/Klein egal). */
+  const detectKnownPages = async (incoming: PDFDocumentProxy): Promise<PageSelectSuggestion | null> => {
+    let best = 0;
+    for (const id of new Set(blocksRef.current.map((b) => b.docId).filter(Boolean) as string[])) {
+      const old = docs.current.get(id);
+      if (!old) continue;
+      let matched = 0;
+      for (let i = 1; i <= Math.min(old.numPages, incoming.numPages, 600); i++) {
+        const [a, b] = await Promise.all([pageText(old, i), pageText(incoming, i)]);
+        if (normalizePageText(a) !== normalizePageText(b)) break;
+        if (normalizePageText(b)) matched = i; // reine Bildseiten zählen nur, wenn danach Text übereinstimmt
+      }
+      best = Math.max(best, matched);
+    }
+    if (!best) return null;
+    if (best >= incoming.numPages) return { pages: [], note: "Alle Seiten dieser Datei sind bereits in dieser Notiz (gleicher Text). Du kannst trotzdem Seiten auswählen." };
+    const pages = Array.from({ length: incoming.numPages - best }, (_, k) => best + k);
+    return { pages, note: `Seiten 1–${best} stimmen mit einem bereits importierten Dokument überein. Vorausgewählt sind nur die neuen Seiten ${best + 1}–${incoming.numPages}.` };
+  };
+  const pdfErrorText = (err: unknown) => {
+    const name = err instanceof Error ? err.name : "";
+    return name === "PasswordException" ? "Diese PDF ist passwortgeschützt und kann nicht importiert werden."
+      : isQuotaError(err) ? "Der Gerätespeicher ist voll – die Datei konnte nicht importiert werden."
+      : err instanceof Error && err.message && !/Invalid PDF|leer/.test(err.message) && /[äöüß]|Datei|Office|Browser|Folie|Präsentation/i.test(err.message) ? err.message
+      : "Diese Datei ist keine lesbare PDF und wurde nicht importiert.";
+  };
+  /** Schritt 1: Datei prüfen (Office/Text vorher in ein PDF umwandeln) und den Seitenauswahl-Dialog öffnen. */
+  const importDocument = async (file: File) => {
+    const kind = classifyFile(file);
+    if (kind === "image") { setPendingImages([file]); return; }
+    if (kind === "unsupported") { alert(/\.(doc|ppt|xls|xlsx)$/i.test(file.name) ? "Ältere Office-Formate (.doc, .ppt) und Excel werden nicht unterstützt. Bitte als .docx, .pptx oder PDF speichern." : "Dieses Dateiformat wird nicht unterstützt. Möglich sind PDF, Word (.docx), PowerPoint (.pptx), Text (.txt, .md) und Bilder."); return; }
+    let pdfBlob: Blob = file, name = file.name;
+    setSaved(kind === "pdf" ? "PDF wird geprüft …" : "Datei wird in Seiten umgewandelt …");
     let doc: PDFDocumentProxy;
     try {
-      const pdfjs = await loadPdfJs();
-      doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise; // zuerst prüfen: kaputte Dateien landen nicht in der Datenbank
+      if (kind !== "pdf") { pdfBlob = await convertToPdf(file, (m) => setSaved(m)); name = file.name.replace(/\.[^.]+$/, "") + " (umgewandelt).pdf"; }
+      doc = await (await loadPdfJs()).getDocument({ data: await pdfBlob.arrayBuffer() }).promise; // zuerst prüfen: kaputte Dateien landen nicht in der Datenbank
       if (!doc.numPages) throw new Error("leer");
-      await kvSet("pdf:" + docId, new Blob([file], { type: "application/pdf" })); // Original als Blob offline sichern (ohne weitere Kopie im Speicher)
-    } catch (err) {
-      try { await kvDel("pdf:" + docId); } catch { /* war nie gespeichert */ }
-      const name = err instanceof Error ? err.name : "";
-      const msg = name === "PasswordException" ? "Diese PDF ist passwortgeschützt und kann nicht importiert werden."
-        : isQuotaError(err) ? "Der Gerätespeicher ist voll – die PDF konnte nicht importiert werden."
-        : "Diese Datei ist keine lesbare PDF und wurde nicht importiert.";
-      setSaved("PDF nicht importiert"); alert(msg); return;
-    }
+    } catch (err) { setSaved("Nicht importiert"); alert(pdfErrorText(err)); return; }
+    setSaved("");
+    let labels: string[] | null = null;
+    try { labels = await doc.getPageLabels(); } catch { /* keine Beschriftungen */ }
+    const renderThumb = async (i: number, cv: HTMLCanvasElement, width: number) => {
+      const page = await doc.getPage(i + 1), base = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: width / base.width });
+      cv.width = Math.ceil(vp.width); cv.height = Math.ceil(vp.height);
+      await page.render({ canvas: cv, canvasContext: cv.getContext("2d")!, viewport: vp } as Parameters<PDFPageProxy["render"]>[0]).promise;
+      page.cleanup();
+    };
+    const close = () => setPageDialog(null);
+    setPageDialog({
+      mode: "import", title: `„${file.name}“ importieren`,
+      subtitle: kind === "pdf" ? `${doc.numPages} Seiten` : `${doc.numPages} ${doc.numPages === 1 ? "Seite" : "Seiten"} · automatisch in ein Seitenlayout umgewandelt (vereinfachte Darstellung)`,
+      pageCount: doc.numPages, pageLabel: (i) => `Seite ${labels?.[i]?.trim() || i + 1}`, renderThumb, insertOptions: insertOptionsFor(),
+      suggestion: detectKnownPages(doc), confirmLabel: (n) => `${n} ${n === 1 ? "Seite" : "Seiten"} importieren`,
+      onCancel: () => { close(); void doc.loadingTask.destroy(); setSaved(""); },
+      onConfirm: (r) => { close(); void commitPdfImport(doc, pdfBlob, r.pages, r.insertAt, name); },
+    });
+  };
+  /** Schritt 2: gewählte Seiten als Blöcke einfügen, Original sichern, Vorschaubilder nur für diese Seiten erzeugen. */
+  const commitPdfImport = async (doc: PDFDocumentProxy, blob: Blob, pages: number[], insertAt: string, name: string) => {
+    const docId = uid();
+    try { await kvSet("pdf:" + docId, new Blob([blob], { type: "application/pdf" })); } // Original als Blob offline sichern
+    catch (err) { try { await kvDel("pdf:" + docId); } catch { /* war nie gespeichert */ } setSaved("Nicht importiert"); alert(pdfErrorText(err)); void doc.loadingTask.destroy(); return; }
     docs.current.set(docId, doc);
     const nb: Block[] = [];
-    for (let i = 1; i <= doc.numPages; i++) {
-      const vp = (await doc.getPage(i)).getViewport({ scale: 1 });
-      nb.push({ id: uid(), kind: "pdf", docId, pageNum: i, height: Math.round((vp.height * PAGE_W) / vp.width), gap: MIN_GAP });
+    for (const i of pages) {
+      const vp = (await doc.getPage(i + 1)).getViewport({ scale: 1 });
+      nb.push({ id: uid(), kind: "pdf", docId, pageNum: i + 1, height: Math.round((vp.height * PAGE_W) / vp.width), gap: MIN_GAP });
     }
     const s0 = snap();
-    setBlocks((bs) => [...bs.slice(0, -1), ...nb, bs[bs.length - 1]]); // Seiten sofort sichtbar, ohne auf die Bilder zu warten
+    setBlocks((bs) => insertBlocks(bs, nb, insertAt)); // Seiten sofort sichtbar, ohne auf die Bilder zu warten
     pushHist(s0);
+    pendingScroll.current = nb[0]?.id ?? null;
+    flash(`${pages.length === doc.numPages ? "Alle " + pages.length : pages.length} ${pages.length === 1 ? "Seite" : "Seiten"} aus „${name}“ eingefügt${pages.length < doc.numPages ? ` (${formatPageRange(pages)})` : ""} · Rückgängig mit Strg+Z`);
     // Hintergrund: Rasterbilder im Web Worker erzeugen, in IndexedDB ablegen und den fertigen Seiten melden
     setSaved("PDF wird aufbereitet …");
-    const ok = await rasterizeInWorker(await file.arrayBuffer(), async (n, total, blob) => {
+    let done = 0;
+    const ok = await rasterizeInWorker(await blob.arrayBuffer(), async (n, _total, img) => {
       const key = rasterKey(docId, n);
-      await kvSet(key, blob);
+      await kvSet(key, img);
       window.dispatchEvent(new CustomEvent("pdfraster", { detail: key }));
-      setSaved(`PDF wird aufbereitet … ${n}/${total}`);
-    });
+      setSaved(`PDF wird aufbereitet … ${++done}/${pages.length}`);
+    }, pages.map((i) => i + 1));
     setSaved(ok ? "PDF aufbereitet" : "PDF importiert (Vorschaubilder unvollständig, Seiten werden live gezeichnet)");
   };
+  // Bilder: als Objekt auf der aktuellen Seite (Mitte des Bildschirms bzw. Ablageort) oder als eigene Seite
+  const viewCenterDoc = () => {
+    const sc = scRef.current, z = zoomRef.current;
+    return sc ? { x: PAGE_W / 2, y: (sc.scrollTop + sc.clientHeight / 2) / z } : { x: PAGE_W / 2, y: 200 };
+  };
+  const insertImages = async (files: File[], asPage: boolean, at?: { x: number; y: number }) => {
+    if (!canEdit) return;
+    const prepared: { assetId: string; w: number; h: number }[] = [];
+    const errors: string[] = [];
+    setSaved(files.length > 1 ? `${files.length} Bilder werden vorbereitet …` : "Bild wird vorbereitet …");
+    for (const f of files) {
+      try {
+        const img = await prepareImage(f), assetId = uid();
+        await kvSet("img:" + assetId, img.blob);
+        prepared.push({ assetId, w: img.w, h: img.h });
+      } catch (err) { errors.push(isQuotaError(err) ? "Der Gerätespeicher ist voll – das Bild wurde nicht eingefügt." : err instanceof Error ? err.message : "Bild konnte nicht gelesen werden."); }
+    }
+    setSaved("");
+    if (errors.length) alert([...new Set(errors)].join("\n\n"));
+    if (!prepared.length) return;
+    const s0 = snap();
+    if (asPage) {
+      const nb: Block[] = [], items: ImageItem[] = [];
+      for (const p of prepared) {
+        const h = Math.max(120, Math.round((PAGE_W * p.h) / p.w)), b: Block = { id: uid(), kind: "blank", height: h, gap: MIN_GAP };
+        nb.push(b); items.push({ id: uid(), blockId: b.id, assetId: p.assetId, x: 0, y: 0, w: PAGE_W, h });
+      }
+      imagesRef.current = [...imagesRef.current, ...items];
+      const cur = blocksRef.current.find((b) => b.id === activeBlock);
+      setBlocks((bs) => insertBlocks(bs, nb, cur && cur.id !== bs[bs.length - 1]?.id ? "after:" + cur.id : "end"));
+      pendingScroll.current = nb[0].id;
+      flash(prepared.length === 1 ? "Bild als neue Seite eingefügt" : `${prepared.length} Bilder als neue Seiten eingefügt`);
+    } else {
+      const c = at ?? viewCenterDoc(), items: ImageItem[] = [];
+      prepared.forEach((p, k) => {
+        const w = Math.min(p.w, PAGE_W * 0.62), h = (w * p.h) / p.w;
+        const x = clamp(c.x - w / 2 + k * 24, 0, Math.max(0, PAGE_W - w)), absY = Math.max(0, c.y - (at ? 0 : h / 2) + k * 24), b = blockAt(absY);
+        items.push({ id: uid(), blockId: b.id, assetId: p.assetId, x, y: absY - (topsRef.current[b.id] ?? 0), w, h });
+        growTail(absY + h);
+      });
+      imagesRef.current = [...imagesRef.current, ...items];
+      setTool("lasso"); setSelImg(items[items.length - 1].id);
+      flash("Bild eingefügt · mit dem Lasso verschieben, an der Ecke skalieren, ✕ entfernt es");
+    }
+    pushHist(s0); bump(); schedule();
+  };
+  const deleteImage = (id: string) => {
+    if (!imagesRef.current.some((im) => im.id === id)) return;
+    const s0 = snap();
+    imagesRef.current = imagesRef.current.filter((im) => im.id !== id);
+    setSelImg(null); pushHist(s0); bump();
+    flash("Bild entfernt · Rückgängig mit Strg+Z");
+  };
+  /** Bild mit dem Lasso verschieben („move“) oder an der Ecke proportional skalieren („resize“). */
+  const startImageDrag = (e: React.PointerEvent, im: ImageItem, mode: "move" | "resize") => {
+    if (!canEdit || tool !== "lasso") return;
+    e.stopPropagation(); e.preventDefault();
+    setSelImg(im.id);
+    const s0 = snap(), z = zoomRef.current, x0 = e.clientX, y0 = e.clientY, top0 = topsRef.current[im.blockId] ?? 0;
+    let changed = false;
+    const target = e.currentTarget as Element;
+    try { target.setPointerCapture(e.pointerId); } catch { /* ältere WebViews */ }
+    const move = (ev: PointerEvent) => {
+      const dx = (ev.clientX - x0) / z, dy = (ev.clientY - y0) / z;
+      if (!changed && Math.hypot(dx, dy) * z < 3) return;
+      changed = true;
+      imagesRef.current = imagesRef.current.map((x) => {
+        if (x.id !== im.id) return x;
+        if (mode === "move") return { ...x, x: clamp(im.x + dx, 24 - im.w, PAGE_W - 24), y: Math.max(-top0, im.y + dy) };
+        const w = clamp(im.w + Math.max(dx, (dy * im.w) / im.h), 32, PAGE_W * 2);
+        return { ...x, w, h: (w * im.h) / im.w };
+      });
+      bump();
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
+      if (!changed) return;
+      imagesRef.current = imagesRef.current.map((x) => { // Neuzuordnung: Block = der, in dem die Bildmitte liegt
+        if (x.id !== im.id) return x;
+        const abs = (topsRef.current[x.blockId] ?? 0) + x.y, b = blockAt(abs + x.h / 2);
+        growTail(abs + x.h);
+        return { ...x, blockId: b.id, y: abs - (topsRef.current[b.id] ?? 0) };
+      });
+      pushHist(s0); bump();
+    };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
+  };
+  // Bilddaten aus IndexedDB als Object-URLs bereitstellen (einmal je Bild)
+  const imageKey = imagesRef.current.map((im) => im.assetId).join(",");
+  useEffect(() => {
+    let alive = true;
+    const missing = [...new Set(imagesRef.current.map((im) => im.assetId))].filter((a) => !(a in imgUrls));
+    if (!missing.length) return;
+    (async () => {
+      const add: Record<string, string> = {};
+      for (const a of missing) { try { const b = await kvGet<Blob>("img:" + a); if (b instanceof Blob) add[a] = URL.createObjectURL(b); } catch { /* Bild fehlt */ } }
+      if (alive && Object.keys(add).length) setImgUrls((m) => ({ ...m, ...add })); else Object.values(add).forEach((u) => URL.revokeObjectURL(u));
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageKey]);
+  const imgUrlsRef = useRef(imgUrls); imgUrlsRef.current = imgUrls;
+  useEffect(() => () => { Object.values(imgUrlsRef.current).forEach((u) => URL.revokeObjectURL(u)); }, []);
+  useEffect(() => { if (tool !== "lasso") setSelImg(null); }, [tool]);
 
   /* ───── PDF-Export: Leinwand in A4-Kacheln (794×1123 px, 2× Auflösung) ───── */
-  const exportPdf = async () => {
+  // Export: erst die Seitenauswahl (gleiche Optionen wie beim Import), dann der unveränderte PDF-Export der gewählten A4-Seiten
+  const exportPdf = () => {
+    const pages = exportPageCount(), renderer = makeExportRenderer();
+    const close = () => { setPageDialog(null); renderer.dispose(); };
+    setPageDialog({
+      mode: "export", title: "Als PDF exportieren", subtitle: `${pages} ${pages === 1 ? "Seite" : "Seiten"} im A4-Format`, pageCount: pages,
+      renderThumb: async (i, cv, width) => { const S = width / PAGE_W; cv.width = Math.round(PAGE_W * S); cv.height = Math.round(EXPORT_TH * S); await renderer.tile(cv, i, S, true); },
+      confirmLabel: (n) => `${n} ${n === 1 ? "Seite" : "Seiten"} exportieren`,
+      onCancel: close,
+      onConfirm: (r) => { close(); void runExport(r.pages, pages); },
+    });
+  };
+  const runExport = async (sel: number[], total: number) => {
     setSaved("Exportiere …");
-    try { await exportPdfInner(); }
+    try { await exportPdfInner(sel, total); }
     catch (err) { setSaved(isQuotaError(err) ? "Export fehlgeschlagen: Speicher voll" : "Export fehlgeschlagen – bitte erneut versuchen"); }
   };
-  const exportPdfInner = async () => {
-    const { jsPDF } = await import("jspdf");
+  const EXPORT_TH = 1123;
+  const exportPageCount = () => {
+    let end = EXPORT_TH;
+    for (const b of blocksRef.current) if (b.kind === "pdf") end = Math.max(end, topsRef.current[b.id] + b.height);
+    for (const s of strokes.current) end = Math.max(end, (topsRef.current[s.blockId] ?? 0) + bbox(s).y1 + 20);
+    for (const t of textFields.current) end = Math.max(end, (topsRef.current[t.blockId] ?? 0) + t.y + t.height + 20);
+    for (const im of imagesRef.current) end = Math.max(end, (topsRef.current[im.blockId] ?? 0) + im.y + im.h);
+    return Math.ceil(end / EXPORT_TH);
+  };
+  /** Zeichnet A4-Kachel i in ein Canvas (Maßstab S). Gleiche Reihenfolge wie bisher: Papier/PDF → Bilder → Textmarker → Schrift → Texte. */
+  const makeExportRenderer = () => {
     const printableInk = (ink: string) => {
       if (!/^#[0-9a-f]{6}$/i.test(ink)) return ink;
       const [r, g, b] = [1, 3, 5].map((i) => parseInt(ink.slice(i, i + 2), 16) / 255);
       return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.94 ? "#111827" : ink;
     };
-    const S = 2, TH = 1123, bs = blocksRef.current, bmp = new Map<string, HTMLCanvasElement>();
-    // PDF-Seiten werden erst für die Kachel gerendert, die sie braucht, und danach wieder freigegeben (spart Speicher bei langen PDFs)
-    const ensureBitmaps = async (y0: number) => {
+    const TH = EXPORT_TH, bs = blocksRef.current, bmp = new Map<string, CanvasImageSource & { width: number; height: number }>(), imgs = new Map<string, ImageBitmap | null>();
+    const free = (c: unknown) => { if (c instanceof HTMLCanvasElement) { c.width = 0; c.height = 0; } else if (c instanceof ImageBitmap) c.close(); };
+    // PDF-Seiten werden erst für die Kachel gerendert, die sie braucht, und danach wieder freigegeben (spart Speicher bei langen PDFs).
+    // Vorschau (thumb): vorhandene Rasterbilder genügen; für das PDF selbst wird wie bisher scharf mit pdf.js gerendert.
+    const ensureBitmaps = async (y0: number, S: number, thumb: boolean) => {
       const needed = bs.filter((b) => b.kind === "pdf" && !(topsRef.current[b.id] + b.height + b.gap < y0 || topsRef.current[b.id] > y0 + TH));
-      for (const [id, c] of bmp) if (!needed.some((b) => b.id === id)) { c.width = 0; c.height = 0; bmp.delete(id); }
+      const tag = (b: Block) => `${b.id}@${thumb ? "t" : S}`;
+      if (!thumb) for (const [id, c] of bmp) if (!needed.some((b) => tag(b) === id)) { free(c); bmp.delete(id); }
       for (const b of needed) {
-        if (bmp.has(b.id)) continue;
+        if (bmp.has(tag(b))) continue;
+        if (thumb) {
+          try { const r = await kvGet<Blob>(rasterKey(b.docId!, b.pageNum!)); if (r instanceof Blob) { bmp.set(tag(b), await createImageBitmap(r)); continue; } } catch { /* sonst pdf.js */ }
+        }
         const doc = docs.current.get(b.docId!);
         if (!doc) continue;
         const page = await doc.getPage(b.pageNum!), base = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: (PAGE_W / base.width) * S });
         const c = document.createElement("canvas"); c.width = vp.width; c.height = vp.height;
         await page.render({ canvas: c, canvasContext: c.getContext("2d")!, viewport: vp } as Parameters<typeof page.render>[0]).promise;
-        bmp.set(b.id, c);
+        bmp.set(tag(b), c);
       }
+      return (b: Block) => bmp.get(tag(b));
     };
-    let end = TH;
-    for (const b of bs) if (b.kind === "pdf") end = Math.max(end, topsRef.current[b.id] + b.height);
-    for (const s of strokes.current) end = Math.max(end, (topsRef.current[s.blockId] ?? 0) + bbox(s).y1 + 20);
-    for (const t of textFields.current) end = Math.max(end, (topsRef.current[t.blockId] ?? 0) + t.y + t.height + 20);
+    const imageOf = async (assetId: string) => {
+      if (!imgs.has(assetId)) { try { const b = await kvGet<Blob>("img:" + assetId); imgs.set(assetId, b instanceof Blob ? await createImageBitmap(b) : null); } catch { imgs.set(assetId, null); } }
+      return imgs.get(assetId) ?? null;
+    };
     const drawTpl = (ctx: CanvasRenderingContext2D, top: number, h: number) => {
       if (tpl === "blank") return;
       if (tpl === "dots") {
@@ -2167,28 +2435,40 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       if (tpl === "grid") for (let x = 0; x <= PAGE_W; x += 24) { ctx.moveTo(x + 0.5, top); ctx.lineTo(x + 0.5, top + h); }
       ctx.stroke();
     };
-    const pdf = new jsPDF({ unit: "px", format: [PAGE_W, TH], hotfixes: ["px_scaling"] }), pages = Math.ceil(end / TH);
-    for (let i = 0; i < pages; i++) {
-      const y0 = i * TH, cv = document.createElement("canvas");
-      await ensureBitmaps(y0);
-      cv.width = PAGE_W * S; cv.height = TH * S;
+    const tile = async (cv: HTMLCanvasElement, i: number, S: number, thumb = false) => {
+      const y0 = i * TH, getBmp = await ensureBitmaps(y0, S, thumb);
       const ctx = cv.getContext("2d")!;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
       ctx.scale(S, S); ctx.translate(0, -y0);
       for (const b of bs) {
         const t = topsRef.current[b.id];
         if (t + b.height + b.gap < y0 || t > y0 + TH) continue;
         if (b.kind === "pdf") {
-          const img = bmp.get(b.id);
+          const img = getBmp(b);
           if (img) ctx.drawImage(img, 0, t, PAGE_W, b.height);
           if (b.gap > MIN_GAP) drawTpl(ctx, t + b.height, b.gap); // wie auf dem Bildschirm: Papier nur im eingefügten Platz
         } else drawTpl(ctx, t, b.height);
       }
-      [...strokes.current].sort((a, b) => Number(b.tool === "highlighter") - Number(a.tool === "highlighter")).forEach((s) => { // Textmarker unter der Schrift
-        const st = topsRef.current[s.blockId] ?? 0, bb = bbox(s);
-        if (st + bb.y1 < y0 - 40 || st + bb.y0 > y0 + TH + 40) return; // liegt nicht auf dieser Seite
-        paint(ctx, s, 0, 0, printableInk(s.color));
-      });
+      for (const im of imagesRef.current) {
+        const t = (topsRef.current[im.blockId] ?? 0) + im.y;
+        if (t + im.h < y0 || t > y0 + TH) continue;
+        const bm = await imageOf(im.assetId);
+        if (bm) ctx.drawImage(bm, im.x, t, im.w, im.h);
+      }
+      const onTile = (s: Stroke) => { const st = topsRef.current[s.blockId] ?? 0, bb = bbox(s); return !(st + bb.y1 < y0 - 40 || st + bb.y0 > y0 + TH + 40); };
+      // Textmarker wie auf dem Bildschirm: deckend in eine eigene Ebene, dann mit „multiply“ und fester Deckkraft
+      // auf die Seite → Schrift darunter bleibt schwarz, überlappende Marker dunkeln nicht auf.
+      const hls = strokes.current.filter((s) => s.tool === "highlighter" && onTile(s));
+      if (hls.length) {
+        const layer = document.createElement("canvas"); layer.width = cv.width; layer.height = cv.height;
+        const lc = layer.getContext("2d")!; lc.scale(S, S); lc.translate(0, -y0);
+        for (const s of hls) paint(lc, s, 0, 0, s.color, true, true, 1);
+        ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = HL_OPACITY_LIGHT; ctx.globalCompositeOperation = "multiply";
+        ctx.drawImage(layer, 0, 0); ctx.restore();
+        layer.width = 0; layer.height = 0;
+      }
+      for (const s of strokes.current) if (s.tool !== "highlighter" && onTile(s)) paint(ctx, s, 0, 0, printableInk(s.color));
       textFields.current.forEach((t) => {
         const lh = t.fontSize * 1.375;
         let y = (topsRef.current[t.blockId] ?? 0) + t.y + 2;
@@ -2202,12 +2482,28 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           ctx.fillText(line, t.x + 2, y); y += lh;
         }
       });
-      pdf.addImage(cv.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, PAGE_W, TH);
-      cv.width = 0; cv.height = 0; // Kachel sofort freigeben
-      if (i < pages - 1) pdf.addPage([PAGE_W, TH]);
-    }
-    for (const c of bmp.values()) { c.width = 0; c.height = 0; }
-    await saveFile(pdf.output("blob"), (title?.split(" › ").pop() || "Notiz") + ".pdf");
+    };
+    const dispose = () => { for (const c of bmp.values()) free(c); bmp.clear(); for (const c of imgs.values()) c?.close(); imgs.clear(); };
+    return { tile, dispose };
+  };
+  /* ───── PDF-Export: Leinwand in A4-Kacheln (794×1123 px, 2× Auflösung) – nur die gewählten Seiten ───── */
+  const exportPdfInner = async (sel: number[], total: number) => {
+    const { jsPDF } = await import("jspdf");
+    const S = 2, TH = EXPORT_TH, renderer = makeExportRenderer();
+    const pdf = new jsPDF({ unit: "px", format: [PAGE_W, TH], hotfixes: ["px_scaling"] });
+    try {
+      for (let k = 0; k < sel.length; k++) {
+        const cv = document.createElement("canvas");
+        cv.width = PAGE_W * S; cv.height = TH * S;
+        await renderer.tile(cv, sel[k], S);
+        pdf.addImage(cv.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, PAGE_W, TH);
+        cv.width = 0; cv.height = 0; // Kachel sofort freigeben
+        if (k < sel.length - 1) pdf.addPage([PAGE_W, TH]);
+        if (sel.length > 3) setSaved(`Exportiere … ${k + 1}/${sel.length}`);
+      }
+    } finally { renderer.dispose(); }
+    const base = title?.split(" › ").pop() || "Notiz";
+    await saveFile(pdf.output("blob"), sel.length < total ? `${base} (Seiten ${formatPageRange(sel).replace(/–/g, "-")}).pdf` : base + ".pdf");
     setSaved("Exportiert");
   };
 
@@ -2217,6 +2513,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
         if (functionMenuOpen || viewMenuOpen) { setFunctionMenuOpen(false); setViewMenuOpen(false); return; }
         if (!(e.target as HTMLElement)?.closest?.("textarea, input, select")) { setFocus(false); return; }
       }
+      if (selImg && (e.key === "Delete" || e.key === "Backspace") && !(e.target as HTMLElement)?.closest?.("textarea, input, select")) { e.preventDefault(); deleteImage(selImg); return; }
       if (!(e.ctrlKey || e.metaKey)) return;
       if ((e.target as HTMLElement)?.closest?.("textarea, input, select")) return; // in Textfeldern gilt das native Undo
       const key = e.key.toLowerCase();
@@ -2330,6 +2627,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const topIcon = (id: TopTool) => id === "lab"
     ? <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 3h6M10 3v6l-5.2 9.1A2 2 0 0 0 6.5 21h11a2 2 0 0 0 1.7-2.9L14 9V3M7.4 15h9.2"/></svg>
     : id === "func" ? <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 20h16M4 20V4M6 17c3-9 5-9 7-4s4 4 6-6"/></svg>
+    : id === "pen" && tool === "highlighter" ? toolIcon("highlighter") // Stift-Platz zeigt beim Textmarker dessen eigenes Symbol (nicht den Stift)
     : toolIcon(id);
   const pickTop = (id: TopTool) => {
     setColorMenu(null);
@@ -2521,7 +2819,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           {/* Mittige Werkzeuggruppe: Werkzeuge · Verlauf · Mehr · Fokus – alles als Symbole */}
           <div className="notiz-toolbar__center">
           {canEdit && <div className="xnts-tools" role="toolbar" aria-label="Werkzeuge">
-            {TOP_TOOLS.map((t) => <button key={t.id} type="button" title={t.label + (topActive(t.id) && t.id !== "lab" && t.id !== "func" ? " – nochmal antippen blendet die Optionen ein/aus" : "")} aria-label={t.label} aria-pressed={topActive(t.id)} className="xnts-tools__btn" onClick={() => pickTop(t.id)}>{topIcon(t.id)}</button>)}
+            {TOP_TOOLS.map((t) => { const label = t.id === "pen" && tool === "highlighter" ? "Textmarker" : t.label; return <button key={t.id} type="button" title={label + (topActive(t.id) && t.id !== "lab" && t.id !== "func" ? " – nochmal antippen blendet die Optionen ein/aus" : "")} aria-label={label} aria-pressed={topActive(t.id)} className="xnts-tools__btn" onClick={() => pickTop(t.id)}>{topIcon(t.id)}</button>; })}
           </div>}
           {canEdit && <div className="xnts-tools xnts-tools--history" role="group" aria-label="Verlauf">
             <button type="button" className="xnts-tools__btn" onClick={undo} disabled={!canUndo} title="Rückgängig (Strg+Z)" aria-label="Rückgängig">
@@ -2646,10 +2944,18 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
             <CtxSep /></>}
             <div className="xnts-ctx__group" role="group" aria-label="PDF">
               <span className="xnts-ctx__label">PDF</span>
-              {canEdit && <label className="xnts-ctx__btn xnts-ctx__file">
-                PDF importieren
-                <input type="file" accept="application/pdf" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importPdf(f); e.target.value = ""; setFunctionMenuOpen(false); }} />
-              </label>}
+              {canEdit && <span className="xnts-ctx__slotwrap">
+                <button type="button" className="xnts-ctx__btn" aria-haspopup="true" aria-expanded={colorMenu === "import"} onClick={() => setColorMenu(colorMenu === "import" ? null : "import")}>Importieren <span aria-hidden="true">⌄</span></button>
+                {colorMenu === "import" && <div className="xnts-pop xnts-pop--import" role="menu" aria-label="Importieren">
+                  <strong>Importieren</strong>
+                  <label className="xnts-pop__row" role="menuitem"><b>📄 Dokument / PDF importieren</b><small>PDF, Word (.docx), PowerPoint (.pptx), .txt, .md</small>
+                    <input type="file" accept={IMPORT_ACCEPT} hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void importDocument(f); e.target.value = ""; setColorMenu(null); setFunctionMenuOpen(false); }} /></label>
+                  <label className="xnts-pop__row" role="menuitem"><b>🖼 Bild aus Galerie einfügen</b><small>JPG, PNG, WebP, HEIC</small>
+                    <input type="file" accept={IMAGE_ACCEPT} multiple hidden onChange={(e) => { const f = [...(e.target.files ?? [])]; if (f.length) setPendingImages(f); e.target.value = ""; setColorMenu(null); setFunctionMenuOpen(false); }} /></label>
+                  <label className="xnts-pop__row" role="menuitem"><b>📷 Foto aufnehmen</b><small>Kamera des Geräts (am PC: Dateiauswahl)</small>
+                    <input type="file" accept="image/*" capture="environment" hidden onChange={(e) => { const f = [...(e.target.files ?? [])]; if (f.length) setPendingImages(f); e.target.value = ""; setColorMenu(null); setFunctionMenuOpen(false); }} /></label>
+                </div>}
+              </span>}
               <button type="button" className="xnts-ctx__btn" onClick={() => { setFunctionMenuOpen(false); exportPdf(); }}>Als PDF exportieren</button>
             </div>
             {canEdit && hasPdf && <><CtxSep />
@@ -2713,7 +3019,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           <button type="button" onClick={togglePdfDeleteMode}>Beenden</button>
         </div>}
         <div ref={scRef} className="xnts-canvas-scroll flex-1 min-w-0 overflow-auto relative" style={{ touchAction: "none", cursor: readOnly ? "grab" : tool === "lasso" ? "crosshair" : tool === "eraser" ? "none" : tool === "text" ? "text" : "default" }}
-          onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+          onPointerDownCapture={() => { if (selImg) setSelImg(null); }} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
           onContextMenu={(e) => e.preventDefault() /* Stift-Seitentaste und „Gedrückt halten“ unter Windows öffnen sonst das Kontextmenü und brechen den Strich ab */}
           onDoubleClick={(e) => {
             if (tool !== "lasso" || readOnly) return;
@@ -2736,6 +3042,9 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
               if (analysis?.supportsRc || hasSymbols) perfectSelected(); else openFunctionForSelection();
             } else setSaved("Kein Inhalt in der Nähe erkannt");
           }}>
+          {/* Ebenen: Papier/PDF/Textfelder → Textmarker (Mischmodus) → Handschrift. So bleibt jede Schrift unter dem Marker scharf. */}
+          <canvas ref={hlLightRef} className="xnts-hl-layer sticky top-0 left-0 pointer-events-none block" style={{ zIndex: 9, mixBlendMode: "multiply", opacity: HL_OPACITY_LIGHT }} aria-hidden="true" />
+          <canvas ref={hlDarkRef} className="xnts-hl-layer sticky top-0 left-0 pointer-events-none block" style={{ zIndex: 9, mixBlendMode: "screen", opacity: HL_OPACITY_DARK, display: darkMode ? undefined : "none" }} aria-hidden="true" />
           <canvas ref={cvRef} className="sticky top-0 left-0 z-10 pointer-events-none block" />
           <div className="xnts-canvas-notice" role="status" aria-live="polite">{notice && <span>{notice}</span>}</div>
           <div ref={zoomLayerRef} className="relative mx-auto" style={{ width: PAGE_W * zoom, height: (total + 400) * zoom }}>
@@ -2751,6 +3060,15 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
                   )}
                 </div>
               ))}
+              {imagesRef.current.map((im) => { const on = selImg === im.id, editable = canEdit && tool === "lasso" && !pdfDeleteMode;
+                return <div key={im.id} className={"xnts-img" + (on ? " is-selected" : "")} style={{ left: im.x, top: (tops[im.blockId] ?? 0) + im.y, width: im.w, height: im.h, pointerEvents: editable ? "auto" : "none", cursor: editable ? "move" : undefined }}
+                  onPointerDown={(e) => startImageDrag(e, im, "move")}>
+                  {imgUrls[im.assetId] ? <img src={imgUrls[im.assetId]} alt="" draggable={false} /> : <span className="xnts-img__ph">Bild wird geladen …</span>}
+                  {on && editable && <>
+                    <button type="button" className="xnts-img__del" style={{ transform: `scale(${1 / zoom})` }} title="Bild entfernen (Entf)" aria-label="Bild entfernen" onPointerDown={(e) => e.stopPropagation()} onClick={() => deleteImage(im.id)}>✕</button>
+                    <span className="xnts-img__handle" style={{ transform: `scale(${1 / zoom})` }} title="Ziehen: Größe ändern" onPointerDown={(e) => startImageDrag(e, im, "resize")} />
+                  </>}
+                </div>; })}
               {pageMarkers && pageBreaks.map((y) => (
                 <div key={"a4-" + y} className="xnts-a4-break" aria-hidden="true" style={{ top: y, "--a4-line": `${Math.max(1, 1.5 / zoom)}px`, "--a4-s": `${1 / Math.min(1, zoom)}` } as React.CSSProperties}>
                   <span>Seite {Math.round(y / A4_H) + 1}</span>
@@ -2900,6 +3218,8 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
           {abtn("Löschen", deleteSel, sel.current.size === 0)}
         </div>
       )}
+      {pageDialog && <PageSelectDialog {...pageDialog} />}
+      {pendingImages && <ImagePlaceDialog count={pendingImages.length} onCancel={() => setPendingImages(null)} onChoose={(asPage) => { const f = pendingImages; setPendingImages(null); void insertImages(f, asPage); }} />}
     </div>
   );
 }

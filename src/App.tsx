@@ -175,7 +175,8 @@ export default function App() {
     // Müllabfuhr: Notiz-Inhalt UND zugehörige PDFs löschen (verzögert, damit ein letztes Auto-Speichern der geschlossenen Notiz nicht zurückschreibt)
     const notes = ids.filter((i) => byId(i)?.type === "note");
     setTimeout(() => notes.forEach(async (i) => {
-      const d = await kvGet<{ blocks?: { docId?: string; pageNum?: number }[] }>("note:" + i);
+      const d = await kvGet<{ blocks?: { docId?: string; pageNum?: number }[]; images?: { assetId?: string }[] }>("note:" + i);
+      new Set(d?.images?.map((im) => im.assetId).filter(Boolean)).forEach((x) => kvDel("img:" + x)); // eingefügte Bilder
       new Set(d?.blocks?.map((b) => b.docId).filter(Boolean)).forEach((x) => kvDel("pdf:" + x));
       d?.blocks?.forEach((b) => { if (b.docId && b.pageNum) kvDel(rasterKey(b.docId, b.pageNum)); }); // Rasterbilder der Seiten
       kvDel("note:" + i);

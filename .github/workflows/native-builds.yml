@@ -133,9 +133,9 @@ jobs:
           name: XNTS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
           files: release-assets/*
           body: |
-            XNTS 1.0.17 — persönliche Notizen, PDFs und eine frei einstellbare Schreibfläche.
+            XNTS 1.0.19 — persönliche Notizen, PDFs und eine frei einstellbare Schreibfläche.
 
-            Neu: Seitenliste und Bibliothek lassen sich leichter anpassen, Notizblätter bieten direkte Aktionen, und Funktionsgraphen können ausgeblendet und wieder geöffnet werden. Zoom und Radierer-Vorschau reagieren direkter; Marker liegen unter der Handschrift, Farbpaletten lassen sich bearbeiten. Die Inhalte bleiben lokal auf dem Gerät.
+            Neu: Importieren mit Seitenauswahl (alle Seiten, Seitenbereich oder einzelne Seiten) und frei wählbarer Einfügeposition – fortgeschriebene Skripte werden erkannt, sodass nur die neuen Seiten dazukommen. Neben PDF lassen sich jetzt Word (.docx), PowerPoint (.pptx), Text (.txt, .md), Bilder und Kamerafotos importieren; Bilder sind verschieb- und skalierbar. Der PDF-Export bietet dieselbe Seitenauswahl. Der Textmarker liegt halbtransparent unter jeder Schrift und zeigt wieder das richtige Symbol. Die Inhalte bleiben lokal auf dem Gerät.
 
             Die Windows-Installer sind nicht digital signiert. Windows Smart App Control kann sie daher blockieren. Die Browserfassung ist auf der XNTS-Website verfügbar.
           generate_release_notes: false
