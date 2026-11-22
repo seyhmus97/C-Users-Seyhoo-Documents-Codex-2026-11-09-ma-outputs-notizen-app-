@@ -133,9 +133,9 @@ jobs:
           name: XNTS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
           files: release-assets/*
           body: |
-            XNTS 1.0.19 — persönliche Notizen, PDFs und eine frei einstellbare Schreibfläche.
+            XNTS 1.0.20 — persönliche Notizen, PDFs und eine frei einstellbare Schreibfläche.
 
-            Neu: Importieren mit Seitenauswahl (alle Seiten, Seitenbereich oder einzelne Seiten) und frei wählbarer Einfügeposition – fortgeschriebene Skripte werden erkannt, sodass nur die neuen Seiten dazukommen. Neben PDF lassen sich jetzt Word (.docx), PowerPoint (.pptx), Text (.txt, .md), Bilder und Kamerafotos importieren; Bilder sind verschieb- und skalierbar. Der PDF-Export bietet dieselbe Seitenauswahl. Der Textmarker liegt halbtransparent unter jeder Schrift und zeigt wieder das richtige Symbol. Die Inhalte bleiben lokal auf dem Gerät.
+            Neu: Importieren mit Seitenauswahl (alle Seiten, Seitenbereich oder einzelne Seiten) und frei wählbarer Einfügeposition – fortgeschriebene Skripte werden erkannt, sodass nur die neuen Seiten dazukommen. Neben PDF lassen sich jetzt Word (.docx), PowerPoint (.pptx), Text (.txt, .md), Bilder und Kamerafotos importieren; Bilder sind verschieb- und skalierbar. Der PDF-Export bietet dieselbe Seitenauswahl. Der Textmarker ist wieder ein Textmarker (kein deckender Füller mehr), liegt halbtransparent unter jeder Schrift und zeigt das richtige Symbol. Die A4-Seitengrenzen erscheinen wieder auch in Notizen mit PDF (im eingefügten Platz und im freien Bereich). Beim Öffnen einer Notiz geht es dort weiter, wo du aufgehört hast (Position und Zoom). Die Inhalte bleiben lokal auf dem Gerät.
 
             Die Windows-Installer sind nicht digital signiert. Windows Smart App Control kann sie daher blockieren. Die Browserfassung ist auf der XNTS-Website verfügbar.
           generate_release_notes: false

@@ -76,7 +76,13 @@ const LINE_STYLES: { id: LineStyle; label: string; title: string }[] = [
 const readPenProfiles = (): PenProfile[] => {
   try {
     const saved: unknown = JSON.parse(localStorage.getItem("notizraum-pen-profiles") ?? "null");
-    if (Array.isArray(saved) && saved.length && saved.every((p) => p && typeof p.id === "string" && typeof p.name === "string" && ["ballpoint", "fountain", "pencil", "marker"].includes(p.kind) && typeof p.color === "string" && Number.isFinite(p.size))) return saved as PenProfile[];
+    if (Array.isArray(saved) && saved.length && saved.every((p) => p && typeof p.id === "string" && typeof p.name === "string" && ["ballpoint", "fountain", "pencil", "marker"].includes(p.kind) && typeof p.color === "string" && Number.isFinite(p.size))) {
+      // Reparatur: Der Textmarker-Platz war bei manchen Installationen als „fountain“ gespeichert → Füller-Symbol und deckende
+      // Füller-Striche statt Textmarker. Der Standard-Marker (id „marker“) bzw. ein Stift namens „(Text)marker“ ist immer ein Marker.
+      const fixed = (saved as PenProfile[]).map((p) => (p.id === "marker" || /^(text)?marker$/i.test(p.name.trim())) && p.kind !== "marker" ? { ...p, kind: "marker" as const } : p);
+      if (fixed.some((p, i) => p !== (saved as PenProfile[])[i])) { try { localStorage.setItem("notizraum-pen-profiles", JSON.stringify(fixed)); } catch { /* gilt dann nur für diese Sitzung */ } }
+      return fixed;
+    }
   } catch { /* private mode or invalid old settings → defaults */ }
   return DEFAULT_PENS;
 };
@@ -691,7 +697,7 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
     return Math.max(MIN_Z, Math.min(1, (window.innerWidth - desktopSidebars - 16) / PAGE_W));
   });
   const [saved, setSaved] = useState("");
-  const [, setReady] = useState(0);
+  const [readyN, setReady] = useState(0);
 
   const scRef = useRef<HTMLDivElement>(null);
   const cvRef = useRef<HTMLCanvasElement>(null);
@@ -1006,11 +1012,10 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
   const topsRef = useRef(tops); topsRef.current = tops;
   const hasPdf = blocks.some((b) => b.kind === "pdf");
   useEffect(() => { if (!hasPdf) setPdfDeleteMode(false); }, [hasPdf]); // letzte PDF-Seite gelöscht → Modus aus
-  // A4-Seitengrenzen (alle 1123 px, wie die Seiten des PDF-Exports) – nur in Notizen ohne PDF.
-  // In PDF-Notizen gilt die Seitenzählung des PDFs; eine zweite, durchlaufende Zählung („Seite 55“ über PDF-Seite 51) verwirrt nur.
+  // A4-Seitengrenzen (alle 1123 px, wie die Seiten des PDF-Exports) – auf allen Schreibflächen, auch in PDF-Notizen
+  // (im eingefügten Platz und im freien Bereich), nie über PDF-Seiten. Abschaltbar in den Einstellungen.
   const pageBreaks = useMemo(() => {
     const out: number[] = [];
-    if (blocks.some((b) => b.kind === "pdf")) return out;
     for (const b of blocks) {
       const top = tops[b.id];
       const y0 = b.kind === "blank" ? top : top + b.height, y1 = top + b.height + (b.kind === "blank" ? 0 : b.gap);
@@ -1119,6 +1124,31 @@ export default function NoteCanvas({ noteId, title, onLibrary, libraryOpen = fal
       clearTimeout(timer.current); if (loaded.current) save();
     };
   }, [save, noteId]);
+
+  /* ───── Leseposition je Notiz: beim Wiederöffnen genau dort weitermachen, wo man aufgehört hat (Position + Zoom) ───── */
+  const viewKey = "xnts-view:" + noteId;
+  const viewRestored = useRef(false);
+  useLayoutEffect(() => {
+    if (!readyN || viewRestored.current) return;
+    viewRestored.current = true;
+    let v: { x: number; y: number; z: number } | null = null;
+    try { v = JSON.parse(localStorage.getItem(viewKey) ?? "null"); } catch { v = null; }
+    const sc = scRef.current;
+    if (!sc || !v || !Number.isFinite(v.y)) return;
+    const z = clamp(Number.isFinite(v.z) ? v.z : zoomRef.current, MIN_Z, MAX_Z), x = Number.isFinite(v.x) ? v.x : 0;
+    if (Math.abs(z - zoomRef.current) > 1e-4) { restoreScroll.current = { left: x * z, top: v.y * z }; zoomRef.current = z; setZoomState(z); }
+    else { sc.scrollLeft = x * z; sc.scrollTop = v.y * z; schedule(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readyN]);
+  useEffect(() => {
+    const sc = scRef.current;
+    if (!sc) return;
+    let t = 0;
+    const store = () => { if (!viewRestored.current) return; const z = zoomRef.current; try { localStorage.setItem(viewKey, JSON.stringify({ x: sc.scrollLeft / z, y: sc.scrollTop / z, z })); } catch { /* nur Komfort */ } };
+    const later = () => { clearTimeout(t); t = window.setTimeout(store, 250); };
+    sc.addEventListener("scroll", later, { passive: true });
+    return () => { clearTimeout(t); store(); sc.removeEventListener("scroll", later); };
+  }, [viewKey]);
 
   /* ───── Verlauf (Undo/Redo über Snapshots; Striche sind unveränderlich) ───── */
   const snap = (): Snap => ({ strokes: strokes.current, blocks: blocksRef.current, texts: textFields.current, images: imagesRef.current });

@@ -53,7 +53,8 @@ XNTS steht für Xnotes. Die offizielle Web- und Installationsversion ist derzeit
 - **Export** (Als PDF exportieren): dieselbe Seitenauswahl (alle, Bereich, einzelne A4-Seiten mit Vorschau); Exportformat und -logik unverändert, Bilder werden mit exportiert.
 - Seitenliste: kein Browser-Kontextmenü; Notizblätter lassen sich per Rechtsklick, Gedrückthalten oder ⋯ löschen (mit Rückfrage, Rückgängig möglich).
 - f(x)-Graphen haben ein ✕ (auch Esc); danach bleibt „📈 Graph zeigen“ zum Wiederöffnen.
-- A4-Grenzen erscheinen in Notizen ohne PDF als sanfter Schimmer mit feiner auslaufender Linie. Die Seitenliste ist eine Liste der Seiten.
+- A4-Grenzen erscheinen auf allen Schreibflächen als sanfter Schimmer mit feiner auslaufender Linie – auch in Notizen mit PDF (im eingefügten Platz und im freien Bereich), nie über PDF-Seiten; abschaltbar in den Einstellungen. Die Seitenliste ist eine Liste der Seiten.
+- Jede Notiz öffnet an der Stelle (Position und Zoom), an der man sie zuletzt verlassen hat; gespeichert pro Gerät (`xnts-view:<Notiz-ID>` im lokalen Speicher, nicht im Backup).
 - Responsive Oberfläche, Hell- und Dunkelmodus, PWA-Installation und Offline-Nutzung.
 
 ## MINT-/Physiklabor (Testversion, getrennt von der App)
